@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import logging
 from typing import Iterable, Optional
+from urllib.parse import urlencode
 
 import anyio
 import httpx
@@ -33,8 +34,13 @@ def _send_whatsapp_sync(
     media_count: int,
 ) -> str:
     """Synchronous Twilio send — runs inside a worker thread."""
+    # Encode as x-www-form-urlencoded manually because httpx sync Client
+    # doesn't handle list-of-tuples the same way as AsyncClient.
+    encoded = urlencode(data)
+    headers["Content-Type"] = "application/x-www-form-urlencoded"
+
     with httpx.Client(timeout=20.0) as client:
-        r = client.post(url, data=data, headers=headers)
+        r = client.post(url, content=encoded.encode("utf-8"), headers=headers)
         if r.status_code >= 400:
             logger.error("twilio_send_failed status=%s body=%s", r.status_code, r.text[:1200])
             r.raise_for_status()
