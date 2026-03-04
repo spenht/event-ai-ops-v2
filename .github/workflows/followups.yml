@@ -1,4 +1,4 @@
-name: Daily Followups
+name: Daily Followups v1
 
 on:
   schedule:
