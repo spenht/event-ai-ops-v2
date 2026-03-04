@@ -1,0 +1,343 @@
+"""Automated follow-up engine.
+
+Called periodically by GitHub Actions (every 5 min).
+The backend decides whether each lead deserves a follow-up right now.
+
+Rules
+-----
+1. followup_15m  — 15 min after last outbound with no reply
+2. followup_1h   — 1 h after last outbound with no reply (only if 15m already sent)
+3. followup_daily — once per calendar day, value-driven content
+
+Anti-spam
+---------
+- Each follow-up type is recorded in touchpoints with a unique key per lead + type + date.
+- If the lead replied after our last outbound, skip (they're engaged).
+- Max 3 follow-ups per lead per day.
+- Never contact do_not_contact leads or PAID leads.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Request
+
+from ..deps import sb
+from ..settings import settings
+from ..services.twilio_whatsapp import send_whatsapp
+
+logger = logging.getLogger("automation")
+
+router = APIRouter(prefix="/v1/automation", tags=["automation"])
+
+# ---------------------------------------------------------------------------
+# Follow-up message templates
+# ---------------------------------------------------------------------------
+
+TEMPLATES: dict[str, dict[str, list[str]]] = {
+    "followup_15m": {
+        "GENERAL_CONFIRMED": [
+            "Hola {name} 👋 Vi que ya tienes tu lugar en *General*.\n\n"
+            "¿Sabías que el boleto *VIP* incluye primera fila, regalos exclusivos y acceso al mastermind?\n\n"
+            "Si quieres, te cuento más 😊",
+        ],
+        "VIP_INTERESTED": [
+            "Hey {name} 😊 Vi que te interesó el *VIP*.\n\n"
+            "¿Tienes alguna duda? Te ayudo rapidísimo para que no se te pase.",
+        ],
+        "VIP_LINK_SENT": [
+            "Oye {name}, ¿pudiste ver el link de pago? 🤔\n\n"
+            "Si tuviste algún problema, dime y te ayudo ahorita mismo.",
+        ],
+    },
+    "followup_1h": {
+        "GENERAL_CONFIRMED": [
+            "Hola {name} 🙌 Solo quería recordarte que el *VIP* tiene cupo limitado.\n\n"
+            "Incluye primera fila, mastermind exclusivo, libro de regalo y más.\n\n"
+            "¿Te gustaría ver un video corto de lo que incluye? 🎥",
+        ],
+        "VIP_INTERESTED": [
+            "{name}, solo para que sepas: los lugares *VIP* se están llenando rápido.\n\n"
+            "Si quieres asegurar el tuyo, te puedo mandar el link de pago ahorita.\n\n"
+            "¿Le entramos? 🔥",
+        ],
+        "VIP_LINK_SENT": [
+            "Oye {name}, te mandé el link hace rato y quiero asegurarme de que todo esté bien.\n\n"
+            "¿Necesitas que te lo reenvíe? A veces WhatsApp los esconde 😅",
+        ],
+    },
+    "followup_daily": {
+        "GENERAL_CONFIRMED": [
+            "Buenos días {name} ☀️\n\n"
+            "Te comparto un testimonio de alguien que fue VIP la vez pasada:\n\n"
+            "💬 *\"Fue la mejor inversión que hice en todo el año. El mastermind solo vale 10x el precio.\"*\n\n"
+            "¿Te gustaría escuchar más sobre el VIP? 😊",
+        ],
+        "VIP_INTERESTED": [
+            "Hola {name} 👋\n\n"
+            "Solo un recordatorio amigable: el evento es pronto y los lugares VIP son limitados.\n\n"
+            "Si decides entrarle hoy, te puedo mandar el link directo.\n\n"
+            "¿Qué dices? 🙌",
+        ],
+        "VIP_LINK_SENT": [
+            "Hola {name} 😊\n\n"
+            "Sé que a veces uno anda ocupado. Solo quería recordarte que tu link de pago VIP sigue activo.\n\n"
+            "Si necesitas otro link o tienes dudas, estoy aquí para ayudarte.\n\n"
+            "¡Que tengas un excelente día! ☀️",
+        ],
+    },
+}
+
+DEFAULT_MSG = "Hola {name} 👋 ¿Cómo vas? Aquí seguimos por si tienes alguna duda del evento 😊"
+
+# ---------------------------------------------------------------------------
+# Eligible statuses (leads we want to follow up)
+# ---------------------------------------------------------------------------
+ELIGIBLE_STATUSES = ["GENERAL_CONFIRMED", "VIP_INTERESTED", "VIP_LINK_SENT"]
+
+MAX_FOLLOWUPS_PER_DAY = 3
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _validate_cron_token(request: Request) -> None:
+    """Validate X-Cron-Token header if CRON_TOKEN is configured."""
+    if not settings.cron_token:
+        return  # No token configured = open (dev mode)
+    token = (request.headers.get("x-cron-token") or "").strip()
+    if token != settings.cron_token:
+        raise HTTPException(status_code=403, detail="invalid cron token")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _today_key(followup_type: str) -> str:
+    """Unique key for dedup: type + date."""
+    return f"{followup_type}_{_utcnow().strftime('%Y-%m-%d')}"
+
+
+def _get_last_touchpoint(lead_id: str, event_types: list[str]) -> dict[str, Any] | None:
+    """Get the most recent touchpoint of given types for a lead."""
+    try:
+        r = (
+            sb.table("touchpoints")
+            .select("event_type,payload,created_at")
+            .eq("lead_id", lead_id)
+            .eq("channel", "whatsapp")
+            .in_("event_type", event_types)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return (r.data or [None])[0]
+    except Exception:
+        return None
+
+
+def _count_today_followups(lead_id: str) -> int:
+    """Count how many follow-ups we already sent today."""
+    today_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    try:
+        r = (
+            sb.table("touchpoints")
+            .select("id")
+            .eq("lead_id", lead_id)
+            .eq("channel", "whatsapp")
+            .in_("event_type", ["followup_15m", "followup_1h", "followup_daily"])
+            .gte("created_at", today_start)
+            .execute()
+        )
+        return len(r.data or [])
+    except Exception:
+        return 0
+
+
+def _followup_already_sent(lead_id: str, followup_type: str) -> bool:
+    """Check if this specific follow-up type was already sent today."""
+    key = _today_key(followup_type)
+    try:
+        r = (
+            sb.table("touchpoints")
+            .select("id")
+            .eq("lead_id", lead_id)
+            .eq("channel", "whatsapp")
+            .eq("event_type", followup_type)
+            .contains("payload", {"key": key})
+            .limit(1)
+            .execute()
+        )
+        return bool(r.data)
+    except Exception:
+        return False
+
+
+def _lead_replied_after(lead_id: str, after_ts: str) -> bool:
+    """Did the lead send any inbound message after the given timestamp?"""
+    try:
+        r = (
+            sb.table("touchpoints")
+            .select("id")
+            .eq("lead_id", lead_id)
+            .eq("channel", "whatsapp")
+            .eq("event_type", "inbound")
+            .gt("created_at", after_ts)
+            .limit(1)
+            .execute()
+        )
+        return bool(r.data)
+    except Exception:
+        return False
+
+
+def _pick_message(followup_type: str, status: str, name: str) -> str:
+    """Pick a message template for this follow-up type and lead status."""
+    templates = TEMPLATES.get(followup_type, {})
+    msgs = templates.get(status, [DEFAULT_MSG])
+    msg = msgs[0]  # For now pick first; later can rotate/randomize
+    return msg.format(name=name or "")
+
+
+def _decide_followup(lead: dict[str, Any], now: datetime) -> str | None:
+    """Decide which follow-up to send (if any).
+
+    Returns followup type string or None.
+    Priority: 15m > 1h > daily
+    """
+    lead_id = lead["lead_id"]
+    status = (lead.get("status") or "").strip()
+
+    # Rate limit
+    if _count_today_followups(lead_id) >= MAX_FOLLOWUPS_PER_DAY:
+        return None
+
+    # Get last outbound (AI reply or follow-up)
+    last_out = _get_last_touchpoint(lead_id, ["outbound_ai", "followup_15m", "followup_1h", "followup_daily"])
+    if not last_out:
+        # Never contacted — send 15m follow-up immediately
+        if not _followup_already_sent(lead_id, "followup_15m"):
+            return "followup_15m"
+        return None
+
+    last_out_ts = last_out.get("created_at", "")
+    try:
+        last_out_dt = datetime.fromisoformat(last_out_ts.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+    # If lead replied after our last outbound, they're engaged — don't interrupt
+    if _lead_replied_after(lead_id, last_out_ts):
+        return None
+
+    elapsed = now - last_out_dt
+    minutes_elapsed = elapsed.total_seconds() / 60
+
+    # 15-minute follow-up
+    if minutes_elapsed >= 15 and not _followup_already_sent(lead_id, "followup_15m"):
+        return "followup_15m"
+
+    # 1-hour follow-up (only if 15m was already sent)
+    if minutes_elapsed >= 60 and _followup_already_sent(lead_id, "followup_15m") and not _followup_already_sent(lead_id, "followup_1h"):
+        return "followup_1h"
+
+    # Daily follow-up (only if 1h was already sent)
+    if minutes_elapsed >= 1440 and _followup_already_sent(lead_id, "followup_1h") and not _followup_already_sent(lead_id, "followup_daily"):
+        return "followup_daily"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main endpoint
+# ---------------------------------------------------------------------------
+
+@router.post("/followups")
+async def run_followups(request: Request):
+    """Process follow-ups for eligible leads.
+
+    Called by GitHub Actions every 5 minutes.
+    """
+    _validate_cron_token(request)
+
+    now = _utcnow()
+
+    # Query eligible leads
+    try:
+        r = (
+            sb.table("leads")
+            .select("*")
+            .in_("status", ELIGIBLE_STATUSES)
+            .neq("payment_status", "PAID")
+            .eq("do_not_contact", False)
+            .execute()
+        )
+        leads = r.data or []
+    except Exception as e:
+        logger.exception("followup_query_failed")
+        raise HTTPException(status_code=500, detail=f"query failed: {str(e)[:200]}")
+
+    processed = 0
+    sent = 0
+    errors = 0
+
+    for lead in leads:
+        lead_id = lead.get("lead_id", "")
+        name = (lead.get("name") or "").strip() or "amigo/a"
+        status = (lead.get("status") or "").strip()
+        wa = (lead.get("whatsapp") or "").strip()
+
+        if not wa:
+            continue
+
+        processed += 1
+
+        followup_type = _decide_followup(lead, now)
+        if not followup_type:
+            continue
+
+        msg = _pick_message(followup_type, status, name)
+
+        try:
+            sid = await send_whatsapp(to_e164=wa, body=msg)
+            logger.info(
+                "followup_sent type=%s lead=%s status=%s sid=%s",
+                followup_type, lead_id, status, sid,
+            )
+            sent += 1
+        except Exception as e:
+            logger.error("followup_send_failed lead=%s err=%s", lead_id, str(e)[:200])
+            errors += 1
+            continue
+
+        # Record the follow-up in touchpoints
+        try:
+            sb.table("touchpoints").insert({
+                "lead_id": lead_id,
+                "channel": "whatsapp",
+                "event_type": followup_type,
+                "payload": {
+                    "key": _today_key(followup_type),
+                    "body": msg,
+                    "status_at_send": status,
+                    "sid": sid,
+                },
+            }).execute()
+        except Exception:
+            pass
+
+        # Update last_contact_at on the lead
+        try:
+            sb.table("leads").update({
+                "last_contact_at": now.isoformat(),
+            }).eq("lead_id", lead_id).execute()
+        except Exception:
+            pass
+
+    logger.info("followup_run processed=%d sent=%d errors=%d", processed, sent, errors)
+    return {"processed": processed, "sent": sent, "errors": errors}

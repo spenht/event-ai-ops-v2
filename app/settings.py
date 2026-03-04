@@ -48,6 +48,9 @@ class Settings:
     stripe_success_url: str = _env("STRIPE_SUCCESS_URL", "")
     stripe_cancel_url: str = _env("STRIPE_CANCEL_URL", "")
 
+    # Automation
+    cron_token: str = _env("CRON_TOKEN", "")
+
     # Event (fallback)
     event_name: str = _env("EVENT_NAME", "Beyond Wealth")
     event_date: str = _env("EVENT_DATE", "")
