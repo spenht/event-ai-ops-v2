@@ -4,6 +4,7 @@ import base64
 import logging
 from typing import Iterable, Optional
 
+import anyio
 import httpx
 
 from ..settings import settings
@@ -24,6 +25,25 @@ def normalize_mx_whatsapp(raw: str) -> str:
     return s
 
 
+def _send_whatsapp_sync(
+    url: str,
+    data: list[tuple[str, str]],
+    headers: dict[str, str],
+    to_value: str,
+    media_count: int,
+) -> str:
+    """Synchronous Twilio send — runs inside a worker thread."""
+    with httpx.Client(timeout=20.0) as client:
+        r = client.post(url, data=data, headers=headers)
+        if r.status_code >= 400:
+            logger.error("twilio_send_failed status=%s body=%s", r.status_code, r.text[:1200])
+            r.raise_for_status()
+        payload = r.json()
+        sid = (payload.get("sid") or "").strip()
+        logger.info("twilio_send_ok sid=%s to=%s media=%s", sid, to_value, media_count)
+        return sid
+
+
 async def send_whatsapp(
     to_e164: str,
     body: str,
@@ -32,8 +52,8 @@ async def send_whatsapp(
 ) -> str:
     """Send WhatsApp message via Twilio REST API.
 
-    Twilio expects MediaUrl to be repeated (same key multiple times), so we send
-    form data as list-of-tuples.
+    Uses synchronous httpx.Client inside a thread to avoid async/sync
+    conflicts with the event loop (known httpx issue).
 
     Returns Twilio Message SID.
     """
@@ -56,12 +76,6 @@ async def send_whatsapp(
 
     headers = {"Authorization": _basic_auth_header(settings.twilio_account_sid, settings.twilio_auth_token)}
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.post(url, data=data, headers=headers)
-        if r.status_code >= 400:
-            logger.error("twilio_send_failed status=%s body=%s", r.status_code, r.text[:1200])
-            r.raise_for_status()
-        payload = r.json()
-        sid = (payload.get("sid") or "").strip()
-        logger.info("twilio_send_ok sid=%s to=%s media=%s", sid, to_value, len(media_list))
-        return sid
+    return await anyio.to_thread.run_sync(
+        lambda: _send_whatsapp_sync(url, data, headers, to_value, len(media_list))
+    )
