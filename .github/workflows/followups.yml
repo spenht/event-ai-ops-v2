@@ -1,8 +1,8 @@
-name: Daily Followups
+name: Followups Scheduler
 
 on:
   schedule:
-    - cron: "0 16 * * *" # 16:00 UTC (ajstalo)
+    - cron: "*/5 * * * *"   # Every 5 minutes
   workflow_dispatch:
 
 jobs:
@@ -11,6 +11,6 @@ jobs:
     steps:
       - name: Call followups endpoint
         run: |
-          curl -sS -X POST "https://calls-mx.fly.dev/v1/automation/followups?days=1" \
+          curl -sS -X POST "https://calls-mx.fly.dev/v1/automation/followups" \
             -H "Accept: application/json" \
             -H "X-Cron-Token: ${{ secrets.CRON_TOKEN }}"
