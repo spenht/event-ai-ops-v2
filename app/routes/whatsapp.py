@@ -162,12 +162,12 @@ def _extract_name(text: str) -> Optional[str]:
     email_in_text = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", t, re.I)
     if email_in_text:
         # Take everything before the email (or before comma/newline preceding it)
-        pre = t[:email_in_text.start()].rstrip(" ,\n\t")
+        pre = t[:email_in_text.start()].rstrip(" ,:\n\t")
         # Clean up: remove common labels
         pre = re.sub(r"^(nombre|name)\s*[:\-]\s*", "", pre, flags=re.I).strip()
         pre = re.sub(r"^(correo|email|mail)\s*[:\-]\s*.*$", "", pre, flags=re.I | re.M).strip()
-        # Strip trailing email-related phrases: "y mi email es", "mi correo es", "mail:", etc.
-        pre = re.sub(r"[,\s]+(y\s+)?(mi\s+)?(e-?mail|correo|mail)\s*(es|:)?\s*$", "", pre, flags=re.I).strip()
+        # Strip trailing email-related phrases: "y mi email es", "mi correo es:", "mail:", etc.
+        pre = re.sub(r"[,\s]+(y\s+)?(mi\s+)?(e-?mail|correo|mail)\s*(es)?\s*:?\s*$", "", pre, flags=re.I).strip()
         if pre:
             words = pre.split()
             if 1 <= len(words) <= 5 and re.fullmatch(r"[A-Za-zÁÉÍÓÚÜÑáéíóüñ\s'.-]+", pre):
