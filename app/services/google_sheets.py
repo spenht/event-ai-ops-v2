@@ -293,7 +293,7 @@ async def sync_sales_leads_sheet() -> dict[str, int]:
     from ..deps import sb
 
     now = datetime.now(timezone.utc)
-    one_hour_ago = (now - timedelta(hours=1)).isoformat()
+    thirty_min_ago = (now - timedelta(minutes=30)).isoformat()
 
     try:
         r = (
@@ -302,7 +302,7 @@ async def sync_sales_leads_sheet() -> dict[str, int]:
             .in_("status", ["GENERAL_CONFIRMED", "VIP_INTERESTED", "VIP_LINK_SENT"])
             .neq("payment_status", "PAID")
             .eq("do_not_contact", False)
-            .lt("last_contact_at", one_hour_ago)
+            .lt("last_contact_at", thirty_min_ago)
             .execute()
         )
         eligible = r.data or []
