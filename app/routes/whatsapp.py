@@ -555,7 +555,25 @@ async def whatsapp_inbound(request: Request):
         except Exception:
             pass
 
-        # Friendly first touch for new leads
+        # If user already provided name+email in first message, skip the greeting
+        # and go straight to auto-confirm GENERAL (background handler).
+        if msg_name and msg_email:
+            asyncio.create_task(
+                _handle_existing_lead(
+                    lead=lead,
+                    lead_id=lead["lead_id"],
+                    body=body,
+                    wa_from=wa_from,
+                    wa_e164=wa_e164,
+                    message_sid=message_sid,
+                    msg_email=msg_email,
+                    msg_name=msg_name,
+                    msg_name_only=msg_name_only,
+                )
+            )
+            return _twiml_empty()
+
+        # Friendly first touch for new leads (need name+email to confirm)
         return _twiml_message(
             "¡Hola! 😊 Soy Ana del equipo de Beyond Wealth.\n\n"
             "Ya te aparte un lugar en *GENERAL* (gratis).\n\n"
@@ -665,7 +683,8 @@ async def _handle_existing_lead(
                         companion_lead = None
 
                 # Store a pointer to the latest companion lead for later payment-link generation
-                if companion_lead and companion_lead.get("lead_id"):
+                # Skip if companion is the same as the main lead (self-reference)
+                if companion_lead and companion_lead.get("lead_id") and companion_lead.get("lead_id") != lead_id:
                     try:
                         sb.table("touchpoints").insert(
                             {
@@ -740,12 +759,85 @@ async def _handle_existing_lead(
         event_id = lead.get("event_id")
         facts = _event_facts(event_id)
 
+        # ---------------------------------------------------------------
+        # AUTO-CONFIRM GENERAL when user provides name + email
+        # This is the SECOND message (after the greeting that asked for data).
+        # When the lead is still NEW and the user just sent name+email,
+        # confirm GENERAL, send ticket + calendar, ask about VIP, and RETURN.
+        # ---------------------------------------------------------------
+        just_provided_name = bool(msg_name or msg_name_only)
+        just_provided_email = bool(msg_email)
+        lead_is_new = str((lead.get("status") or "")).upper() in ("NEW", "")
+
+        if just_provided_name and just_provided_email and lead_is_new:
+            # Update status
+            try:
+                sb.table("leads").update({"status": "GENERAL_CONFIRMED", "payment_status": "FREE"}).eq("lead_id", lead_id).execute()
+                lead["status"] = "GENERAL_CONFIRMED"
+                lead["payment_status"] = "FREE"
+            except Exception:
+                pass
+
+            if settings.public_base_url:
+                ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts)
+                ticket_url = f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
+                cal_url = _google_calendar_url(facts)
+                ticket_msg = (
+                    "✅ Listo. Ya tienes tu acceso *GENERAL* confirmado (sin costo).\n"
+                    "Aqui esta tu boleto con QR 👇\n\n"
+                    "📅 Agregalo a tu calendario:\n" + cal_url + "\n\n"
+                    "¿Te gustaria conocer el pase *VIP* y saber todo lo que incluye?"
+                ).strip()
+
+                # Save outbound
+                try:
+                    sb.table("touchpoints").insert(
+                        {
+                            "lead_id": lead_id,
+                            "channel": "whatsapp",
+                            "event_type": "outbound_ai",
+                            "payload": {"to": wa_from, "body": ticket_msg, "in_reply_to": message_sid},
+                        }
+                    ).execute()
+                except Exception:
+                    pass
+
+                # Mark ticket sent
+                try:
+                    sb.table("touchpoints").insert(
+                        {
+                            "lead_id": lead_id,
+                            "channel": "whatsapp",
+                            "event_type": "ticket_sent",
+                            "payload": {"tier": "GENERAL", "ticket_id": ticket["ticket_id"]},
+                        }
+                    ).execute()
+                except Exception:
+                    pass
+
+                # Send ticket + message
+                await send_whatsapp(to_e164=wa_e164, body=ticket_msg, media_urls=[ticket_url])
+            else:
+                fallback_msg = "✅ Listo. Tu lugar en *GENERAL* esta confirmado."
+                try:
+                    sb.table("touchpoints").insert(
+                        {
+                            "lead_id": lead_id,
+                            "channel": "whatsapp",
+                            "event_type": "outbound_ai",
+                            "payload": {"to": wa_from, "body": fallback_msg, "in_reply_to": message_sid},
+                        }
+                    ).execute()
+                except Exception:
+                    pass
+                await send_whatsapp(to_e164=wa_e164, body=fallback_msg)
+
+            return  # Done — ticket sent, don't continue to AI reply
+
         # Build conversation context
         convo = _load_recent_conversation(lead_id)
         if not convo or convo[-1].get("role") != "user" or (convo[-1].get("content") or "").strip() != body:
             convo.append({"role": "user", "content": body})
-
-        first_contact = _is_first_contact(lead_id)
 
         # Generate AI reply
         ai = await generate_reply(lead=lead, event_facts=facts, conversation=convo)
@@ -857,9 +949,19 @@ async def _handle_existing_lead(
             ]
         )
 
-        if vip_context and vip_explainer_message and str((lead.get("payment_status") or "")).upper() != "PAID":
+        # --- VIP PITCH: send copy FIRST (separate msg), then video (separate msg) ---
+        # ONLY if VIP pitch hasn't been sent yet. If it was already sent,
+        # skip the pitch entirely — user already saw it.
+        vip_pitch_already_sent = _already_sent_media(lead_id, "vip_video")
+
+        if (
+            vip_context
+            and (vip_explainer_message or asks_vip_details)
+            and str((lead.get("payment_status") or "")).upper() != "PAID"
+            and not vip_pitch_already_sent
+        ):
             event_name_upper = (facts.get("event_name") or "BEYOND WEALTH").upper()
-            clean = (
+            vip_pitch_text = (
                 f"VIP es la forma mas cercana, estrategica y transformadora de vivir *{event_name_upper}*.\n\n"
                 "🔥 *Por que ser VIP:*\n"
                 "- Asientos preferenciales\n"
@@ -871,36 +973,61 @@ async def _handle_existing_lead(
                 "Puedes elegir:\n"
                 "1️⃣ 1 VIP individual x 79 USD\n"
                 "2️⃣ La opcion mas popular: 2 VIPs x 97 USD (promo especial)\n\n"
-                "¿Te aparto 1 VIP o prefieres aprovechar la promo de 2?\n\n"
-                "🎥 Aqui tienes un video corto de Spencer explicando el VIP:"
+                "¿Te aparto 1 VIP o prefieres aprovechar la promo de 2?"
             ).strip()
-            clean_low = clean.lower()
 
-        # VIP pitch video (send as real media, at most once per lead)
-        should_send_vip_video = ("[[SEND_VIP_VIDEO]]" in tokens) or asks_vip_details or (vip_context and vip_explainer_message)
+            # MESSAGE 1: Send VIP pitch text FIRST (no media)
+            try:
+                sb.table("touchpoints").insert(
+                    {
+                        "lead_id": lead_id,
+                        "channel": "whatsapp",
+                        "event_type": "outbound_ai",
+                        "payload": {"to": wa_from, "body": vip_pitch_text, "in_reply_to": message_sid, "type": "vip_pitch"},
+                    }
+                ).execute()
+            except Exception:
+                pass
+            await send_whatsapp(to_e164=wa_e164, body=vip_pitch_text)
+
+            # MESSAGE 2: Send VIP video separately (with short intro text)
+            if settings.whatsapp_video_vip_pitch.strip():
+                u = settings.whatsapp_video_vip_pitch.strip()
+                if u.startswith("https://"):
+                    video_intro = "🎥 Aqui tienes un video corto de Spencer explicando el VIP:"
+                    try:
+                        sb.table("touchpoints").insert(
+                            {
+                                "lead_id": lead_id,
+                                "channel": "whatsapp",
+                                "event_type": "media_sent",
+                                "payload": {"key": "vip_video", "url": u},
+                            }
+                        ).execute()
+                    except Exception:
+                        pass
+                    await send_whatsapp(to_e164=wa_e164, body=video_intro, media_urls=[u])
+
+            # Update status to VIP_INTERESTED so affirmative replies trigger link generation
+            try:
+                sb.table("leads").update({"status": "VIP_INTERESTED"}).eq("lead_id", lead_id).execute()
+                lead["status"] = "VIP_INTERESTED"
+            except Exception:
+                pass
+
+            # Don't send the AI's response — we already sent the pitch + video
+            return
+
+        # VIP pitch video re-send on explicit request (user asks "mandame el video")
+        should_send_vip_video = ("[[SEND_VIP_VIDEO]]" in tokens) or asks_video
         if (
             should_send_vip_video
             and settings.whatsapp_video_vip_pitch.strip()
-            and (asks_video or not _already_sent_media(lead_id, "vip_video"))
+            and asks_video
         ):
-            if "video" not in clean.lower():
-                clean = (clean.rstrip() + "\n\n🎥 Aquí tienes un video corto de Spencer explicando el VIP:").strip()
-            # Remove any .mp4 URL from the text, just in case
-            clean = re.sub(r"https?://\S+\.mp4\S*", "", clean, flags=re.I).strip()
             u = settings.whatsapp_video_vip_pitch.strip()
             if u.startswith("https://"):
                 media_urls.append(u)
-                try:
-                    sb.table("touchpoints").insert(
-                        {
-                            "lead_id": lead_id,
-                            "channel": "whatsapp",
-                            "event_type": "media_sent",
-                            "payload": {"key": "vip_video", "url": u},
-                        }
-                    ).execute()
-                except Exception:
-                    pass
 
         # --- VIP link heuristics (fix: define should_send_vip_link) ---
         asks_pay_link = any(
@@ -918,7 +1045,9 @@ async def _handle_existing_lead(
                 "checkout",
                 "stripe",
                 "pago el vip",
-                "pagar",
+                "quiero pagarlo",
+                "pasame el link",
+                "pásame el link",
             ]
         )
 
@@ -1043,15 +1172,21 @@ async def _handle_existing_lead(
                             pass
 
                     # Detect which option user wants
-                    wants_option_2 = any(k in low for k in [
-                        "2", "dos", "opcion 2", "opción 2", "la 2", "el 2",
-                        "quiero 2", "promo", "la promo", "los 2", "los dos",
-                        "2 vip", "dos vip", "2 boletos", "dos boletos",
-                    ])
-                    wants_option_1 = any(k in low for k in [
-                        "1", "uno", "opcion 1", "opción 1", "la 1", "el 1",
-                        "quiero 1", "1 vip", "un vip", "individual",
-                    ])
+                    wants_option_2 = (
+                        any(k in low for k in [
+                            "dos", "opcion 2", "opción 2", "la 2", "el 2",
+                            "quiero 2", "promo", "la promo", "los 2", "los dos",
+                            "2 vip", "dos vip", "2 boletos", "dos boletos",
+                        ])
+                        or bool(re.search(r'\b2\b', low))
+                    )
+                    wants_option_1 = (
+                        any(k in low for k in [
+                            "uno", "opcion 1", "opción 1", "la 1", "el 1",
+                            "quiero 1", "1 vip", "un vip", "individual",
+                        ])
+                        or bool(re.search(r'\b1\b', low))
+                    )
 
                     if wants_option_2 and not wants_option_1:
                         # User explicitly wants option 2
@@ -1098,6 +1233,14 @@ async def _handle_existing_lead(
                     url = None
                     clean = (clean.rstrip() + "\n\nAhorita no pude generar el link 😅 ¿Me pones *VIP* otra vez en 30 segundos?").strip()
 
+            # Update status to VIP_LINK_SENT after successfully generating links
+            if "checkout.stripe.com" in clean:
+                try:
+                    sb.table("leads").update({"status": "VIP_LINK_SENT"}).eq("lead_id", lead_id).execute()
+                    lead["status"] = "VIP_LINK_SENT"
+                except Exception:
+                    pass
+
         # If model asked to send General ticket
         if "[[SEND_GENERAL_TICKET]]" in tokens:
             if not settings.public_base_url:
@@ -1134,16 +1277,8 @@ async def _handle_existing_lead(
             ]
         )
 
-        if str((lead.get("payment_status") or "")).upper() == "PAID" and asks_qr and settings.public_base_url:
-            ticket = generate_ticket_png(lead=lead, tier="VIP", event=facts)
-            media_urls.append(
-                f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
-            )
-            if "qr" not in clean.lower() and "boleto" not in clean.lower():
-                cal_url = _google_calendar_url(facts)
-                clean = (clean.rstrip() + "\n\n✅ Aqui tienes tu boleto VIP con QR 👇\n\n📅 Agregalo a tu calendario:\n" + cal_url).strip()
-
         # If Stripe webhook already marked this lead as PAID, automatically send VIP ticket ONCE (no user trigger needed)
+        vip_ticket_auto_sent = False
         if str((lead.get("payment_status") or "")).upper() == "PAID":
             if settings.public_base_url and not _already_sent_ticket(lead_id, "VIP"):
                 ticket = generate_ticket_png(lead=lead, tier="VIP", event=facts)
@@ -1168,10 +1303,27 @@ async def _handle_existing_lead(
                     ).execute()
                 except Exception:
                     pass
+                vip_ticket_auto_sent = True
 
+        # If the user explicitly asks again for the QR/ticket after payment, re-send it (on demand).
+        # Skip if we just auto-sent above to avoid duplicates.
+        if (
+            not vip_ticket_auto_sent
+            and str((lead.get("payment_status") or "")).upper() == "PAID"
+            and asks_qr
+            and settings.public_base_url
+        ):
+            ticket = generate_ticket_png(lead=lead, tier="VIP", event=facts)
+            media_urls.append(
+                f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
+            )
+            if "qr" not in clean.lower() and "boleto" not in clean.lower():
+                cal_url = _google_calendar_url(facts)
+                clean = (clean.rstrip() + "\n\n✅ Aqui tienes tu boleto VIP con QR 👇\n\n📅 Agregalo a tu calendario:\n" + cal_url).strip()
 
         # Free GENERAL flow: if the user chooses General (no payment), confirm + send ticket right away.
-        if wants_general and not wants_vip and str((lead.get("status") or "")).upper() not in ["GENERAL_CONFIRMED", "VIP_PAID"]:
+        # Guard: don't re-send if they already have a GENERAL ticket (e.g. from auto-confirm).
+        if wants_general and not wants_vip and not _already_sent_ticket(lead_id, "GENERAL") and str((lead.get("payment_status") or "")).upper() != "PAID":
             try:
                 sb.table("leads").update({"status": "GENERAL_CONFIRMED", "payment_status": "FREE"}).eq("lead_id", lead_id).execute()
                 lead["status"] = "GENERAL_CONFIRMED"
@@ -1237,7 +1389,12 @@ async def _handle_existing_lead(
             (wants_general and lead_status in ("GENERAL_CONFIRMED",))
             or (lead_paid == "PAID" and "boleto" in clean.lower())
         )
-        if ticket_just_sent and settings.whatsapp_video_testimonios.strip():
+        # Also send testimonials on first message after payment (even if ticket was sent by Stripe webhook)
+        should_send_testimonials = (
+            ticket_just_sent
+            or (lead_paid == "PAID" and not _already_sent_media(lead_id, "testimonios"))
+        )
+        if should_send_testimonials and settings.whatsapp_video_testimonios.strip():
             if not _already_sent_media(lead_id, "testimonios"):
                 testimonial_url = settings.whatsapp_video_testimonios.strip()
                 try:
