@@ -166,6 +166,8 @@ def _extract_name(text: str) -> Optional[str]:
         # Clean up: remove common labels
         pre = re.sub(r"^(nombre|name)\s*[:\-]\s*", "", pre, flags=re.I).strip()
         pre = re.sub(r"^(correo|email|mail)\s*[:\-]\s*.*$", "", pre, flags=re.I | re.M).strip()
+        # Strip trailing email-related phrases: "y mi email es", "mi correo es", "mail:", etc.
+        pre = re.sub(r"[,\s]+(y\s+)?(mi\s+)?(e-?mail|correo|mail)\s*(es|:)?\s*$", "", pre, flags=re.I).strip()
         if pre:
             words = pre.split()
             if 1 <= len(words) <= 5 and re.fullmatch(r"[A-Za-zÁÉÍÓÚÜÑáéíóüñ\s'.-]+", pre):
@@ -650,6 +652,20 @@ async def _handle_existing_lead(
                 comp_name = ln
                 break
 
+            # Fallback: extract name from single-line comma-separated format
+            # e.g. "Maria Maria, maria123@gmail.com, 5532073344"
+            if not comp_name and comp_email:
+                cleaned = body
+                cleaned = cleaned.replace(comp_email, "")
+                if comp_phone:
+                    # Remove phone in various formats
+                    for pv in [comp_phone, comp_phone.lstrip("+"), comp_phone.replace("+", "")]:
+                        cleaned = cleaned.replace(pv, "")
+                cleaned = re.sub(r"[,\n]+", " ", cleaned).strip()
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                if cleaned and 2 <= len(cleaned) <= 80 and re.fullmatch(r"[A-Za-zÁÉÍÓÚÜÑáéíóüñ\s'.-]+", cleaned):
+                    comp_name = cleaned
+
             has_companion_bundle = bool(comp_email and comp_phone and comp_name)
 
             if has_companion_bundle:
@@ -733,6 +749,12 @@ async def _handle_existing_lead(
             # - If user sent a "name-only" message, only use it when we don't have a good name yet,
             #   or when the existing name looks like a mistaken capture (e.g. "Ya pagué").
             incoming_name = msg_name or msg_name_only
+            # Guard: don't overwrite lead's name if the message is companion data
+            # (contains a DIFFERENT email than the lead's own email)
+            lead_email = (lead.get("email") or "").strip().lower()
+            if incoming_name and msg_email and lead_email and msg_email.lower() != lead_email:
+                incoming_name = None  # Skip — this name belongs to a companion, not the lead
+
             if incoming_name:
                 existing_name = (lead.get("name") or "").strip()
                 existing_low = existing_name.lower()
