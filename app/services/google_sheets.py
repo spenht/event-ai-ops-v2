@@ -43,12 +43,12 @@ _client = None
 ALL_LEADS_COLUMNS = [
     "lead_id", "name", "email", "whatsapp", "phone",
     "status", "payment_status", "event_id",
-    "created_at", "last_contact_at",
+    "last_contact_at",
 ]
 
 SALES_LEADS_COLUMNS = [
     "lead_id", "name", "email", "whatsapp", "phone",
-    "status", "event_id", "created_at",
+    "status", "event_id", "last_contact_at",
 ]
 
 # ---------------------------------------------------------------------------
@@ -80,11 +80,15 @@ def _get_client():
     # Parse credentials: try raw JSON first, then base64
     try:
         info = json.loads(raw)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e1:
         try:
             info = json.loads(base64.b64decode(raw))
         except Exception:
-            logger.error("google_sheets_creds_invalid: cannot parse service account JSON")
+            logger.error(
+                "google_sheets_creds_invalid: cannot parse service account JSON "
+                "json_err=%s raw_len=%d raw_start=%s",
+                str(e1)[:100], len(raw), repr(raw[:60]),
+            )
             return None
 
     try:
@@ -283,7 +287,7 @@ async def sync_sales_leads_sheet() -> dict[str, int]:
             .in_("status", ["GENERAL_CONFIRMED", "VIP_INTERESTED", "VIP_LINK_SENT"])
             .neq("payment_status", "PAID")
             .eq("do_not_contact", False)
-            .lt("created_at", one_hour_ago)
+            .lt("last_contact_at", one_hour_ago)
             .execute()
         )
         eligible = r.data or []
