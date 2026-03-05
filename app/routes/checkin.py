@@ -19,6 +19,18 @@ router = APIRouter(prefix="/checkin", tags=["checkin"])
 # ── helpers ────────────────────────────────────────────────────────
 
 
+def _get_checkin_count() -> int:
+    """Return total unique check-ins from Supabase."""
+    try:
+        res = sb.table("touchpoints") \
+            .select("lead_id") \
+            .eq("event_type", "checkin") \
+            .execute()
+        return len(res.data) if res.data else 0
+    except Exception:
+        return 0
+
+
 def _scanner_html(key: str) -> str:
     """Return the full-screen QR scanner HTML page."""
     return f"""<!DOCTYPE html>
@@ -117,7 +129,7 @@ body {{
 <div class="topbar">
   <h1>BEYOND WEALTH</h1>
   <div class="sub">Check-in</div>
-  <div id="counter">0 registrados</div>
+  <div id="counter">Cargando...</div>
 </div>
 <div id="scanner-region">
   <div id="reader"></div>
@@ -134,6 +146,20 @@ const KEY = "{key}";
 let scanCount = 0;
 let processing = false;
 let scanner = null;
+
+// ── load real count from server ──
+async function loadCount() {{
+  try {{
+    const r = await fetch('/checkin/count?key=' + KEY);
+    const j = await r.json();
+    scanCount = j.count || 0;
+    updateCounter();
+  }} catch(e) {{}}
+}}
+
+function updateCounter() {{
+  document.getElementById('counter').textContent = scanCount + ' asistente' + (scanCount === 1 ? '' : 's');
+}}
 
 // ── audio feedback ──
 function beep(freq, ms) {{
@@ -183,13 +209,16 @@ async function verify(data) {{
     }});
     const j = await res.json();
     if (j.ok) {{
+      // Always sync counter from server
+      if (typeof j.total === 'number') {{
+        scanCount = j.total;
+        updateCounter();
+      }}
       if (j.already) {{
         beep(400, 300);
         showResult('already', j.name, j.tier, 'Ya registrado');
       }} else {{
         beep(800, 150);
-        scanCount++;
-        document.getElementById('counter').textContent = scanCount + ' registrado' + (scanCount === 1 ? '' : 's');
         showResult('success', j.name, j.tier, 'Check-in exitoso');
       }}
     }} else {{
@@ -229,6 +258,7 @@ function startScanner() {{
   }});
 }}
 
+loadCount();
 startScanner();
 </script>
 </body>
@@ -244,6 +274,14 @@ async def checkin_scanner(key: str = ""):
     if not settings.checkin_key or key != settings.checkin_key:
         raise HTTPException(status_code=403, detail="Acceso denegado")
     return _scanner_html(key)
+
+
+@router.get("/count")
+async def checkin_count(key: str = ""):
+    """Return total unique check-ins."""
+    if not settings.checkin_key or key != settings.checkin_key:
+        raise HTTPException(status_code=403, detail="Acceso denegado")
+    return {"count": _get_checkin_count()}
 
 
 @router.post("/verify")
@@ -332,12 +370,14 @@ async def checkin_verify(request: Request, key: str = ""):
             .limit(1) \
             .execute()
         if existing.data:
+            total = _get_checkin_count()
             return JSONResponse({
                 "ok": True,
                 "already": True,
                 "name": lead_name,
                 "tier": tier or "GENERAL",
                 "message": "Ya registrado",
+                "total": total,
             })
     except Exception:
         pass
@@ -360,7 +400,17 @@ async def checkin_verify(request: Request, key: str = ""):
         logger.error("checkin_insert_failed err=%s", str(exc)[:300])
         return JSONResponse({"ok": False, "message": "Error al registrar"})
 
-    # 8. Sync to Google Sheets (fire-and-forget)
+    # 8. Update lead status to ATTENDED in Supabase
+    attended_status = f"{tier}_ATTENDED" if tier else "ATTENDED"
+    try:
+        sb.table("leads").update({
+            "status": attended_status,
+        }).eq("lead_id", lead_id).execute()
+        logger.info("lead_status_updated lead=%s status=%s", lead_id, attended_status)
+    except Exception as exc:
+        logger.error("lead_status_update_failed lead=%s err=%s", lead_id, str(exc)[:300])
+
+    # 9. Sync to Google Sheets (fire-and-forget, re-fetch with updated status)
     try:
         lr2 = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1).execute()
         if lr2.data:
@@ -368,10 +418,13 @@ async def checkin_verify(request: Request, key: str = ""):
     except Exception:
         pass
 
+    # 10. Return with global count
+    total = _get_checkin_count()
     return JSONResponse({
         "ok": True,
         "already": False,
         "name": lead_name,
         "tier": tier or "GENERAL",
         "message": "Check-in exitoso",
+        "total": total,
     })
