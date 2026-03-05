@@ -364,7 +364,7 @@ async def checkin_verify(request: Request, key: str = ""):
     # 6. Check if already checked in
     try:
         existing = sb.table("touchpoints") \
-            .select("touchpoint_id") \
+            .select("lead_id") \
             .eq("event_type", "checkin") \
             .eq("lead_id", lead_id) \
             .limit(1) \
