@@ -898,13 +898,17 @@ async def _handle_existing_lead(
                     if u.startswith("https://"):
                         video_intro = "🎥 Aqui tienes un video corto de Spencer explicando el VIP:"
                         try:
-                            sb.table("touchpoints").insert(
-                                {"lead_id": lead_id, "channel": "whatsapp", "event_type": "media_sent",
-                                 "payload": {"key": "vip_video", "url": u}}
-                            ).execute()
-                        except Exception:
-                            pass
-                        await send_whatsapp(to_e164=wa_e164, body=video_intro, media_urls=[u])
+                            await send_whatsapp(to_e164=wa_e164, body=video_intro, media_urls=[u])
+                            # Only mark as sent AFTER successful send
+                            try:
+                                sb.table("touchpoints").insert(
+                                    {"lead_id": lead_id, "channel": "whatsapp", "event_type": "media_sent",
+                                     "payload": {"key": "vip_video", "url": u}}
+                                ).execute()
+                            except Exception:
+                                pass
+                        except Exception as exc:
+                            logger.error("vip_video_send_failed lead=%s err=%s", lead_id, str(exc)[:200])
 
                 # Update status
                 try:
@@ -1090,17 +1094,21 @@ async def _handle_existing_lead(
                 if u.startswith("https://"):
                     video_intro = "🎥 Aqui tienes un video corto de Spencer explicando el VIP:"
                     try:
-                        sb.table("touchpoints").insert(
-                            {
-                                "lead_id": lead_id,
-                                "channel": "whatsapp",
-                                "event_type": "media_sent",
-                                "payload": {"key": "vip_video", "url": u},
-                            }
-                        ).execute()
-                    except Exception:
-                        pass
-                    await send_whatsapp(to_e164=wa_e164, body=video_intro, media_urls=[u])
+                        await send_whatsapp(to_e164=wa_e164, body=video_intro, media_urls=[u])
+                        # Only mark as sent AFTER successful send
+                        try:
+                            sb.table("touchpoints").insert(
+                                {
+                                    "lead_id": lead_id,
+                                    "channel": "whatsapp",
+                                    "event_type": "media_sent",
+                                    "payload": {"key": "vip_video", "url": u},
+                                }
+                            ).execute()
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        logger.error("vip_video_send_failed lead=%s err=%s", lead_id, str(exc)[:200])
 
             # Update status to VIP_INTERESTED so affirmative replies trigger link generation
             try:
