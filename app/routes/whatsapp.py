@@ -1541,11 +1541,19 @@ async def _handle_existing_lead(
                 # Closing message (no re-introduction)
                 try:
                     event_name = facts.get("event_name") or "Beyond Wealth"
-                    closing = (
-                        f"Estoy muy emocionada de que vayas a ser parte del grupo VIP de *{event_name}*, "
-                        "un evento que va a marcar un antes y un despues en tu vida.\n\n"
-                        "Cualquier pregunta que tengas, aqui estoy para servirte."
-                    ).strip()
+                    is_vip = lead_paid == "PAID"
+                    if is_vip:
+                        closing = (
+                            f"Estoy muy emocionada de que vayas a ser parte del grupo VIP de *{event_name}*, "
+                            "un evento que va a marcar un antes y un despues en tu vida.\n\n"
+                            "Cualquier pregunta que tengas, aqui estoy para servirte."
+                        ).strip()
+                    else:
+                        closing = (
+                            f"Estoy muy emocionada de que vayas a ser parte de *{event_name}*, "
+                            "un evento que va a marcar un antes y un despues en tu vida.\n\n"
+                            "Cualquier pregunta que tengas, aqui estoy para servirte."
+                        ).strip()
                     await send_whatsapp(to_e164=wa_e164, body=closing)
                 except Exception:
                     pass
