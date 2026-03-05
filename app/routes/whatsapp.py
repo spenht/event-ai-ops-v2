@@ -834,6 +834,87 @@ async def _handle_existing_lead(
 
             return  # Done — ticket sent, don't continue to AI reply
 
+        # ---------------------------------------------------------------
+        # VIP PITCH SHORTCUT: if lead just confirmed GENERAL and user
+        # responds affirmatively to the VIP offer, send the hardcoded
+        # pitch + video IMMEDIATELY — skip the AI call entirely.
+        # ---------------------------------------------------------------
+        low_pre = (body or "").strip().lower()
+        lead_status_pre = str((lead.get("status") or "")).upper()
+        vip_pitch_already_sent_pre = _already_sent_media(lead_id, "vip_video")
+
+        if (
+            lead_status_pre == "GENERAL_CONFIRMED"
+            and not vip_pitch_already_sent_pre
+            and str((lead.get("payment_status") or "")).upper() != "PAID"
+        ):
+            # Detect affirmative or VIP-curious responses
+            user_wants_vip_info = any(k in low_pre for k in [
+                "si", "sí", "claro", "dale", "por supuesto", "va",
+                "me gustaría", "me gustaria", "me interesa",
+                "cuéntame", "cuentame", "me encantaría", "me encantaria",
+                "sí me gustaría", "si me gustaria", "quiero saber",
+                "vip", "precio", "cuánto cuesta", "cuanto cuesta",
+                "qué incluye", "que incluye", "incluye", "saber más", "saber mas",
+            ])
+            if user_wants_vip_info:
+                event_name_upper = (facts.get("event_name") or "BEYOND WEALTH").upper()
+                vip_pitch_text = (
+                    f"VIP es la forma mas cercana, estrategica y transformadora de vivir *{event_name_upper}*.\n\n"
+                    "🔥 *Por que ser VIP:*\n"
+                    "- Asientos preferenciales\n"
+                    "- Mastermind intimo\n"
+                    "- Libro firmado\n"
+                    "- Foto con Spencer Hoffmann y algunos speakers\n"
+                    "- Sorpresas especiales\n\n"
+                    "(Por aqui te dejo un mensaje de Spencer sobre el VIP 👇)\n\n"
+                    "Puedes elegir:\n"
+                    "1️⃣ 1 VIP individual x 79 USD\n"
+                    "2️⃣ La opcion mas popular: 2 VIPs x 97 USD (promo especial)\n\n"
+                    "¿Te aparto 1 VIP o prefieres aprovechar la promo de 2?"
+                ).strip()
+
+                # Log inbound
+                try:
+                    sb.table("touchpoints").insert(
+                        {"lead_id": lead_id, "channel": "whatsapp", "event_type": "inbound",
+                         "payload": {"from": wa_from, "body": body, "message_sid": message_sid}}
+                    ).execute()
+                except Exception:
+                    pass
+
+                # MESSAGE 1: VIP pitch text
+                try:
+                    sb.table("touchpoints").insert(
+                        {"lead_id": lead_id, "channel": "whatsapp", "event_type": "outbound_ai",
+                         "payload": {"to": wa_from, "body": vip_pitch_text, "type": "vip_pitch"}}
+                    ).execute()
+                except Exception:
+                    pass
+                await send_whatsapp(to_e164=wa_e164, body=vip_pitch_text)
+
+                # MESSAGE 2: VIP video
+                if settings.whatsapp_video_vip_pitch.strip():
+                    u = settings.whatsapp_video_vip_pitch.strip()
+                    if u.startswith("https://"):
+                        video_intro = "🎥 Aqui tienes un video corto de Spencer explicando el VIP:"
+                        try:
+                            sb.table("touchpoints").insert(
+                                {"lead_id": lead_id, "channel": "whatsapp", "event_type": "media_sent",
+                                 "payload": {"key": "vip_video", "url": u}}
+                            ).execute()
+                        except Exception:
+                            pass
+                        await send_whatsapp(to_e164=wa_e164, body=video_intro, media_urls=[u])
+
+                # Update status
+                try:
+                    sb.table("leads").update({"status": "VIP_INTERESTED"}).eq("lead_id", lead_id).execute()
+                    lead["status"] = "VIP_INTERESTED"
+                except Exception:
+                    pass
+                return  # Done — VIP pitch sent, skip AI
+
         # Build conversation context
         convo = _load_recent_conversation(lead_id)
         if not convo or convo[-1].get("role") != "user" or (convo[-1].get("content") or "").strip() != body:
@@ -1213,7 +1294,7 @@ async def _handle_existing_lead(
                         else:
                             clean = (clean.rstrip() + "\n\nAhorita no pude generar el link 😅 ¿Me pones *VIP* otra vez en 30 segundos?").strip()
                     else:
-                        # Send BOTH options
+                        # Send BOTH options — replace AI response with clean message
                         url1 = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=1)
                         url2 = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=2)
                         links_text = ""
@@ -1223,8 +1304,9 @@ async def _handle_existing_lead(
                             links_text += f"2️⃣ 2 VIPs x 97 USD (promo especial):\n{url2.strip()}\n\n"
                         if links_text:
                             clean = (
-                                links_text.strip() + "\n\n"
-                                + clean.rstrip() + "\n\n"
+                                "¡Perfecto! 😊 Aqui tienes los links de pago:\n\n"
+                                + links_text.strip() + "\n\n"
+                                "¿Necesitas ayuda con algo mas?\n"
                                 "En cuanto se confirme tu pago, te mando tu boleto VIP con QR 🎟️"
                             ).strip()
                         else:
@@ -1400,7 +1482,7 @@ async def _handle_existing_lead(
                 try:
                     await send_whatsapp(
                         to_e164=wa_e164,
-                        body="🎬 Mira lo que dicen quienes ya vivieron Beyond Wealth 👇",
+                        body="🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth 👇",
                         media_urls=[testimonial_url],
                     )
                     sb.table("touchpoints").insert(
@@ -1414,17 +1496,43 @@ async def _handle_existing_lead(
                 except Exception:
                     pass
 
-                # Closing message from Ana
+                # Closing message (no re-introduction)
                 try:
-                    cal_url = _google_calendar_url(facts)
+                    event_name = facts.get("event_name") or "Beyond Wealth"
                     closing = (
-                        "Soy Ana y me da muchisimo gusto poderte servir 😊\n\n"
-                        "Estoy muy emocionada de que vayas a ser parte de *Beyond Wealth*, "
-                        "un evento que puede cambiar tu vida.\n\n"
-                        "Cualquier pregunta que tengas, aqui estoy para servirte.\n\n"
-                        "📅 Recuerda agregar el evento a tu calendario:\n" + cal_url
+                        f"Estoy muy emocionada de que vayas a ser parte del grupo VIP de *{event_name}*, "
+                        "un evento que va a marcar un antes y un despues en tu vida.\n\n"
+                        "Cualquier pregunta que tengas, aqui estoy para servirte."
                     ).strip()
                     await send_whatsapp(to_e164=wa_e164, body=closing)
+                except Exception:
+                    pass
+
+                # Schedule calendar reminder for ~10 min later
+                try:
+                    from datetime import timedelta, timezone as tz_
+                    lead_name = (lead.get("name") or "").strip()
+                    cal_url = _google_calendar_url(facts)
+                    send_at = (datetime.now(tz_.utc) + timedelta(minutes=10)).isoformat()
+                    cal_msg = (
+                        f"{lead_name} 😊 quise tomarme la libertad de mandarte nuevamente la liga "
+                        "para que agregues el evento a tu calendario y lo tengas super presente, "
+                        "ahi viene la direccion del lugar tambien, de esa manera tienes todo a la mano "
+                        "ya en tu agenda. Solo dale click abajo y dale aceptar y listo :)\n\n"
+                        f"📅 {cal_url}"
+                    ).strip()
+                    sb.table("touchpoints").insert({
+                        "lead_id": lead_id,
+                        "channel": "whatsapp",
+                        "event_type": "scheduled_message",
+                        "payload": {
+                            "type": "calendar_reminder",
+                            "send_after": send_at,
+                            "status": "pending",
+                            "body": cal_msg,
+                            "wa": wa_e164,
+                        },
+                    }).execute()
                 except Exception:
                     pass
 

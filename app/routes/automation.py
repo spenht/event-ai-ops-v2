@@ -332,5 +332,43 @@ async def run_followups(request: Request):
         except Exception:
             pass
 
-    logger.info("followup_run processed=%d sent=%d errors=%d", processed, sent, errors)
-    return {"processed": processed, "sent": sent, "errors": errors}
+    # ------------------------------------------------------------------
+    # Process scheduled messages (e.g. calendar reminders 10 min later)
+    # ------------------------------------------------------------------
+    sched_sent = 0
+    try:
+        sched_r = (
+            sb.table("touchpoints")
+            .select("*")
+            .eq("channel", "whatsapp")
+            .eq("event_type", "scheduled_message")
+            .execute()
+        )
+        for tp in (sched_r.data or []):
+            payload = tp.get("payload") or {}
+            if payload.get("status") != "pending":
+                continue
+            send_after = payload.get("send_after", "")
+            try:
+                send_after_dt = datetime.fromisoformat(send_after.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            if now < send_after_dt:
+                continue
+            wa = (payload.get("wa") or "").strip()
+            body = (payload.get("body") or "").strip()
+            if not wa or not body:
+                continue
+            try:
+                await send_whatsapp(to_e164=wa, body=body)
+                payload["status"] = "sent"
+                sb.table("touchpoints").update({"payload": payload}).eq("id", tp["id"]).execute()
+                sched_sent += 1
+                logger.info("scheduled_msg_sent tp_id=%s type=%s", tp.get("id"), payload.get("type"))
+            except Exception as e:
+                logger.error("scheduled_msg_failed tp_id=%s err=%s", tp.get("id"), str(e)[:200])
+    except Exception:
+        logger.exception("scheduled_msg_query_failed")
+
+    logger.info("followup_run processed=%d sent=%d errors=%d scheduled=%d", processed, sent, errors, sched_sent)
+    return {"processed": processed, "sent": sent, "errors": errors, "scheduled_sent": sched_sent}
