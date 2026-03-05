@@ -28,6 +28,7 @@ from fastapi import APIRouter, HTTPException, Request
 from ..deps import sb
 from ..settings import settings
 from ..services.twilio_whatsapp import send_whatsapp
+from ..routes.broadcasts import execute_campaign
 
 logger = logging.getLogger("automation")
 
@@ -370,5 +371,45 @@ async def run_followups(request: Request):
     except Exception:
         logger.exception("scheduled_msg_query_failed")
 
-    logger.info("followup_run processed=%d sent=%d errors=%d scheduled=%d", processed, sent, errors, sched_sent)
-    return {"processed": processed, "sent": sent, "errors": errors, "scheduled_sent": sched_sent}
+    # ------------------------------------------------------------------
+    # Process due broadcast campaigns
+    # ------------------------------------------------------------------
+    broadcasts_executed = 0
+    try:
+        bc_r = (
+            sb.table("broadcasts")
+            .select("id,campaign_name,template_name,scheduled_at,status")
+            .eq("status", "scheduled")
+            .lte("scheduled_at", now.isoformat())
+            .execute()
+        )
+        due_campaigns = bc_r.data or []
+        for bc in due_campaigns:
+            bc_id = bc.get("id", "")
+            bc_name = bc.get("campaign_name", "")
+            try:
+                stats = await execute_campaign(bc_id)
+                broadcasts_executed += 1
+                logger.info(
+                    "broadcast_campaign_executed id=%s name=%s sent=%s failed=%s",
+                    bc_id, bc_name, stats.get("sent", 0), stats.get("failed", 0),
+                )
+            except Exception as e:
+                logger.error(
+                    "broadcast_campaign_failed id=%s name=%s err=%s",
+                    bc_id, bc_name, str(e)[:300],
+                )
+    except Exception:
+        logger.exception("broadcast_campaign_query_failed")
+
+    logger.info(
+        "followup_run processed=%d sent=%d errors=%d scheduled=%d broadcasts=%d",
+        processed, sent, errors, sched_sent, broadcasts_executed,
+    )
+    return {
+        "processed": processed,
+        "sent": sent,
+        "errors": errors,
+        "scheduled_sent": sched_sent,
+        "broadcasts_executed": broadcasts_executed,
+    }
