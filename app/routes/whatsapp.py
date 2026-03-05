@@ -140,7 +140,7 @@ def _strip_media_placeholders(text: str) -> str:
 def _extract_name(text: str) -> Optional[str]:
     """Best-effort name extraction.
 
-    IMPORTANT: Only accept explicit name-intent patterns to avoid false positives (e.g. “sí me encantaría”).
+    IMPORTANT: Only accept explicit name-intent patterns to avoid false positives (e.g. "sí me encantaría").
     """
     if not text:
         return None
@@ -955,15 +955,15 @@ async def whatsapp_inbound(request: Request):
             except Exception:
                 url = None
             if url:
-                url = (url or “”).strip()
+                url = (url or "").strip()
                 # Links FIRST, then explanation. People click faster when
                 # the link is the first thing they see.
                 clean = (
-                    “🔥 Link de pago VIP:\n”
+                    "\U0001f525 Link de pago VIP:\n"
                     + url
-                    + “\n\n”
+                    + "\n\n"
                     + clean.rstrip()
-                    + “\n\nEn cuanto se confirme tu pago, te mando tu boleto VIP con QR 🎟️”
+                    + "\n\nEn cuanto se confirme tu pago, te mando tu boleto VIP con QR \U0001f39f\ufe0f"
                 ).strip()
             else:
                 clean = (
