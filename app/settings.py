@@ -64,5 +64,10 @@ class Settings:
     event_speakers: str = _env("EVENT_SPEAKERS", "")
     vip_price: str = _env("VIP_PRICE", "")
 
+    # Google Sheets
+    google_service_account_json: str = _env("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    gsheet_all_leads_id: str = _env("GSHEET_ALL_LEADS_ID", "")
+    gsheet_sales_leads_id: str = _env("GSHEET_SALES_LEADS_ID", "")
+
 
 settings = Settings()

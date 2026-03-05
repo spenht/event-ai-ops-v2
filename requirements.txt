@@ -7,3 +7,5 @@ stripe==10.11.0
 qrcode[pil]==7.4.2
 pillow==10.4.0
 python-multipart==0.0.9
+gspread>=6.0
+google-auth>=2.0

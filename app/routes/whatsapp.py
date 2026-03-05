@@ -19,8 +19,17 @@ from ..services.tickets import generate_ticket_png
 from ..services.stripe_checkout import create_vip_checkout_link
 from ..services.twilio_whatsapp import normalize_mx_whatsapp, send_whatsapp
 from ..services.url_shortener import create_short_url
+from ..services.google_sheets import sync_lead_to_all_leads_sheet
 
 logger = logging.getLogger("whatsapp")
+
+
+def _sync_to_sheets(lead: dict) -> None:
+    """Fire-and-forget sync lead to Google Sheets (All Leads backup)."""
+    try:
+        asyncio.create_task(sync_lead_to_all_leads_sheet(lead))
+    except Exception:
+        pass
 
 router = APIRouter(prefix="/v1/messaging/whatsapp", tags=["whatsapp"])
 
@@ -480,6 +489,7 @@ async def whatsapp_inbound(request: Request):
                     try:
                         sb.table("leads").update({"whatsapp": wa_e164}).eq("lead_id", lead["lead_id"]).execute()
                         lead["whatsapp"] = wa_e164
+                        _sync_to_sheets(lead)
                     except Exception:
                         pass
             except Exception:
@@ -528,6 +538,7 @@ async def whatsapp_inbound(request: Request):
                 lead = (ins.data or [new_lead])[0] or new_lead
             else:
                 lead = new_lead
+            _sync_to_sheets(lead)
         except Exception as e:
             # Log the full exception so we can diagnose schema/RLS issues quickly.
             logger.exception("lead_autocreate_failed")
@@ -551,6 +562,7 @@ async def whatsapp_inbound(request: Request):
                     sb.table("leads").update(updates).eq("lead_id", lead_id_new).execute()
                     # Keep local copy in sync
                     lead.update(updates)
+                    _sync_to_sheets(lead)
                 except Exception:
                     pass
         except Exception:
@@ -680,6 +692,7 @@ async def _handle_existing_lead(
                             companion_lead = (ins.data or [companion_row])[0] or companion_row
                         else:
                             companion_lead = companion_row
+                        _sync_to_sheets(companion_lead)
                     except Exception:
                         companion_lead = None
 
@@ -753,6 +766,7 @@ async def _handle_existing_lead(
                 try:
                     sb.table("leads").update(updates).eq("lead_id", lead_id).execute()
                     lead.update(updates)
+                    _sync_to_sheets(lead)
                 except Exception:
                     pass
         except Exception:
@@ -775,6 +789,7 @@ async def _handle_existing_lead(
             try:
                 sb.table("leads").update({"status": "GENERAL_CONFIRMED"}).eq("lead_id", lead_id).execute()
                 lead["status"] = "GENERAL_CONFIRMED"
+                _sync_to_sheets(lead)
             except Exception:
                 pass
 
@@ -916,6 +931,7 @@ async def _handle_existing_lead(
                 try:
                     sb.table("leads").update({"status": "VIP_INTERESTED"}).eq("lead_id", lead_id).execute()
                     lead["status"] = "VIP_INTERESTED"
+                    _sync_to_sheets(lead)
                 except Exception:
                     pass
                 return  # Done — VIP pitch sent, skip AI
@@ -1114,6 +1130,7 @@ async def _handle_existing_lead(
             try:
                 sb.table("leads").update({"status": "VIP_INTERESTED"}).eq("lead_id", lead_id).execute()
                 lead["status"] = "VIP_INTERESTED"
+                _sync_to_sheets(lead)
             except Exception:
                 pass
 
@@ -1343,6 +1360,7 @@ async def _handle_existing_lead(
                 try:
                     sb.table("leads").update({"status": "VIP_LINK_SENT"}).eq("lead_id", lead_id).execute()
                     lead["status"] = "VIP_LINK_SENT"
+                    _sync_to_sheets(lead)
                 except Exception:
                     pass
 
@@ -1443,6 +1461,7 @@ async def _handle_existing_lead(
                 except Exception:
                     pass
             lead["status"] = "GENERAL_CONFIRMED"
+            _sync_to_sheets(lead)
 
             if settings.public_base_url:
                 ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts)

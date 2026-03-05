@@ -402,9 +402,22 @@ async def run_followups(request: Request):
     except Exception:
         logger.exception("broadcast_campaign_query_failed")
 
+    # ------------------------------------------------------------------
+    # Sync sales leads to Google Sheets (Spartans list)
+    # ------------------------------------------------------------------
+    gsheet_synced = 0
+    try:
+        from ..services.google_sheets import sync_sales_leads_sheet
+        gsheet_result = await sync_sales_leads_sheet()
+        gsheet_synced = gsheet_result.get("synced", 0)
+        if gsheet_synced:
+            logger.info("gsheet_sales_sync synced=%d", gsheet_synced)
+    except Exception:
+        logger.exception("gsheet_sales_sync_failed")
+
     logger.info(
-        "followup_run processed=%d sent=%d errors=%d scheduled=%d broadcasts=%d",
-        processed, sent, errors, sched_sent, broadcasts_executed,
+        "followup_run processed=%d sent=%d errors=%d scheduled=%d broadcasts=%d gsheet=%d",
+        processed, sent, errors, sched_sent, broadcasts_executed, gsheet_synced,
     )
     return {
         "processed": processed,
@@ -412,4 +425,5 @@ async def run_followups(request: Request):
         "errors": errors,
         "scheduled_sent": sched_sent,
         "broadcasts_executed": broadcasts_executed,
+        "gsheet_sales_synced": gsheet_synced,
     }
