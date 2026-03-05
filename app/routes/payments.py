@@ -28,10 +28,10 @@ def _event_facts(event_id: str | None) -> dict:
 
     return {
         "event_id": event_id,
-        "event_name": settings.event_name or event.get("event_name") or "Evento",
-        "event_date": settings.event_date or str(event.get("starts_at") or ""),
-        "event_place": settings.event_place or event.get("address") or "",
-        "event_speakers": settings.event_speakers or "",
+        "event_name": (event.get("event_name") or settings.event_name or "Evento").strip(),
+        "event_date": (str(event.get("starts_at") or "") or settings.event_date or "").strip(),
+        "event_place": (event.get("address") or settings.event_place or "").strip(),
+        "event_speakers": (event.get("speakers") or settings.event_speakers or "").strip(),
     }
 
 
@@ -164,12 +164,25 @@ async def stripe_webhook(request: Request):
                     media = f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                     msg = (
                         "✅ ¡Listo! Pago confirmado.\n"
-                        "Aquí está tu boleto VIP con tu QR (guárdalo).\n\n"
-                        "Si quieres, dime: ¿qué te urge destrabar en el evento para que valga cada minuto?"
+                        "Aquí esta tu boleto VIP con tu QR (guardalo).\n\n"
+                        "Si quieres, dime: ¿que te urge destrabar en el evento para que valga cada minuto?"
                     )
                     try:
                         await send_whatsapp(wa, msg, media_urls=[media])
                     except Exception as e:
                         logger.error("send_ticket_failed %s", str(e)[:300])
+
+                    # Mark ticket as sent so whatsapp handler doesn't re-send
+                    try:
+                        sb.table("touchpoints").insert(
+                            {
+                                "lead_id": lead_id,
+                                "channel": "whatsapp",
+                                "event_type": "ticket_sent",
+                                "payload": {"tier": tier, "ticket_id": ticket["ticket_id"], "source": "stripe_webhook"},
+                            }
+                        ).execute()
+                    except Exception:
+                        pass
 
     return {"ok": True}

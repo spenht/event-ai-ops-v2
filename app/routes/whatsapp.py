@@ -148,6 +148,22 @@ def _extract_name(text: str) -> Optional[str]:
 
     t = re.sub(r"\s+", " ", text.strip())
 
+    # Pattern: "Name, email" or "Name\nemail" (common when user provides both)
+    email_in_text = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", t, re.I)
+    if email_in_text:
+        # Take everything before the email (or before comma/newline preceding it)
+        pre = t[:email_in_text.start()].rstrip(" ,\n\t")
+        # Clean up: remove common labels
+        pre = re.sub(r"^(nombre|name)\s*[:\-]\s*", "", pre, flags=re.I).strip()
+        pre = re.sub(r"^(correo|email|mail)\s*[:\-]\s*.*$", "", pre, flags=re.I | re.M).strip()
+        if pre:
+            words = pre.split()
+            if 1 <= len(words) <= 5 and re.fullmatch(r"[A-Za-zÁÉÍÓÚÜÑáéíóüñ\s'.-]+", pre):
+                name = pre
+                # Skip the rejection logic below — this is a strong signal
+                if len(name) >= 2:
+                    return name[:80]
+
     # Common patterns: "soy Juan", "me llamo Juan", "mi nombre es Juan"
     m = re.search(
         r"\b(soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÜÑáéíóüñ][A-Za-zÁÉÍÓÚÜÑáéíóüñ\s'.-]{1,60})",
@@ -362,6 +378,38 @@ def _is_first_contact(lead_id: str) -> bool:
     return _last_outbound(lead_id) == ""
 
 
+def _google_calendar_url(facts: dict[str, str]) -> str:
+    """Build a Google Calendar 'add event' URL from event facts."""
+    from urllib.parse import quote_plus
+    name = facts.get("event_name") or "Beyond Wealth"
+    place = facts.get("event_place") or ""
+    speakers = facts.get("event_speakers") or ""
+    date_raw = facts.get("event_date") or ""
+
+    # Try to parse ISO datetime for proper calendar format
+    # Default: 2026-03-27T15:00 to 2026-03-30T01:30
+    start_dt = "20260327T150000Z"
+    end_dt = "20260330T013000Z"
+    try:
+        if "T" in date_raw:
+            clean_dt = date_raw.replace("+00:00", "").replace("-", "").replace(":", "")
+            if len(clean_dt) >= 15:
+                start_dt = clean_dt[:15] + "Z"
+    except Exception:
+        pass
+
+    details = f"{name}\nSpeakers: {speakers}\nLugar: {place}"
+    url = (
+        "https://calendar.google.com/calendar/render?"
+        f"action=TEMPLATE"
+        f"&text={quote_plus(name)}"
+        f"&details={quote_plus(details)}"
+        f"&dates={start_dt}/{end_dt}"
+        f"&location={quote_plus(place)}"
+    )
+    return url
+
+
 def _event_facts(event_id: Optional[str]) -> dict[str, str]:
     event: dict[str, Any] = {}
     if event_id:
@@ -373,11 +421,11 @@ def _event_facts(event_id: Optional[str]) -> dict[str, str]:
 
     return {
         "event_id": event_id or "",
-        "event_name": (settings.event_name or event.get("event_name") or "el evento").strip(),
-        "event_date": (settings.event_date or str(event.get("starts_at") or "")).strip(),
-        "event_place": (settings.event_place or event.get("address") or "").strip(),
-        "event_speakers": (settings.event_speakers or DEFAULT_SPEAKERS).strip(),
-        "vip_price": (settings.vip_price or str(event.get("vip_price_usd") or "")).strip(),
+        "event_name": (event.get("event_name") or settings.event_name or "el evento").strip(),
+        "event_date": (str(event.get("starts_at") or "") or settings.event_date or "").strip(),
+        "event_place": (event.get("address") or settings.event_place or "").strip(),
+        "event_speakers": (event.get("speakers") or settings.event_speakers or DEFAULT_SPEAKERS).strip(),
+        "vip_price": (str(event.get("vip_price_usd") or "") or settings.vip_price or "").strip(),
     }
 
 
@@ -509,7 +557,9 @@ async def whatsapp_inbound(request: Request):
 
         # Friendly first touch for new leads
         return _twiml_message(
-            "¡Hola! 😊 Soy Ana del equipo de Beyond Wealth.\n\nYa te aparté un lugar en *GENERAL* (gratis).\n\nPara confirmarlo: ¿prefieres confirmar tu boleto *GENERAL* o te gustaría escuchar del *VIP*?"
+            "¡Hola! 😊 Soy Ana del equipo de Beyond Wealth.\n\n"
+            "Ya te aparte un lugar en *GENERAL* (gratis).\n\n"
+            "Para confirmarlo: ¿me compartes tu *nombre* y tu *correo* (en un solo mensaje)?"
         )
 
     lead_id = lead["lead_id"]
@@ -808,9 +858,23 @@ async def _handle_existing_lead(
         )
 
         if vip_context and vip_explainer_message and str((lead.get("payment_status") or "")).upper() != "PAID":
-            if "precio de un libro" not in clean_low:
-                clean = ("📘 Por el precio de un libro, obtienes:\n" + clean.lstrip()).strip()
-                clean_low = (clean or "").lower()
+            event_name_upper = (facts.get("event_name") or "BEYOND WEALTH").upper()
+            clean = (
+                f"VIP es la forma mas cercana, estrategica y transformadora de vivir *{event_name_upper}*.\n\n"
+                "🔥 *Por que ser VIP:*\n"
+                "- Asientos preferenciales\n"
+                "- Mastermind intimo\n"
+                "- Libro firmado\n"
+                "- Foto con Spencer Hoffmann y algunos speakers\n"
+                "- Sorpresas especiales\n\n"
+                "(Por aqui te dejo un mensaje de Spencer sobre el VIP 👇)\n\n"
+                "Puedes elegir:\n"
+                "1️⃣ 1 VIP individual x 79 USD\n"
+                "2️⃣ La opcion mas popular: 2 VIPs x 97 USD (promo especial)\n\n"
+                "¿Te aparto 1 VIP o prefieres aprovechar la promo de 2?\n\n"
+                "🎥 Aqui tienes un video corto de Spencer explicando el VIP:"
+            ).strip()
+            clean_low = clean.lower()
 
         # VIP pitch video (send as real media, at most once per lead)
         should_send_vip_video = ("[[SEND_VIP_VIDEO]]" in tokens) or asks_vip_details or (vip_context and vip_explainer_message)
@@ -942,30 +1006,22 @@ async def _handle_existing_lead(
             # Avoid duplicating the link if the model already included it
             if "checkout.stripe.com" not in clean and "https://checkout.stripe.com" not in clean:
                 try:
-                    # Si el modelo metió un link placeholder en Markdown, quítalo antes de pegar el link real
+                    # Remove AI placeholders
                     clean = re.sub(r"\[[^\]]+\]\((https?://[^\)]+)\)", "", clean, flags=re.I).strip()
                     clean = re.sub(r"https?://(?:www\.)?example\.com\S*", "", clean, flags=re.I).strip()
                     clean = re.sub(r"https?://stripe-link-para-pago\S*", "", clean, flags=re.I).strip()
                     clean = re.sub(r"\[\s*link\s*\]", "", clean, flags=re.I).strip()
                     checkout_lead_id = lead_id
 
-                    # If the user is asking to pay for a companion ("para ella", "acompañante", etc.),
-                    # use the most recently captured companion_lead_id so Stripe link is NEW and not the already-paid one.
+                    # companion payment logic (keep existing)
                     is_companion_payment = any(
                         k in low
                         for k in [
-                            "acompanante",
-                            "acompañante",
-                            "para ella",
-                            "para el",
-                            "para florencia",
-                            "solo para ella",
-                            "solo para el",
-                            "para mi acompañante",
-                            "para mi acompanante",
+                            "acompanante", "acompañante", "para ella", "para el",
+                            "para florencia", "solo para ella", "solo para el",
+                            "para mi acompañante", "para mi acompanante",
                         ]
                     )
-
                     if is_companion_payment:
                         try:
                             tp = (
@@ -986,25 +1042,61 @@ async def _handle_existing_lead(
                         except Exception:
                             pass
 
-                    url = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id)
+                    # Detect which option user wants
+                    wants_option_2 = any(k in low for k in [
+                        "2", "dos", "opcion 2", "opción 2", "la 2", "el 2",
+                        "quiero 2", "promo", "la promo", "los 2", "los dos",
+                        "2 vip", "dos vip", "2 boletos", "dos boletos",
+                    ])
+                    wants_option_1 = any(k in low for k in [
+                        "1", "uno", "opcion 1", "opción 1", "la 1", "el 1",
+                        "quiero 1", "1 vip", "un vip", "individual",
+                    ])
+
+                    if wants_option_2 and not wants_option_1:
+                        # User explicitly wants option 2
+                        url = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=2)
+                        if url:
+                            url = url.strip()
+                            clean = (
+                                "🔥 ¡Excelente eleccion! 2 VIPs x 97 USD (la promo mas popular).\n\n"
+                                "Link de pago:\n" + url + "\n\n"
+                                "En cuanto se confirme tu pago, te mando tu boleto VIP con QR 🎟️"
+                            ).strip()
+                        else:
+                            clean = (clean.rstrip() + "\n\nAhorita no pude generar el link 😅 ¿Me pones *VIP* otra vez en 30 segundos?").strip()
+                    elif wants_option_1:
+                        # User explicitly wants option 1
+                        url = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=1)
+                        if url:
+                            url = url.strip()
+                            clean = (
+                                "🔥 ¡Perfecto! 1 VIP individual x 79 USD.\n\n"
+                                "Link de pago:\n" + url + "\n\n"
+                                "En cuanto se confirme tu pago, te mando tu boleto VIP con QR 🎟️"
+                            ).strip()
+                        else:
+                            clean = (clean.rstrip() + "\n\nAhorita no pude generar el link 😅 ¿Me pones *VIP* otra vez en 30 segundos?").strip()
+                    else:
+                        # Send BOTH options
+                        url1 = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=1)
+                        url2 = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=2)
+                        links_text = ""
+                        if url1:
+                            links_text += f"1️⃣ 1 VIP individual x 79 USD:\n{url1.strip()}\n\n"
+                        if url2:
+                            links_text += f"2️⃣ 2 VIPs x 97 USD (promo especial):\n{url2.strip()}\n\n"
+                        if links_text:
+                            clean = (
+                                links_text.strip() + "\n\n"
+                                + clean.rstrip() + "\n\n"
+                                "En cuanto se confirme tu pago, te mando tu boleto VIP con QR 🎟️"
+                            ).strip()
+                        else:
+                            clean = (clean.rstrip() + "\n\nAhorita no pude generar el link 😅 ¿Me pones *VIP* otra vez en 30 segundos?").strip()
                 except Exception:
                     url = None
-                if url:
-                    url = (url or "").strip()
-                    # Links FIRST, then explanation. People click faster when
-                    # the link is the first thing they see.
-                    clean = (
-                        "\U0001f525 Link de pago VIP:\n"
-                        + url
-                        + "\n\n"
-                        + clean.rstrip()
-                        + "\n\nEn cuanto se confirme tu pago, te mando tu boleto VIP con QR \U0001f39f\ufe0f"
-                    ).strip()
-                else:
-                    clean = (
-                        clean.rstrip()
-                        + "\n\nAhorita no pude generar el link 😅 ¿me pones *VIP* otra vez en 30 segundos?"
-                    ).strip()
+                    clean = (clean.rstrip() + "\n\nAhorita no pude generar el link 😅 ¿Me pones *VIP* otra vez en 30 segundos?").strip()
 
         # If model asked to send General ticket
         if "[[SEND_GENERAL_TICKET]]" in tokens:
@@ -1048,7 +1140,8 @@ async def _handle_existing_lead(
                 f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
             )
             if "qr" not in clean.lower() and "boleto" not in clean.lower():
-                clean = (clean.rstrip() + "\n\n✅ Aquí tienes tu boleto VIP con QR 👇").strip()
+                cal_url = _google_calendar_url(facts)
+                clean = (clean.rstrip() + "\n\n✅ Aqui tienes tu boleto VIP con QR 👇\n\n📅 Agregalo a tu calendario:\n" + cal_url).strip()
 
         # If Stripe webhook already marked this lead as PAID, automatically send VIP ticket ONCE (no user trigger needed)
         if str((lead.get("payment_status") or "")).upper() == "PAID":
@@ -1057,10 +1150,13 @@ async def _handle_existing_lead(
                 media_urls.append(
                     f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                 )
-                if "qr" not in clean.lower() and "boleto" not in clean.lower():
-                    clean = (clean.rstrip() + "\n\n✅ Pago confirmado. Aquí está tu boleto VIP con QR 👇").strip()
+                cal_url = _google_calendar_url(facts)
+                clean = (
+                    "✅ Pago confirmado. Aqui esta tu boleto VIP con QR 👇\n\n"
+                    "📅 Agregalo a tu calendario:\n" + cal_url
+                ).strip()
 
-                # Mark that we already sent the VIP ticket so it doesn't get re-sent on every message
+                # Mark that we already sent the VIP ticket
                 try:
                     sb.table("touchpoints").insert(
                         {
@@ -1088,15 +1184,30 @@ async def _handle_existing_lead(
                 media_urls.append(
                     f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                 )
+                cal_url = _google_calendar_url(facts)
                 clean = (
-                    "✅ Perfecto. Te confirmé en *GENERAL* (sin VIP).\n"
-                    "Aquí está tu boleto con QR 👇\n\n"
-                    "Tip: para aprovecharlo cañón, intenta asistir los *3 días completos*."
+                    "✅ Listo. Ya tienes tu acceso *GENERAL* confirmado (sin costo).\n"
+                    "Aqui esta tu boleto con QR 👇\n\n"
+                    "📅 Agregalo a tu calendario:\n" + cal_url + "\n\n"
+                    "¿Te gustaria conocer el pase *VIP* y saber todo lo que incluye?"
                 ).strip()
+
+                # Mark ticket sent
+                try:
+                    sb.table("touchpoints").insert(
+                        {
+                            "lead_id": lead_id,
+                            "channel": "whatsapp",
+                            "event_type": "ticket_sent",
+                            "payload": {"tier": "GENERAL", "ticket_id": ticket["ticket_id"]},
+                        }
+                    ).execute()
+                except Exception:
+                    pass
             else:
                 clean = (
-                    "✅ Perfecto. Te confirmé en *GENERAL* (sin VIP).\n\n"
-                    "(Nota: falta PUBLIC_BASE_URL para mandar tu QR automático.)"
+                    "✅ Listo. Ya tienes tu acceso *GENERAL* confirmado (sin costo).\n\n"
+                    "(Nota: falta PUBLIC_BASE_URL para mandar tu QR automatico.)"
                 ).strip()
 
         # Save outbound
@@ -1118,6 +1229,47 @@ async def _handle_existing_lead(
 
         # Send reply via Twilio REST API (background; TwiML already returned empty).
         await send_whatsapp(to_e164=wa_e164, body=clean, media_urls=media_urls or None)
+
+        # --- Post-reply: send testimonial video + closing message (once per lead) ---
+        lead_status = str((lead.get("status") or "")).upper()
+        lead_paid = str((lead.get("payment_status") or "")).upper()
+        ticket_just_sent = (
+            (wants_general and lead_status in ("GENERAL_CONFIRMED",))
+            or (lead_paid == "PAID" and "boleto" in clean.lower())
+        )
+        if ticket_just_sent and settings.whatsapp_video_testimonios.strip():
+            if not _already_sent_media(lead_id, "testimonios"):
+                testimonial_url = settings.whatsapp_video_testimonios.strip()
+                try:
+                    await send_whatsapp(
+                        to_e164=wa_e164,
+                        body="🎬 Mira lo que dicen quienes ya vivieron Beyond Wealth 👇",
+                        media_urls=[testimonial_url],
+                    )
+                    sb.table("touchpoints").insert(
+                        {
+                            "lead_id": lead_id,
+                            "channel": "whatsapp",
+                            "event_type": "media_sent",
+                            "payload": {"key": "testimonios", "url": testimonial_url},
+                        }
+                    ).execute()
+                except Exception:
+                    pass
+
+                # Closing message from Ana
+                try:
+                    cal_url = _google_calendar_url(facts)
+                    closing = (
+                        "Soy Ana y me da muchisimo gusto poderte servir 😊\n\n"
+                        "Estoy muy emocionada de que vayas a ser parte de *Beyond Wealth*, "
+                        "un evento que puede cambiar tu vida.\n\n"
+                        "Cualquier pregunta que tengas, aqui estoy para servirte.\n\n"
+                        "📅 Recuerda agregar el evento a tu calendario:\n" + cal_url
+                    ).strip()
+                    await send_whatsapp(to_e164=wa_e164, body=closing)
+                except Exception:
+                    pass
 
     except Exception:
         logger.exception("bg_reply_failed lead=%s", lead_id)
