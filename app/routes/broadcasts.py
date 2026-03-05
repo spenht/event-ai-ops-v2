@@ -45,6 +45,7 @@ from pydantic import BaseModel
 
 from ..deps import sb
 from ..settings import settings
+from ..services.twilio_whatsapp import send_whatsapp
 from ..services.whatsapp_templates import (
     TEMPLATES,
     create_all_templates,
@@ -211,6 +212,17 @@ async def execute_campaign(campaign_id: str) -> dict[str, Any]:
                 "broadcast_sent campaign=%s template=%s lead=%s sid=%s",
                 campaign_id, template_name, lead_id, msg_sid,
             )
+
+            # Follow-up messages after specific templates
+            if template_name == "gift_course" and msg_sid:
+                try:
+                    await send_whatsapp(
+                        to_e164=wa,
+                        body="👆 Aquí puedes acceder al curso:\nhttps://whop.com/legacy-business-academy-llc/vip-curso-mentalidad\n\n¡Disfrútalo! 🔥",
+                    )
+                except Exception as fu_err:
+                    logger.warning("gift_course_followup_failed lead=%s err=%s", lead_id, str(fu_err)[:200])
+
         except Exception as e:
             failed += 1
             msg_sid = ""
