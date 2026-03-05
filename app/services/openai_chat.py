@@ -92,7 +92,7 @@ async def generate_reply(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        async with httpx.AsyncClient(timeout=12.0) as client:
             resp = await client.post(
                 "https://api.openai.com/v1/responses",
                 headers={
