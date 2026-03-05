@@ -11,6 +11,7 @@ from .routes.automation import router as automation_router
 from .routes.short_urls import router as short_urls_router
 from .routes.broadcasts import router as broadcasts_router
 from .routes.spartans import router as spartans_router
+from .routes.checkin import router as checkin_router
 
 logging.basicConfig(level=logging.INFO)
 
@@ -23,6 +24,7 @@ app.include_router(automation_router)
 app.include_router(short_urls_router)
 app.include_router(broadcasts_router)
 app.include_router(spartans_router)
+app.include_router(checkin_router)
 
 
 @app.get("/health")

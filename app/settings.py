@@ -57,6 +57,9 @@ class Settings:
     # Spartans
     spartans_key: str = _env("SPARTANS_KEY", "")
 
+    # Check-in
+    checkin_key: str = _env("CHECKIN_KEY", "")
+
     # Default event
     default_event_id: str = _env("DEFAULT_EVENT_ID", "")
 
