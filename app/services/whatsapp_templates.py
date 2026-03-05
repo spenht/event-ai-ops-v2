@@ -207,9 +207,9 @@ def _create_template_sync(name: str, body: str, language: str) -> dict[str, Any]
 def _submit_approval_sync(content_sid: str, name: str, category: str) -> dict[str, Any]:
     """Submit a content template for WhatsApp approval (synchronous).
 
-    POST https://content.twilio.com/v1/Content/{content_sid}/ApprovalRequests
+    POST https://content.twilio.com/v1/Content/{content_sid}/ApprovalRequests/whatsapp
     """
-    url = f"{CONTENT_API_BASE}/{content_sid}/ApprovalRequests"
+    url = f"{CONTENT_API_BASE}/{content_sid}/ApprovalRequests/whatsapp"
     payload = {
         "name": name,
         "category": category,
