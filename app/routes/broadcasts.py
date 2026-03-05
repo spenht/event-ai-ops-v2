@@ -46,6 +46,7 @@ from pydantic import BaseModel
 from ..deps import sb
 from ..settings import settings
 from ..services.twilio_whatsapp import send_whatsapp
+from ..services.url_shortener import create_short_url
 from ..services.whatsapp_templates import (
     TEMPLATES,
     create_all_templates,
@@ -216,9 +217,13 @@ async def execute_campaign(campaign_id: str) -> dict[str, Any]:
             # Follow-up messages after specific templates
             if template_name == "gift_course" and msg_sid:
                 try:
+                    course_url = await create_short_url(
+                        "https://whop.com/legacy-business-academy-llc/vip-curso-mentalidad",
+                        lead_id=lead_id, url_type="gift_course", prefix="curso_",
+                    )
                     await send_whatsapp(
                         to_e164=wa,
-                        body="👆 Aquí puedes acceder al curso:\nhttps://whop.com/legacy-business-academy-llc/vip-curso-mentalidad\n\n¡Disfrútalo! 🔥",
+                        body=f"👆 Aquí puedes acceder al curso:\n{course_url}\n\n¡Disfrútalo! 🔥",
                     )
                 except Exception as fu_err:
                     logger.warning("gift_course_followup_failed lead=%s err=%s", lead_id, str(fu_err)[:200])
