@@ -172,24 +172,31 @@ def _sync_lead_to_all_leads_sync(lead: dict[str, Any]) -> None:
 
     row_data = _lead_to_all_leads_row(lead)
 
+    wa = str(lead.get("whatsapp") or "").strip()
+
     try:
         # Find existing row by lead_id in column A
-        cell = ws.find(lead_id, in_column=1)
+        cell = None
+        try:
+            cell = ws.find(lead_id, in_column=1)
+        except gspread.exceptions.CellNotFound:
+            pass
+
+        # Fallback: find by WhatsApp in column D (dedup by phone number)
+        if not cell and wa:
+            try:
+                cell = ws.find(wa, in_column=4)
+            except gspread.exceptions.CellNotFound:
+                pass
+
         if cell:
-            # Update existing row
+            # Update existing row (also updates lead_id if it changed)
             end_col = _col_letter(len(row_data))
             ws.update(f"A{cell.row}:{end_col}{cell.row}", [row_data])
             logger.info("gsheet_updated sheet=all_leads lead=%s row=%d", lead_id, cell.row)
         else:
             ws.append_row(row_data, value_input_option="RAW")
             logger.info("gsheet_appended sheet=all_leads lead=%s", lead_id)
-    except gspread.exceptions.CellNotFound:
-        # lead_id not found in sheet — append new row
-        try:
-            ws.append_row(row_data, value_input_option="RAW")
-            logger.info("gsheet_appended sheet=all_leads lead=%s", lead_id)
-        except Exception as exc:
-            logger.error("gsheet_append_failed sheet=all_leads lead=%s err=%s", lead_id, str(exc)[:200])
     except Exception as exc:
         logger.error("gsheet_sync_failed sheet=all_leads lead=%s err=%s", lead_id, str(exc)[:200])
 
@@ -236,16 +243,24 @@ def _sync_sales_leads_sync(eligible_leads: list[dict[str, Any]]) -> dict[str, in
     headers = SALES_LEADS_COLUMNS + ["call_status", "notes"]
     _ensure_headers_sync(ws, headers)
 
-    # Get existing lead_ids from column A (skip header row)
+    # Get existing lead_ids (col A) and WhatsApp numbers (col D) to dedup
     try:
         existing_ids = set(ws.col_values(1)[1:])
     except Exception:
         existing_ids = set()
+    try:
+        existing_wa = set(ws.col_values(4)[1:])
+    except Exception:
+        existing_wa = set()
 
     synced = 0
     for lead in eligible_leads:
         lead_id = str(lead.get("lead_id") or "")
+        wa = str(lead.get("whatsapp") or "").strip()
+        # Skip if already in sheet (by lead_id OR by WhatsApp number)
         if not lead_id or lead_id in existing_ids:
+            continue
+        if wa and wa in existing_wa:
             continue
 
         row = _lead_to_sales_row(lead)
