@@ -191,6 +191,16 @@ button:disabled {{
   border: 1px solid #ef444444;
   color: #f87171;
 }}
+.tip {{
+  background: #d4af3712;
+  border: 1px solid #d4af3730;
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: 13px;
+  color: #c8b88a;
+  line-height: 1.5;
+  margin-bottom: 20px;
+}}
 .footer {{
   text-align: center;
   margin-top: 24px;
@@ -206,6 +216,7 @@ button:disabled {{
     <h2>Confirmacion VIP</h2>
   </div>
   <div class="sep"></div>
+  <div class="tip">💡 Si pasaron mas de 24 hrs desde el ultimo mensaje del cliente, pidele que mande un <b>"hola"</b> al WhatsApp antes de confirmar aqui.</div>
   <form method="POST" action="/spartans/confirm-vip?key={key}" id="vipForm">
     <label for="whatsapp">WhatsApp del cliente</label>
     <input type="tel" id="whatsapp" name="whatsapp" placeholder="+521XXXXXXXXXX"
