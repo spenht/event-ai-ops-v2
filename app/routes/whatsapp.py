@@ -823,6 +823,43 @@ async def whatsapp_inbound(request: Request):
         ]
     )
 
+    # Affirmative VIP intent — user is saying YES to VIP purchase.
+    # Works especially when lead is already VIP_INTERESTED or VIP_LINK_SENT.
+    lead_status_upper = str((lead.get("status") or "")).upper()
+    affirmative_vip_intent = any(
+        k in low
+        for k in [
+            "si me interesa",
+            "sí me interesa",
+            "me interesa",
+            "si quiero",
+            "sí quiero",
+            "dale",
+            "va",
+            "le entro",
+            "quiero 1",
+            "quiero 2",
+            "quiero el 1",
+            "quiero el 2",
+            "opción 1",
+            "opcion 1",
+            "opción 2",
+            "opcion 2",
+            "el 1",
+            "el 2",
+            "la 1",
+            "la 2",
+            "mándame el link",
+            "mandame el link",
+            "manda el link",
+            "mándamelo",
+            "mandamelo",
+            "quiero vip",
+            "sí vip",
+            "si vip",
+        ]
+    ) and lead_status_upper in ("VIP_INTERESTED", "VIP_LINK_SENT")
+
     # If the model is clearly trying to send a link but used a placeholder, treat it as a link-intent.
     # This fixes the "primera vez no manda la liga" case (e.g. message contains "[LINK]").
     model_link_placeholder = (
@@ -838,11 +875,27 @@ async def whatsapp_inbound(request: Request):
         or "link para pagarlo" in clean_low
     )
 
+    # Also detect when AI response talks about payment options/links (means it WANTS to send links)
+    ai_wants_to_send_link = any(
+        k in clean_low
+        for k in [
+            "opciones para completar",
+            "link de pago",
+            "liga de pago",
+            "puedes elegir",
+            "te comparto las opciones",
+            "completar tu registro vip",
+            "completar tu compra",
+        ]
+    )
+
     should_send_vip_link = (
         ("[[SEND_VIP_LINK]]" in tokens)
         or asks_pay_link
+        or affirmative_vip_intent
         or ("vip" in low and "pago" in low)
         or (vip_context and model_link_placeholder)
+        or ai_wants_to_send_link
     )
 
     # If the user asks for the payment link but the lead is already PAID, don't send a bogus/placeholder link.
@@ -902,15 +955,15 @@ async def whatsapp_inbound(request: Request):
             except Exception:
                 url = None
             if url:
-                # WhatsApp a veces trunca/rompe URLs largas si hay texto después.
-                # Importante: NO quitar el fragmento `#...` de Stripe; en algunos navegadores el link “corto” sin `#...` falla.
-                # Mantén el link completo y déjalo como ÚLTIMA línea.
-                url = (url or "").strip()
+                url = (url or “”).strip()
+                # Links FIRST, then explanation. People click faster when
+                # the link is the first thing they see.
                 clean = (
-                    clean.rstrip()
-                    + "\n\n¿Lo pagas ahorita o te espero 2 min?\n"
-                    + "🔥 Link de pago VIP:\n"
+                    “🔥 Link de pago VIP:\n”
                     + url
+                    + “\n\n”
+                    + clean.rstrip()
+                    + “\n\nEn cuanto se confirme tu pago, te mando tu boleto VIP con QR 🎟️”
                 ).strip()
             else:
                 clean = (
