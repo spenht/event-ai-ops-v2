@@ -1426,14 +1426,19 @@ async def _handle_existing_lead(
                 cal_url = _google_calendar_url(facts)
                 clean = (clean.rstrip() + "\n\n✅ Aqui tienes tu boleto VIP con QR 👇\n\n📅 Agregalo a tu calendario:\n" + cal_url).strip()
 
-        # Free GENERAL flow: if the user chooses General (no payment), confirm + send ticket right away.
-        # Guard: don't re-send if they already have a GENERAL ticket (e.g. from auto-confirm).
-        if wants_general and not wants_vip and not _already_sent_ticket(lead_id, "GENERAL") and str((lead.get("payment_status") or "")).upper() != "PAID":
-            try:
-                sb.table("leads").update({"status": "GENERAL_CONFIRMED"}).eq("lead_id", lead_id).execute()
-                lead["status"] = "GENERAL_CONFIRMED"
-            except Exception:
-                pass
+        # Free GENERAL flow: if the user chooses General (no payment), confirm + send ticket.
+        # Always re-send ticket + calendar when user explicitly asks for general
+        # (even if auto-confirm already sent it — user expects to see it again).
+        if wants_general and not wants_vip and str((lead.get("payment_status") or "")).upper() != "PAID":
+            already_has_general = _already_sent_ticket(lead_id, "GENERAL")
+
+            # Update status if not already confirmed
+            if str((lead.get("status") or "")).upper() != "GENERAL_CONFIRMED":
+                try:
+                    sb.table("leads").update({"status": "GENERAL_CONFIRMED"}).eq("lead_id", lead_id).execute()
+                except Exception:
+                    pass
+            lead["status"] = "GENERAL_CONFIRMED"
 
             if settings.public_base_url:
                 ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts)
@@ -1441,25 +1446,35 @@ async def _handle_existing_lead(
                     f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                 )
                 cal_url = _google_calendar_url(facts)
-                clean = (
-                    "✅ Listo. Ya tienes tu acceso *GENERAL* confirmado (sin costo).\n"
-                    "Aqui esta tu boleto con QR 👇\n\n"
-                    "📅 Agregalo a tu calendario:\n" + cal_url + "\n\n"
-                    "¿Te gustaria conocer el pase *VIP* y saber todo lo que incluye?"
-                ).strip()
 
-                # Mark ticket sent
-                try:
-                    sb.table("touchpoints").insert(
-                        {
-                            "lead_id": lead_id,
-                            "channel": "whatsapp",
-                            "event_type": "ticket_sent",
-                            "payload": {"tier": "GENERAL", "ticket_id": ticket["ticket_id"]},
-                        }
-                    ).execute()
-                except Exception:
-                    pass
+                if already_has_general:
+                    # User already saw VIP pitch and chose general — don't ask about VIP again
+                    clean = (
+                        "✅ Tu acceso *GENERAL* esta confirmado.\n"
+                        "Aqui tienes tu boleto con QR 👇\n\n"
+                        "📅 Agregalo a tu calendario:\n" + cal_url
+                    ).strip()
+                else:
+                    clean = (
+                        "✅ Listo. Ya tienes tu acceso *GENERAL* confirmado (sin costo).\n"
+                        "Aqui esta tu boleto con QR 👇\n\n"
+                        "📅 Agregalo a tu calendario:\n" + cal_url + "\n\n"
+                        "¿Te gustaria conocer el pase *VIP* y saber todo lo que incluye?"
+                    ).strip()
+
+                # Mark ticket sent (only first time)
+                if not already_has_general:
+                    try:
+                        sb.table("touchpoints").insert(
+                            {
+                                "lead_id": lead_id,
+                                "channel": "whatsapp",
+                                "event_type": "ticket_sent",
+                                "payload": {"tier": "GENERAL", "ticket_id": ticket["ticket_id"]},
+                            }
+                        ).execute()
+                    except Exception:
+                        pass
             else:
                 clean = (
                     "✅ Listo. Ya tienes tu acceso *GENERAL* confirmado (sin costo).\n\n"
