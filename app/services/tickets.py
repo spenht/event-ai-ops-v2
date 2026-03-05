@@ -405,18 +405,19 @@ def generate_ticket_png(*, lead: dict[str, Any], tier: str, event: dict[str, Any
         place_tw = place_bbox[2] - place_bbox[0]
 
         if place_tw > max_text_w:
-            # Use smaller font for long addresses
-            f_place_small = _font(34, "regular")
-            # Try to split at a natural break point (·, -, comma)
+            # Use smaller font for long addresses and split into ALL segments
+            f_place_small = _font(32, "regular")
+            placed = False
             for sep in [" · ", " - ", ", "]:
                 if sep in place:
-                    parts = place.split(sep, 1)
-                    draw.text((LEFT_MARGIN, y), parts[0].strip(), fill=white, font=f_place_small)
-                    y += 46
-                    draw.text((LEFT_MARGIN, y), parts[1].strip(), fill=light_gray, font=f_place_small)
-                    y += 46
+                    parts = [p.strip() for p in place.split(sep) if p.strip()]
+                    for i, part in enumerate(parts):
+                        fill = white if i == 0 else light_gray
+                        draw.text((LEFT_MARGIN, y), part, fill=fill, font=f_place_small)
+                        y += 42
+                    placed = True
                     break
-            else:
+            if not placed:
                 # No natural break — just use smaller font
                 draw.text((LEFT_MARGIN, y), place, fill=white, font=f_place_small)
                 y += 50
