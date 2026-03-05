@@ -12,6 +12,7 @@ from ..settings import settings
 from ..services.tickets import generate_ticket_png
 from ..services.twilio_whatsapp import send_whatsapp
 from ..services.url_shortener import create_short_url
+from ..services.google_sheets import sync_lead_to_all_leads_sheet
 
 logger = logging.getLogger("payments")
 
@@ -150,6 +151,13 @@ async def stripe_webhook(request: Request):
             # Generate ticket + send
             lead_res = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1).execute()
             lead = (lead_res.data or [None])[0] or {}
+
+            # Sync paid lead to Google Sheets
+            try:
+                import asyncio
+                asyncio.create_task(sync_lead_to_all_leads_sheet(lead))
+            except Exception:
+                pass
 
             wa = (lead.get("whatsapp") or meta.get("whatsapp") or "").strip()
             if wa:
