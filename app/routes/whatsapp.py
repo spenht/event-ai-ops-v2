@@ -18,6 +18,7 @@ from ..services.openai_chat import generate_reply, strip_tokens
 from ..services.tickets import generate_ticket_png
 from ..services.stripe_checkout import create_vip_checkout_link
 from ..services.twilio_whatsapp import normalize_mx_whatsapp, send_whatsapp
+from ..services.url_shortener import create_short_url
 
 logger = logging.getLogger("whatsapp")
 
@@ -781,6 +782,7 @@ async def _handle_existing_lead(
                 ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts)
                 ticket_url = f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                 cal_url = _google_calendar_url(facts)
+                cal_url = await create_short_url(cal_url, lead_id=lead_id, url_type="calendar", prefix="cal_")
                 ticket_msg = (
                     "✅ Listo. Ya tienes tu acceso *GENERAL* confirmado (sin costo).\n"
                     "Aqui esta tu boleto con QR 👇\n\n"
@@ -1391,6 +1393,7 @@ async def _handle_existing_lead(
                     f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                 )
                 cal_url = _google_calendar_url(facts)
+                cal_url = await create_short_url(cal_url, lead_id=lead_id, url_type="calendar", prefix="cal_")
                 clean = (
                     "✅ Pago confirmado. Aqui esta tu boleto VIP con QR 👇\n\n"
                     "📅 Agregalo a tu calendario:\n" + cal_url
@@ -1424,6 +1427,7 @@ async def _handle_existing_lead(
             )
             if "qr" not in clean.lower() and "boleto" not in clean.lower():
                 cal_url = _google_calendar_url(facts)
+                cal_url = await create_short_url(cal_url, lead_id=lead_id, url_type="calendar", prefix="cal_")
                 clean = (clean.rstrip() + "\n\n✅ Aqui tienes tu boleto VIP con QR 👇\n\n📅 Agregalo a tu calendario:\n" + cal_url).strip()
 
         # Free GENERAL flow: if the user chooses General (no payment), confirm + send ticket.
@@ -1446,6 +1450,7 @@ async def _handle_existing_lead(
                     f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                 )
                 cal_url = _google_calendar_url(facts)
+                cal_url = await create_short_url(cal_url, lead_id=lead_id, url_type="calendar", prefix="cal_")
 
                 if already_has_general:
                     # User already saw VIP pitch and chose general — don't ask about VIP again
@@ -1550,6 +1555,7 @@ async def _handle_existing_lead(
                     from datetime import timedelta, timezone as tz_
                     lead_name = (lead.get("name") or "").strip()
                     cal_url = _google_calendar_url(facts)
+                    cal_url = await create_short_url(cal_url, lead_id=lead_id, url_type="calendar", prefix="cal_")
                     send_at = (datetime.now(tz_.utc) + timedelta(minutes=10)).isoformat()
                     cal_msg = (
                         f"{lead_name} 😊 quise tomarme la libertad de mandarte nuevamente la liga "

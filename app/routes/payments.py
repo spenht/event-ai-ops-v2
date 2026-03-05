@@ -11,6 +11,7 @@ from ..deps import sb
 from ..settings import settings
 from ..services.tickets import generate_ticket_png
 from ..services.twilio_whatsapp import send_whatsapp
+from ..services.url_shortener import create_short_url
 
 logger = logging.getLogger("payments")
 
@@ -247,6 +248,7 @@ async def stripe_webhook(request: Request):
                                 f"&dates=20260327T150000Z/20260330T013000Z"
                                 f"&location={quote_plus(e_place)}"
                             )
+                            cal_url = await create_short_url(cal_url, lead_id=lead_id, url_type="calendar", prefix="cal_")
                             send_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
                             cal_msg = (
                                 f"{lead_name} 😊 quise tomarme la libertad de mandarte nuevamente la liga "
