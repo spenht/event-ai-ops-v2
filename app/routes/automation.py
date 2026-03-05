@@ -40,53 +40,46 @@ router = APIRouter(prefix="/v1/automation", tags=["automation"])
 TEMPLATES: dict[str, dict[str, list[str]]] = {
     "followup_15m": {
         "GENERAL_CONFIRMED": [
-            "Hola {name} 👋 Vi que ya tienes tu lugar en *General*.\n\n"
-            "¿Sabías que el boleto *VIP* incluye primera fila, regalos exclusivos y acceso al mastermind?\n\n"
-            "Si quieres, te cuento más 😊",
+            "{name} 👋 ya tienes tu lugar en *General*.\n\n"
+            "¿Sabías que el *VIP* incluye primera fila, regalos y mastermind? Te cuento más si quieres 😊",
         ],
         "VIP_INTERESTED": [
-            "Hey {name} 😊 Vi que te interesó el *VIP*.\n\n"
-            "¿Tienes alguna duda? Te ayudo rapidísimo para que no se te pase.",
+            "Hey {name} 😊 vi que te interesó el *VIP*.\n\n"
+            "¿Alguna duda? Te ayudo rapidísimo.",
         ],
         "VIP_LINK_SENT": [
-            "Oye {name}, ¿pudiste ver el link de pago? 🤔\n\n"
-            "Si tuviste algún problema, dime y te ayudo ahorita mismo.",
+            "{name}, ¿pudiste ver el link de pago? 🤔\n\n"
+            "Si tuviste algún problema dime y te ayudo ahorita.",
         ],
     },
     "followup_1h": {
         "GENERAL_CONFIRMED": [
-            "Hola {name} 🙌 Solo quería recordarte que el *VIP* tiene cupo limitado.\n\n"
-            "Incluye primera fila, mastermind exclusivo, libro de regalo y más.\n\n"
-            "¿Te gustaría ver un video corto de lo que incluye? 🎥",
+            "{name} 🙌 el *VIP* tiene cupo limitado.\n\n"
+            "Primera fila + mastermind + libro de regalo.\n\n"
+            "¿Te mando un video corto de lo que incluye? 🎥",
         ],
         "VIP_INTERESTED": [
-            "{name}, solo para que sepas: los lugares *VIP* se están llenando rápido.\n\n"
-            "Si quieres asegurar el tuyo, te puedo mandar el link de pago ahorita.\n\n"
-            "¿Le entramos? 🔥",
+            "{name}, los lugares *VIP* se están llenando rápido.\n\n"
+            "¿Te mando el link de pago? 🔥",
         ],
         "VIP_LINK_SENT": [
-            "Oye {name}, te mandé el link hace rato y quiero asegurarme de que todo esté bien.\n\n"
+            "{name}, te mandé el link hace rato.\n\n"
             "¿Necesitas que te lo reenvíe? A veces WhatsApp los esconde 😅",
         ],
     },
     "followup_daily": {
         "GENERAL_CONFIRMED": [
-            "Buenos días {name} ☀️\n\n"
-            "Te comparto un testimonio de alguien que fue VIP la vez pasada:\n\n"
-            "💬 *\"Fue la mejor inversión que hice en todo el año. El mastermind solo vale 10x el precio.\"*\n\n"
-            "¿Te gustaría escuchar más sobre el VIP? 😊",
+            "{name} ☀️ alguien que fue VIP la vez pasada nos dijo:\n\n"
+            "💬 *\"Fue la mejor inversión del año.\"*\n\n"
+            "¿Te cuento qué incluye el VIP?",
         ],
         "VIP_INTERESTED": [
-            "Hola {name} 👋\n\n"
-            "Solo un recordatorio amigable: el evento es pronto y los lugares VIP son limitados.\n\n"
-            "Si decides entrarle hoy, te puedo mandar el link directo.\n\n"
-            "¿Qué dices? 🙌",
+            "{name} 👋 el evento es pronto y quedan muy pocos VIP.\n\n"
+            "¿Te mando el link directo?",
         ],
         "VIP_LINK_SENT": [
-            "Hola {name} 😊\n\n"
-            "Sé que a veces uno anda ocupado. Solo quería recordarte que tu link de pago VIP sigue activo.\n\n"
-            "Si necesitas otro link o tienes dudas, estoy aquí para ayudarte.\n\n"
-            "¡Que tengas un excelente día! ☀️",
+            "{name} 🔥 los boletos VIP se están agotando súper rápido y quedan muy poquitos.\n\n"
+            "Tu link sigue activo. ¿Lo pagas hoy?",
         ],
     },
 }
