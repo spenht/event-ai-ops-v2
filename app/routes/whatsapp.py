@@ -1022,8 +1022,6 @@ async def _handle_existing_lead(
                 "no me llego el video",
                 "no me llegó el vídeo",
                 "no me llego el vídeo",
-                "no me llego",
-                "no me llegó",
             ]
         )
 
@@ -1296,7 +1294,7 @@ async def _handle_existing_lead(
                         # User explicitly wants option 2
                         url = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=2)
                         if url:
-                            url = url.strip()
+                            url = await create_short_url(url.strip(), lead_id=lead_id, url_type="stripe_checkout", prefix="vip_")
                             clean = (
                                 "🔥 ¡Excelente eleccion! 2 VIPs x 97 USD (la promo mas popular).\n\n"
                                 "Link de pago:\n" + url + "\n\n"
@@ -1308,7 +1306,7 @@ async def _handle_existing_lead(
                         # User explicitly wants option 1
                         url = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=1)
                         if url:
-                            url = url.strip()
+                            url = await create_short_url(url.strip(), lead_id=lead_id, url_type="stripe_checkout", prefix="vip_")
                             clean = (
                                 "🔥 ¡Perfecto! 1 VIP individual x 79 USD.\n\n"
                                 "Link de pago:\n" + url + "\n\n"
@@ -1322,9 +1320,11 @@ async def _handle_existing_lead(
                         url2 = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=2)
                         links_text = ""
                         if url1:
-                            links_text += f"1️⃣ 1 VIP individual x 79 USD:\n{url1.strip()}\n\n"
+                            url1 = await create_short_url(url1.strip(), lead_id=lead_id, url_type="stripe_checkout", prefix="vip_")
+                            links_text += f"1️⃣ 1 VIP individual x 79 USD:\n{url1}\n\n"
                         if url2:
-                            links_text += f"2️⃣ 2 VIPs x 97 USD (promo especial):\n{url2.strip()}\n\n"
+                            url2 = await create_short_url(url2.strip(), lead_id=lead_id, url_type="stripe_checkout", prefix="vip_")
+                            links_text += f"2️⃣ 2 VIPs x 97 USD (promo especial):\n{url2}\n\n"
                         if links_text:
                             clean = (
                                 "¡Perfecto! 😊 Aqui tienes los links de pago:\n\n"
@@ -1339,7 +1339,7 @@ async def _handle_existing_lead(
                     clean = (clean.rstrip() + "\n\nAhorita no pude generar el link 😅 ¿Me pones *VIP* otra vez en 30 segundos?").strip()
 
             # Update status to VIP_LINK_SENT after successfully generating links
-            if "checkout.stripe.com" in clean:
+            if "checkout.stripe.com" in clean or "Link de pago" in clean:
                 try:
                     sb.table("leads").update({"status": "VIP_LINK_SENT"}).eq("lead_id", lead_id).execute()
                     lead["status"] = "VIP_LINK_SENT"

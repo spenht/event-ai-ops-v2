@@ -63,6 +63,50 @@ def _safe_text(s: str, max_len: int = 60) -> str:
     return (s or "").strip()[:max_len]
 
 
+def _friendly_date(raw: str) -> str:
+    """Convert ISO timestamp or raw date to friendly Spanish format.
+
+    '2026-03-27T15:00:00+00:00' -> '27 - 29 de Marzo, 2026'
+    Already-friendly strings pass through unchanged.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return s
+
+    # If it looks like an ISO timestamp, parse it
+    if "T" in s and len(s) > 10:
+        try:
+            from datetime import datetime as _dt
+            dt = _dt.fromisoformat(s.replace("Z", "+00:00"))
+            months_es = {
+                1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
+                5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
+                9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
+            }
+            month = months_es.get(dt.month, str(dt.month))
+            # Events are typically 3 days
+            return f"{dt.day} - {dt.day + 2} de {month}, {dt.year}"
+        except Exception:
+            pass
+
+    # If it's just a date like '2026-03-27', also format it
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        try:
+            from datetime import datetime as _dt
+            dt = _dt.strptime(s, "%Y-%m-%d")
+            months_es = {
+                1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
+                5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
+                9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
+            }
+            month = months_es.get(dt.month, str(dt.month))
+            return f"{dt.day} - {dt.day + 2} de {month}, {dt.year}"
+        except Exception:
+            pass
+
+    return s
+
+
 def _ticket_id() -> str:
     return secrets.token_urlsafe(12).replace("-", "").replace("_", "")
 
@@ -236,8 +280,8 @@ def generate_ticket_png(*, lead: dict[str, Any], tier: str, event: dict[str, Any
     name = _safe_text(lead.get("name") or "Participante")
     email = _safe_text(lead.get("email") or "")
     event_name = _safe_text(event.get("event_name") or "Evento", max_len=40)
-    date = _safe_text(event.get("event_date") or "")
-    place = _safe_text(event.get("event_place") or "")
+    date = _friendly_date(event.get("event_date") or "")
+    place = _safe_text(event.get("event_place") or "", max_len=120)
 
     # Stable code for scanning
     raw = f"{lead.get('lead_id')}|{tid}|{tier}|{email}".encode("utf-8")
@@ -354,8 +398,31 @@ def generate_ticket_png(*, lead: dict[str, Any], tier: str, event: dict[str, Any
     if place:
         draw.text((LEFT_MARGIN, y), "LOCATION", fill=label_color, font=f_label)
         y += 38
-        draw.text((LEFT_MARGIN, y), place, fill=white, font=f_info)
-        y += 55
+
+        # Auto-wrap place text if it's too long for one line
+        max_text_w = WIDTH - LEFT_MARGIN * 2
+        place_bbox = draw.textbbox((0, 0), place, font=f_info)
+        place_tw = place_bbox[2] - place_bbox[0]
+
+        if place_tw > max_text_w:
+            # Use smaller font for long addresses
+            f_place_small = _font(34, "regular")
+            # Try to split at a natural break point (·, -, comma)
+            for sep in [" · ", " - ", ", "]:
+                if sep in place:
+                    parts = place.split(sep, 1)
+                    draw.text((LEFT_MARGIN, y), parts[0].strip(), fill=white, font=f_place_small)
+                    y += 46
+                    draw.text((LEFT_MARGIN, y), parts[1].strip(), fill=light_gray, font=f_place_small)
+                    y += 46
+                    break
+            else:
+                # No natural break — just use smaller font
+                draw.text((LEFT_MARGIN, y), place, fill=white, font=f_place_small)
+                y += 50
+        else:
+            draw.text((LEFT_MARGIN, y), place, fill=white, font=f_info)
+            y += 55
 
     y += 25
 
