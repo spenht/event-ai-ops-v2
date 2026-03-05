@@ -214,6 +214,23 @@ async def stripe_webhook(request: Request):
                         except Exception:
                             pass
 
+                        # Log all webhook-sent messages as outbound_ai so the AI
+                        # conversation history knows they were already delivered.
+                        try:
+                            webhook_summary = (
+                                msg + "\n\n"
+                                "🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth 👇\n\n"
+                                + closing
+                            )
+                            sb.table("touchpoints").insert({
+                                "lead_id": lead_id,
+                                "channel": "whatsapp",
+                                "event_type": "outbound_ai",
+                                "payload": {"to": f"whatsapp:{wa}", "body": webhook_summary, "source": "stripe_webhook"},
+                            }).execute()
+                        except Exception:
+                            pass
+
                         # Schedule calendar reminder for ~10 min later
                         try:
                             from urllib.parse import quote_plus
