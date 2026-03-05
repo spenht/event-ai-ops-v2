@@ -6,6 +6,7 @@ import re
 import html
 import uuid
 import httpx
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import parse_qs
 
@@ -524,6 +525,7 @@ async def whatsapp_inbound(request: Request):
             "event_id": default_event_id,
             "status": "NEW",
             "tier_interest": "NONE",
+            "last_contact_at": datetime.now(timezone.utc).isoformat(),
         }
 
         # If the user already provided contact info in the first message, include it in the insert
@@ -737,6 +739,8 @@ async def _handle_existing_lead(
         # Best-effort: keep lead contact info updated over time
         try:
             updates: dict[str, Any] = {}
+            # Always update last_contact_at on every message
+            updates["last_contact_at"] = datetime.now(timezone.utc).isoformat()
             # Always ensure whatsapp is stored (normalized)
             if (lead.get("whatsapp") or "").strip() != wa_e164:
                 updates["whatsapp"] = wa_e164
