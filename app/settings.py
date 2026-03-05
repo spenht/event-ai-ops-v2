@@ -40,18 +40,24 @@ class Settings:
 
     # Media
     whatsapp_video_vip_pitch: str = _env("WHATSAPP_VIDEO_VIP_PITCH", "")
+    whatsapp_video_testimonios: str = _env("WHATSAPP_VIDEO_TESTIMONIOS", "")
 
     # Stripe
     stripe_secret_key: str = _env("STRIPE_SECRET_KEY", "")
     stripe_webhook_secret: str = _env("STRIPE_WEBHOOK_SECRET", "")
     stripe_vip_price_id: str = _env("STRIPE_VIP_PRICE_ID", "")
+    stripe_vip_price_id_1: str = _env("VIP_PRICE_USA_1", "")   # 1 VIP x 79 USD
+    stripe_vip_price_id_2: str = _env("VIP_PRICE_USA_2", "")   # 2 VIPs x 97 USD
     stripe_success_url: str = _env("STRIPE_SUCCESS_URL", "")
     stripe_cancel_url: str = _env("STRIPE_CANCEL_URL", "")
 
     # Automation
     cron_token: str = _env("CRON_TOKEN", "")
 
-    # Event (fallback)
+    # Default event
+    default_event_id: str = _env("DEFAULT_EVENT_ID", "")
+
+    # Event (fallback — DB data takes priority when available)
     event_name: str = _env("EVENT_NAME", "Beyond Wealth")
     event_date: str = _env("EVENT_DATE", "")
     event_place: str = _env("EVENT_PLACE", "")
