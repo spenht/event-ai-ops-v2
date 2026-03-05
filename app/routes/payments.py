@@ -195,6 +195,10 @@ async def stripe_webhook(request: Request):
                     except Exception:
                         pass
 
+                    # Small delay so WhatsApp delivers the ticket before the video
+                    import asyncio
+                    await asyncio.sleep(5)
+
                     # Send testimonials video (once)
                     testimonial_url = (settings.whatsapp_video_testimonios or "").strip() if hasattr(settings, "whatsapp_video_testimonios") else ""
                     if testimonial_url and testimonial_url.startswith("https://"):
