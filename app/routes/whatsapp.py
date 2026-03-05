@@ -772,9 +772,8 @@ async def _handle_existing_lead(
         if just_provided_name and just_provided_email and lead_is_new:
             # Update status
             try:
-                sb.table("leads").update({"status": "GENERAL_CONFIRMED", "payment_status": "FREE"}).eq("lead_id", lead_id).execute()
+                sb.table("leads").update({"status": "GENERAL_CONFIRMED"}).eq("lead_id", lead_id).execute()
                 lead["status"] = "GENERAL_CONFIRMED"
-                lead["payment_status"] = "FREE"
             except Exception:
                 pass
 
@@ -844,9 +843,9 @@ async def _handle_existing_lead(
         vip_pitch_already_sent_pre = _already_sent_media(lead_id, "vip_video")
 
         if (
-            lead_status_pre == "GENERAL_CONFIRMED"
-            and not vip_pitch_already_sent_pre
+            not vip_pitch_already_sent_pre
             and str((lead.get("payment_status") or "")).upper() != "PAID"
+            and lead_status_pre not in ("", "NEW")
         ):
             # Detect affirmative or VIP-curious responses
             user_wants_vip_info = any(k in low_pre for k in [
@@ -979,6 +978,20 @@ async def _handle_existing_lead(
                     "saber mas",
                     "más info",
                     "mas info",
+                    # Affirmative responses to VIP offer
+                    "me gustaría",
+                    "me gustaria",
+                    "me encantaría",
+                    "me encantaria",
+                    "si porfa",
+                    "sí porfa",
+                    "si por favor",
+                    "claro que sí",
+                    "claro que si",
+                    "por supuesto",
+                    "cuéntame",
+                    "cuentame",
+                    "me interesa",
                 ]
             )
         )
@@ -1354,6 +1367,8 @@ async def _handle_existing_lead(
                 "me mandas mi boleto",
                 "me mandas el boleto",
                 "boleto vip",
+                "boleto",
+                "y el boleto",
                 "imagen",
                 "ticket",
             ]
@@ -1407,9 +1422,8 @@ async def _handle_existing_lead(
         # Guard: don't re-send if they already have a GENERAL ticket (e.g. from auto-confirm).
         if wants_general and not wants_vip and not _already_sent_ticket(lead_id, "GENERAL") and str((lead.get("payment_status") or "")).upper() != "PAID":
             try:
-                sb.table("leads").update({"status": "GENERAL_CONFIRMED", "payment_status": "FREE"}).eq("lead_id", lead_id).execute()
+                sb.table("leads").update({"status": "GENERAL_CONFIRMED"}).eq("lead_id", lead_id).execute()
                 lead["status"] = "GENERAL_CONFIRMED"
-                lead["payment_status"] = "FREE"
             except Exception:
                 pass
 
