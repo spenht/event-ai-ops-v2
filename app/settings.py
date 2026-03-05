@@ -54,6 +54,9 @@ class Settings:
     # Automation
     cron_token: str = _env("CRON_TOKEN", "")
 
+    # Spartans
+    spartans_key: str = _env("SPARTANS_KEY", "")
+
     # Default event
     default_event_id: str = _env("DEFAULT_EVENT_ID", "")
 
