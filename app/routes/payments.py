@@ -185,4 +185,33 @@ async def stripe_webhook(request: Request):
                     except Exception:
                         pass
 
+                    # Send testimonials video (once)
+                    testimonial_url = (settings.whatsapp_video_testimonios or "").strip() if hasattr(settings, "whatsapp_video_testimonios") else ""
+                    if testimonial_url and testimonial_url.startswith("https://"):
+                        try:
+                            await send_whatsapp(wa, "🎬 Mira lo que dicen quienes ya vivieron Beyond Wealth 👇", media_urls=[testimonial_url])
+                            sb.table("touchpoints").insert(
+                                {
+                                    "lead_id": lead_id,
+                                    "channel": "whatsapp",
+                                    "event_type": "media_sent",
+                                    "payload": {"key": "testimonios", "url": testimonial_url},
+                                }
+                            ).execute()
+                        except Exception:
+                            pass
+
+                        # Closing message from Ana
+                        try:
+                            event_name = facts.get("event_name") or "Beyond Wealth"
+                            closing = (
+                                "Soy Ana y me da muchisimo gusto poderte servir 😊\n\n"
+                                f"Estoy muy emocionada de que vayas a ser parte de *{event_name}*, "
+                                "un evento que puede cambiar tu vida.\n\n"
+                                "Cualquier pregunta que tengas, aqui estoy para servirte."
+                            ).strip()
+                            await send_whatsapp(wa, closing)
+                        except Exception:
+                            pass
+
     return {"ok": True}
