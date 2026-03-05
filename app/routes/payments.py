@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 import stripe
 from fastapi import APIRouter, HTTPException, Request
@@ -164,8 +165,8 @@ async def stripe_webhook(request: Request):
                     media = f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                     msg = (
                         "✅ ¡Listo! Pago confirmado.\n"
-                        "Aquí esta tu boleto VIP con tu QR (guardalo).\n\n"
-                        "Si quieres, dime: ¿que te urge destrabar en el evento para que valga cada minuto?"
+                        "Aqui esta tu boleto VIP con tu QR (guardalo).\n\n"
+                        "Te voy a compartir un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth."
                     )
                     try:
                         await send_whatsapp(wa, msg, media_urls=[media])
@@ -189,7 +190,7 @@ async def stripe_webhook(request: Request):
                     testimonial_url = (settings.whatsapp_video_testimonios or "").strip() if hasattr(settings, "whatsapp_video_testimonios") else ""
                     if testimonial_url and testimonial_url.startswith("https://"):
                         try:
-                            await send_whatsapp(wa, "🎬 Mira lo que dicen quienes ya vivieron Beyond Wealth 👇", media_urls=[testimonial_url])
+                            await send_whatsapp(wa, "🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth 👇", media_urls=[testimonial_url])
                             sb.table("touchpoints").insert(
                                 {
                                     "lead_id": lead_id,
@@ -201,16 +202,54 @@ async def stripe_webhook(request: Request):
                         except Exception:
                             pass
 
-                        # Closing message from Ana
+                        # Closing message (no re-introduction)
                         try:
                             event_name = facts.get("event_name") or "Beyond Wealth"
                             closing = (
-                                "Soy Ana y me da muchisimo gusto poderte servir 😊\n\n"
-                                f"Estoy muy emocionada de que vayas a ser parte de *{event_name}*, "
-                                "un evento que puede cambiar tu vida.\n\n"
+                                f"Estoy muy emocionada de que vayas a ser parte del grupo VIP de *{event_name}*, "
+                                "un evento que va a marcar un antes y un despues en tu vida.\n\n"
                                 "Cualquier pregunta que tengas, aqui estoy para servirte."
                             ).strip()
                             await send_whatsapp(wa, closing)
+                        except Exception:
+                            pass
+
+                        # Schedule calendar reminder for ~10 min later
+                        try:
+                            from urllib.parse import quote_plus
+                            lead_name = (lead.get("name") or "").strip()
+                            e_name = facts.get("event_name") or "Beyond Wealth"
+                            e_place = facts.get("event_place") or ""
+                            e_speakers = facts.get("event_speakers") or ""
+                            details = f"{e_name}\nSpeakers: {e_speakers}\nLugar: {e_place}"
+                            cal_url = (
+                                "https://calendar.google.com/calendar/render?"
+                                f"action=TEMPLATE"
+                                f"&text={quote_plus(e_name)}"
+                                f"&details={quote_plus(details)}"
+                                f"&dates=20260327T150000Z/20260330T013000Z"
+                                f"&location={quote_plus(e_place)}"
+                            )
+                            send_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+                            cal_msg = (
+                                f"{lead_name} 😊 quise tomarme la libertad de mandarte nuevamente la liga "
+                                "para que agregues el evento a tu calendario y lo tengas super presente, "
+                                "ahi viene la direccion del lugar tambien, de esa manera tienes todo a la mano "
+                                "ya en tu agenda. Solo dale click abajo y dale aceptar y listo :)\n\n"
+                                f"📅 {cal_url}"
+                            ).strip()
+                            sb.table("touchpoints").insert({
+                                "lead_id": lead_id,
+                                "channel": "whatsapp",
+                                "event_type": "scheduled_message",
+                                "payload": {
+                                    "type": "calendar_reminder",
+                                    "send_after": send_at,
+                                    "status": "pending",
+                                    "body": cal_msg,
+                                    "wa": wa,
+                                },
+                            }).execute()
                         except Exception:
                             pass
 
