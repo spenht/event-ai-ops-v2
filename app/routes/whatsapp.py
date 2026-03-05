@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import html
@@ -513,574 +514,614 @@ async def whatsapp_inbound(request: Request):
 
     lead_id = lead["lead_id"]
 
-    # --- Companion capture (only when user provides companion details in-message) ---
-    # If the user sends something like:
-    #   Florencia Montoya\nflorencia@example.com\n+1 (954) 756-4662
-    # we create a new lead for that companion and store it as the latest companion for this lead.
+    # Launch heavy processing in background; return empty TwiML immediately
+    # so Twilio doesn't time out (~15 s limit).
+    asyncio.create_task(
+        _handle_existing_lead(
+            lead=lead,
+            lead_id=lead_id,
+            body=body,
+            wa_from=wa_from,
+            wa_e164=wa_e164,
+            message_sid=message_sid,
+            msg_email=msg_email,
+            msg_name=msg_name,
+            msg_name_only=msg_name_only,
+        )
+    )
+    return _twiml_empty()
+
+
+# ---------------------------------------------------------------------------
+# Background handler – all heavy processing for existing leads
+# ---------------------------------------------------------------------------
+
+async def _handle_existing_lead(
+    lead: dict[str, Any],
+    lead_id: str,
+    body: str,
+    wa_from: str,
+    wa_e164: str,
+    message_sid: str,
+    msg_email: Optional[str],
+    msg_name: Optional[str],
+    msg_name_only: Optional[str],
+) -> None:
     try:
-        lines = [ln.strip() for ln in (body or "").splitlines() if ln.strip()]
-        comp_email = _extract_email(body)
-        comp_phone = _extract_phone_e164(body)
+        # --- Companion capture (only when user provides companion details in-message) ---
+        # If the user sends something like:
+        #   Florencia Montoya\nflorencia@example.com\n+1 (954) 756-4662
+        # we create a new lead for that companion and store it as the latest companion for this lead.
+        try:
+            lines = [ln.strip() for ln in (body or "").splitlines() if ln.strip()]
+            comp_email = _extract_email(body)
+            comp_phone = _extract_phone_e164(body)
 
-        # Pick a name line: first line that is not email-like and has no digits
-        comp_name = None
-        for ln in lines:
-            if "@" in ln:
-                continue
-            if re.search(r"\d", ln):
-                continue
-            if len(ln) < 2 or len(ln) > 80:
-                continue
-            comp_name = ln
-            break
+            # Pick a name line: first line that is not email-like and has no digits
+            comp_name = None
+            for ln in lines:
+                if "@" in ln:
+                    continue
+                if re.search(r"\d", ln):
+                    continue
+                if len(ln) < 2 or len(ln) > 80:
+                    continue
+                comp_name = ln
+                break
 
-        has_companion_bundle = bool(comp_email and comp_phone and comp_name)
+            has_companion_bundle = bool(comp_email and comp_phone and comp_name)
 
-        if has_companion_bundle:
-            companion_lead = None
-            # Try to find an existing lead by email first
-            try:
-                by_email = sb.table("leads").select("*").eq("email", comp_email).limit(1).execute()
-                companion_lead = (by_email.data or [None])[0]
-            except Exception:
+            if has_companion_bundle:
                 companion_lead = None
-
-            # If not found by email, try by whatsapp/phone
-            if not companion_lead and comp_phone:
-                for candidate in _mx_variants(comp_phone):
-                    try:
-                        by_wa = sb.table("leads").select("*").eq("whatsapp", candidate).limit(1).execute()
-                        companion_lead = (by_wa.data or [None])[0]
-                        if companion_lead:
-                            break
-                    except Exception:
-                        pass
-
-            # If still not found, create the companion lead
-            if not companion_lead:
-                comp_lead_id_new = f"wa_{uuid.uuid4().hex[:12]}"
-                companion_row: dict[str, Any] = {
-                    "lead_id": comp_lead_id_new,
-                    "event_id": lead.get("event_id"),
-                    "status": "NEW",
-                    "tier_interest": "VIP",
-                    "name": comp_name,
-                    "email": comp_email,
-                    # Keep schema-safe: ensure phone present
-                    "phone": comp_phone,
-                    "whatsapp": comp_phone,
-                }
+                # Try to find an existing lead by email first
                 try:
-                    ins = sb.table("leads").insert(companion_row).execute()
-                    if getattr(ins, "data", None):
-                        companion_lead = (ins.data or [companion_row])[0] or companion_row
-                    else:
-                        companion_lead = companion_row
+                    by_email = sb.table("leads").select("*").eq("email", comp_email).limit(1).execute()
+                    companion_lead = (by_email.data or [None])[0]
                 except Exception:
                     companion_lead = None
 
-            # Store a pointer to the latest companion lead for later payment-link generation
-            if companion_lead and companion_lead.get("lead_id"):
+                # If not found by email, try by whatsapp/phone
+                if not companion_lead and comp_phone:
+                    for candidate in _mx_variants(comp_phone):
+                        try:
+                            by_wa = sb.table("leads").select("*").eq("whatsapp", candidate).limit(1).execute()
+                            companion_lead = (by_wa.data or [None])[0]
+                            if companion_lead:
+                                break
+                        except Exception:
+                            pass
+
+                # If still not found, create the companion lead
+                if not companion_lead:
+                    comp_lead_id_new = f"wa_{uuid.uuid4().hex[:12]}"
+                    companion_row: dict[str, Any] = {
+                        "lead_id": comp_lead_id_new,
+                        "event_id": lead.get("event_id"),
+                        "status": "NEW",
+                        "tier_interest": "VIP",
+                        "name": comp_name,
+                        "email": comp_email,
+                        # Keep schema-safe: ensure phone present
+                        "phone": comp_phone,
+                        "whatsapp": comp_phone,
+                    }
+                    try:
+                        ins = sb.table("leads").insert(companion_row).execute()
+                        if getattr(ins, "data", None):
+                            companion_lead = (ins.data or [companion_row])[0] or companion_row
+                        else:
+                            companion_lead = companion_row
+                    except Exception:
+                        companion_lead = None
+
+                # Store a pointer to the latest companion lead for later payment-link generation
+                if companion_lead and companion_lead.get("lead_id"):
+                    try:
+                        sb.table("touchpoints").insert(
+                            {
+                                "lead_id": lead_id,
+                                "channel": "whatsapp",
+                                "event_type": "companion_created",
+                                "payload": {
+                                    "companion_lead_id": companion_lead.get("lead_id"),
+                                    "name": companion_lead.get("name") or comp_name,
+                                    "email": companion_lead.get("email") or comp_email,
+                                    "phone": companion_lead.get("phone") or comp_phone,
+                                },
+                            }
+                        ).execute()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Best-effort: keep lead contact info updated over time
+        try:
+            updates: dict[str, Any] = {}
+            # Always ensure whatsapp is stored (normalized)
+            if (lead.get("whatsapp") or "").strip() != wa_e164:
+                updates["whatsapp"] = wa_e164
+
+            if msg_email and not (lead.get("email") or "").strip():
+                updates["email"] = msg_email
+
+            # Name updates:
+            # - If user used an explicit pattern (soy/me llamo/mi nombre es), always trust it and overwrite.
+            # - If user sent a "name-only" message, only use it when we don't have a good name yet,
+            #   or when the existing name looks like a mistaken capture (e.g. "Ya pagué").
+            incoming_name = msg_name or msg_name_only
+            if incoming_name:
+                existing_name = (lead.get("name") or "").strip()
+                existing_low = existing_name.lower()
+
+                bad_names = {
+                    "si me encantaría",
+                    "si me encantaria",
+                    "sí me encantaría",
+                    "hola",
+                    "ok",
+                    "gracias",
+                }
+
+                looks_like_mistake = (
+                    (not existing_name)
+                    or (existing_low in bad_names)
+                    or ("pagu" in existing_low)
+                    or ("pago" in existing_low)
+                    or (existing_low in {"ya pague", "ya pagué", "ya pago"})
+                )
+
+                # If it's an explicit-intent name, overwrite. Otherwise, only overwrite when existing looks wrong.
+                if msg_name or looks_like_mistake:
+                    updates["name"] = incoming_name
+
+            # Store phone redundantly if your schema has it (safe if it doesn't)
+            if not (lead.get("phone") or "").strip():
+                updates["phone"] = wa_e164
+
+            if updates:
+                try:
+                    sb.table("leads").update(updates).eq("lead_id", lead_id).execute()
+                    lead.update(updates)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        event_id = lead.get("event_id")
+        facts = _event_facts(event_id)
+
+        # Build conversation context
+        convo = _load_recent_conversation(lead_id)
+        if not convo or convo[-1].get("role") != "user" or (convo[-1].get("content") or "").strip() != body:
+            convo.append({"role": "user", "content": body})
+
+        first_contact = _is_first_contact(lead_id)
+
+        # Generate AI reply
+        ai = await generate_reply(lead=lead, event_facts=facts, conversation=convo)
+
+        if not ai:
+            # Hard fallback
+            ai = (
+                f"Hola {(lead.get('name') or '😊')} 👋 Soy Ana del equipo.\n"
+                f"Vi tu registro a *{facts['event_name']}*.\n\n"
+                "Para cuidarte tu lugar: ¿sí vas a poder asistir? (Sí/No)\n"
+                "Y dime: ¿qué te llamó la atención del evento?"
+            )
+
+        clean, tokens = strip_tokens(ai)
+        clean = _strip_media_placeholders(clean)
+        # Remove common placeholder URL if the model outputs it (we always prefer real media/URLs)
+        clean = re.sub(r"https?://(www\.)?linkdelvideo\.com/?", "", clean, flags=re.I).strip()
+
+        # --- Quick intent heuristics (keeps the experience smooth even if the model doesn't emit tokens) ---
+        low = (body or "").strip().lower()
+        wants_general = any(
+            k in low
+            for k in [
+                "general",
+                "gral",
+                "entrada general",
+                "boleto general",
+                "me quedo con general",
+                "me quedo con el general",
+                "solo general",
+                "sin vip",
+                "no vip",
+                "no quiero vip",
+            ]
+        )
+        wants_vip = any(k in low for k in ["vip", "quiero vip", "sí vip", "si vip", "pagar vip", "pago vip"])
+        vip_context = (
+            wants_vip
+            or ("vip" in low)
+            or any(
+                k in low
+                for k in [
+                    "incluye",
+                    "incluye el vip",
+                    "qué incluye",
+                    "que incluye",
+                    "precio",
+                    "cuánto cuesta",
+                    "cuanto cuesta",
+                    "video",
+                    "tienes algún video",
+                    "tienes algun video",
+                    "tienes un video",
+                    "me gustaría escuchar",
+                    "me gustaria escuchar",
+                    "quiero escuchar",
+                    "saber más",
+                    "saber mas",
+                    "más info",
+                    "mas info",
+                ]
+            )
+        )
+
+        asks_vip_details = any(k in low for k in [
+            "que incluye", "qué incluye", "incluye el vip", "como es el vip", "cómo es el vip",
+            "beneficios", "ventajas", "precio", "cuanto cuesta", "cuánto cuesta",
+            "vip incluye", "detalles vip",
+            "saber más del vip", "saber mas del vip", "quiero saber más del vip", "quiero saber mas del vip",
+        ])
+
+        asks_video = any(
+            k in low
+            for k in [
+                "video",
+                "vídeo",
+                "mandame el video",
+                "mándame el video",
+                "me mandas el video",
+                "me mandas vídeo",
+                "no me llegó el video",
+                "no me llego el video",
+                "no me llegó el vídeo",
+                "no me llego el vídeo",
+                "no me llego",
+                "no me llegó",
+            ]
+        )
+
+        media_urls: list[str] = []
+        clean_low = (clean or "").lower()
+
+        # We want the VIP video to be sent the first time the user hears the VIP details.
+        # Heuristic: if this outbound message contains VIP-benefit keywords (i.e., it's the VIP explainer), attach the video.
+        vip_explainer_message = any(
+            k in clean_low
+            for k in [
+                "acceso vip",
+                "boleto vip",
+                "experiencia vip",
+                "incluye",
+                "asientos",
+                "primera fila",
+                "acceso preferencial",
+                "mastermind",
+                "libro",
+                "foto",
+                "regalos",
+            ]
+        )
+
+        if vip_context and vip_explainer_message and str((lead.get("payment_status") or "")).upper() != "PAID":
+            if "precio de un libro" not in clean_low:
+                clean = ("📘 Por el precio de un libro, obtienes:\n" + clean.lstrip()).strip()
+                clean_low = (clean or "").lower()
+
+        # VIP pitch video (send as real media, at most once per lead)
+        should_send_vip_video = ("[[SEND_VIP_VIDEO]]" in tokens) or asks_vip_details or (vip_context and vip_explainer_message)
+        if (
+            should_send_vip_video
+            and settings.whatsapp_video_vip_pitch.strip()
+            and (asks_video or not _already_sent_media(lead_id, "vip_video"))
+        ):
+            if "video" not in clean.lower():
+                clean = (clean.rstrip() + "\n\n🎥 Aquí tienes un video corto de Spencer explicando el VIP:").strip()
+            # Remove any .mp4 URL from the text, just in case
+            clean = re.sub(r"https?://\S+\.mp4\S*", "", clean, flags=re.I).strip()
+            u = settings.whatsapp_video_vip_pitch.strip()
+            if u.startswith("https://"):
+                media_urls.append(u)
                 try:
                     sb.table("touchpoints").insert(
                         {
                             "lead_id": lead_id,
                             "channel": "whatsapp",
-                            "event_type": "companion_created",
-                            "payload": {
-                                "companion_lead_id": companion_lead.get("lead_id"),
-                                "name": companion_lead.get("name") or comp_name,
-                                "email": companion_lead.get("email") or comp_email,
-                                "phone": companion_lead.get("phone") or comp_phone,
-                            },
+                            "event_type": "media_sent",
+                            "payload": {"key": "vip_video", "url": u},
                         }
                     ).execute()
                 except Exception:
                     pass
-    except Exception:
-        pass
 
-    # Best-effort: keep lead contact info updated over time
-    try:
-        updates: dict[str, Any] = {}
-        # Always ensure whatsapp is stored (normalized)
-        if (lead.get("whatsapp") or "").strip() != wa_e164:
-            updates["whatsapp"] = wa_e164
-
-        if msg_email and not (lead.get("email") or "").strip():
-            updates["email"] = msg_email
-
-        # Name updates:
-        # - If user used an explicit pattern (soy/me llamo/mi nombre es), always trust it and overwrite.
-        # - If user sent a "name-only" message, only use it when we don't have a good name yet,
-        #   or when the existing name looks like a mistaken capture (e.g. "Ya pagué").
-        incoming_name = msg_name or msg_name_only
-        if incoming_name:
-            existing_name = (lead.get("name") or "").strip()
-            existing_low = existing_name.lower()
-
-            bad_names = {
-                "si me encantaría",
-                "si me encantaria",
-                "sí me encantaría",
-                "hola",
-                "ok",
-                "gracias",
-            }
-
-            looks_like_mistake = (
-                (not existing_name)
-                or (existing_low in bad_names)
-                or ("pagu" in existing_low)
-                or ("pago" in existing_low)
-                or (existing_low in {"ya pague", "ya pagué", "ya pago"})
-            )
-
-            # If it's an explicit-intent name, overwrite. Otherwise, only overwrite when existing looks wrong.
-            if msg_name or looks_like_mistake:
-                updates["name"] = incoming_name
-
-        # Store phone redundantly if your schema has it (safe if it doesn't)
-        if not (lead.get("phone") or "").strip():
-            updates["phone"] = wa_e164
-
-        if updates:
-            try:
-                sb.table("leads").update(updates).eq("lead_id", lead_id).execute()
-                lead.update(updates)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    event_id = lead.get("event_id")
-    facts = _event_facts(event_id)
-
-    # Build conversation context
-    convo = _load_recent_conversation(lead_id)
-    if not convo or convo[-1].get("role") != "user" or (convo[-1].get("content") or "").strip() != body:
-        convo.append({"role": "user", "content": body})
-
-    first_contact = _is_first_contact(lead_id)
-
-    # Generate AI reply
-    ai = await generate_reply(lead=lead, event_facts=facts, conversation=convo)
-
-    if not ai:
-        # Hard fallback
-        ai = (
-            f"Hola {(lead.get('name') or '😊')} 👋 Soy Ana del equipo.\n"
-            f"Vi tu registro a *{facts['event_name']}*.\n\n"
-            "Para cuidarte tu lugar: ¿sí vas a poder asistir? (Sí/No)\n"
-            "Y dime: ¿qué te llamó la atención del evento?"
-        )
-
-    clean, tokens = strip_tokens(ai)
-    clean = _strip_media_placeholders(clean)
-    # Remove common placeholder URL if the model outputs it (we always prefer real media/URLs)
-    clean = re.sub(r"https?://(www\.)?linkdelvideo\.com/?", "", clean, flags=re.I).strip()
-
-    # --- Quick intent heuristics (keeps the experience smooth even if the model doesn't emit tokens) ---
-    low = (body or "").strip().lower()
-    wants_general = any(
-        k in low
-        for k in [
-            "general",
-            "gral",
-            "entrada general",
-            "boleto general",
-            "me quedo con general",
-            "me quedo con el general",
-            "solo general",
-            "sin vip",
-            "no vip",
-            "no quiero vip",
-        ]
-    )
-    wants_vip = any(k in low for k in ["vip", "quiero vip", "sí vip", "si vip", "pagar vip", "pago vip"])
-    vip_context = (
-        wants_vip
-        or ("vip" in low)
-        or any(
+        # --- VIP link heuristics (fix: define should_send_vip_link) ---
+        asks_pay_link = any(
             k in low
             for k in [
-                "incluye",
-                "incluye el vip",
-                "qué incluye",
-                "que incluye",
-                "precio",
-                "cuánto cuesta",
-                "cuanto cuesta",
-                "video",
-                "tienes algún video",
-                "tienes algun video",
-                "tienes un video",
-                "me gustaría escuchar",
-                "me gustaria escuchar",
-                "quiero escuchar",
-                "saber más",
-                "saber mas",
-                "más info",
-                "mas info",
+                "donde pago",
+                "dónde pago",
+                "donde se paga",
+                "link de pago",
+                "liga de pago",
+                "pagar vip",
+                "pago vip",
+                "quiero pagar",
+                "quiero comprar",
+                "checkout",
+                "stripe",
+                "pago el vip",
+                "pagar",
             ]
         )
-    )
 
-    asks_vip_details = any(k in low for k in [
-        "que incluye", "qué incluye", "incluye el vip", "como es el vip", "cómo es el vip",
-        "beneficios", "ventajas", "precio", "cuanto cuesta", "cuánto cuesta",
-        "vip incluye", "detalles vip",
-        "saber más del vip", "saber mas del vip", "quiero saber más del vip", "quiero saber mas del vip",
-    ])
+        # Affirmative VIP intent — user is saying YES to VIP purchase.
+        # Works especially when lead is already VIP_INTERESTED or VIP_LINK_SENT.
+        lead_status_upper = str((lead.get("status") or "")).upper()
+        affirmative_vip_intent = any(
+            k in low
+            for k in [
+                "si me interesa",
+                "sí me interesa",
+                "me interesa",
+                "si quiero",
+                "sí quiero",
+                "dale",
+                "va",
+                "le entro",
+                "quiero 1",
+                "quiero 2",
+                "quiero el 1",
+                "quiero el 2",
+                "opción 1",
+                "opcion 1",
+                "opción 2",
+                "opcion 2",
+                "el 1",
+                "el 2",
+                "la 1",
+                "la 2",
+                "mándame el link",
+                "mandame el link",
+                "manda el link",
+                "mándamelo",
+                "mandamelo",
+                "quiero vip",
+                "sí vip",
+                "si vip",
+            ]
+        ) and lead_status_upper in ("VIP_INTERESTED", "VIP_LINK_SENT")
 
-    asks_video = any(
-        k in low
-        for k in [
-            "video",
-            "vídeo",
-            "mandame el video",
-            "mándame el video",
-            "me mandas el video",
-            "me mandas vídeo",
-            "no me llegó el video",
-            "no me llego el video",
-            "no me llegó el vídeo",
-            "no me llego el vídeo",
-            "no me llego",
-            "no me llegó",
-        ]
-    )
+        # If the model is clearly trying to send a link but used a placeholder, treat it as a link-intent.
+        # This fixes the "primera vez no manda la liga" case (e.g. message contains "[LINK]").
+        model_link_placeholder = (
+            "[link" in clean_low
+            or "link]" in clean_low
+            or "[link]." in clean_low
+            or "te dejo aquí el link" in clean_low
+            or "te dejo aqui el link" in clean_low
+            or "te dejo el link" in clean_low
+            or "aquí tienes el link" in clean_low
+            or "aqui tienes el link" in clean_low
+            or "link para que lo pagues" in clean_low
+            or "link para pagarlo" in clean_low
+        )
 
-    media_urls: list[str] = []
-    clean_low = (clean or "").lower()
+        # Also detect when AI response talks about payment options/links (means it WANTS to send links)
+        ai_wants_to_send_link = any(
+            k in clean_low
+            for k in [
+                "opciones para completar",
+                "link de pago",
+                "liga de pago",
+                "puedes elegir",
+                "te comparto las opciones",
+                "completar tu registro vip",
+                "completar tu compra",
+            ]
+        )
 
-    # We want the VIP video to be sent the first time the user hears the VIP details.
-    # Heuristic: if this outbound message contains VIP-benefit keywords (i.e., it's the VIP explainer), attach the video.
-    vip_explainer_message = any(
-        k in clean_low
-        for k in [
-            "acceso vip",
-            "boleto vip",
-            "experiencia vip",
-            "incluye",
-            "asientos",
-            "primera fila",
-            "acceso preferencial",
-            "mastermind",
-            "libro",
-            "foto",
-            "regalos",
-        ]
-    )
+        should_send_vip_link = (
+            ("[[SEND_VIP_LINK]]" in tokens)
+            or asks_pay_link
+            or affirmative_vip_intent
+            or ("vip" in low and "pago" in low)
+            or (vip_context and model_link_placeholder)
+            or ai_wants_to_send_link
+        )
 
-    if vip_context and vip_explainer_message and str((lead.get("payment_status") or "")).upper() != "PAID":
-        if "precio de un libro" not in clean_low:
-            clean = ("📘 Por el precio de un libro, obtienes:\n" + clean.lstrip()).strip()
-            clean_low = (clean or "").lower()
+        # If the user asks for the payment link but the lead is already PAID, don't send a bogus/placeholder link.
+        if should_send_vip_link and str((lead.get("payment_status") or "")).upper() == "PAID":
+            if "pago" not in clean.lower() and "confirm" not in clean.lower():
+                clean = (clean.rstrip() + "\n\n✅ Tu pago ya está confirmado. Si necesitas tu boleto/QR otra vez, dímelo y te lo reenvío.").strip()
 
-    # VIP pitch video (send as real media, at most once per lead)
-    should_send_vip_video = ("[[SEND_VIP_VIDEO]]" in tokens) or asks_vip_details or (vip_context and vip_explainer_message)
-    if (
-        should_send_vip_video
-        and settings.whatsapp_video_vip_pitch.strip()
-        and (asks_video or not _already_sent_media(lead_id, "vip_video"))
-    ):
-        if "video" not in clean.lower():
-            clean = (clean.rstrip() + "\n\n🎥 Aquí tienes un video corto de Spencer explicando el VIP:").strip()
-        # Remove any .mp4 URL from the text, just in case
-        clean = re.sub(r"https?://\S+\.mp4\S*", "", clean, flags=re.I).strip()
-        u = settings.whatsapp_video_vip_pitch.strip()
-        if u.startswith("https://"):
-            media_urls.append(u)
-            try:
-                sb.table("touchpoints").insert(
-                    {
-                        "lead_id": lead_id,
-                        "channel": "whatsapp",
-                        "event_type": "media_sent",
-                        "payload": {"key": "vip_video", "url": u},
-                    }
-                ).execute()
-            except Exception:
-                pass
+        if should_send_vip_link and str((lead.get("payment_status") or "")).upper() != "PAID":
+            # Avoid duplicating the link if the model already included it
+            if "checkout.stripe.com" not in clean and "https://checkout.stripe.com" not in clean:
+                try:
+                    # Si el modelo metió un link placeholder en Markdown, quítalo antes de pegar el link real
+                    clean = re.sub(r"\[[^\]]+\]\((https?://[^\)]+)\)", "", clean, flags=re.I).strip()
+                    clean = re.sub(r"https?://(?:www\.)?example\.com\S*", "", clean, flags=re.I).strip()
+                    clean = re.sub(r"https?://stripe-link-para-pago\S*", "", clean, flags=re.I).strip()
+                    clean = re.sub(r"\[\s*link\s*\]", "", clean, flags=re.I).strip()
+                    checkout_lead_id = lead_id
 
-    # --- VIP link heuristics (fix: define should_send_vip_link) ---
-    asks_pay_link = any(
-        k in low
-        for k in [
-            "donde pago",
-            "dónde pago",
-            "donde se paga",
-            "link de pago",
-            "liga de pago",
-            "pagar vip",
-            "pago vip",
-            "quiero pagar",
-            "quiero comprar",
-            "checkout",
-            "stripe",
-            "pago el vip",
-            "pagar",
-        ]
-    )
+                    # If the user is asking to pay for a companion ("para ella", "acompañante", etc.),
+                    # use the most recently captured companion_lead_id so Stripe link is NEW and not the already-paid one.
+                    is_companion_payment = any(
+                        k in low
+                        for k in [
+                            "acompanante",
+                            "acompañante",
+                            "para ella",
+                            "para el",
+                            "para florencia",
+                            "solo para ella",
+                            "solo para el",
+                            "para mi acompañante",
+                            "para mi acompanante",
+                        ]
+                    )
 
-    # Affirmative VIP intent — user is saying YES to VIP purchase.
-    # Works especially when lead is already VIP_INTERESTED or VIP_LINK_SENT.
-    lead_status_upper = str((lead.get("status") or "")).upper()
-    affirmative_vip_intent = any(
-        k in low
-        for k in [
-            "si me interesa",
-            "sí me interesa",
-            "me interesa",
-            "si quiero",
-            "sí quiero",
-            "dale",
-            "va",
-            "le entro",
-            "quiero 1",
-            "quiero 2",
-            "quiero el 1",
-            "quiero el 2",
-            "opción 1",
-            "opcion 1",
-            "opción 2",
-            "opcion 2",
-            "el 1",
-            "el 2",
-            "la 1",
-            "la 2",
-            "mándame el link",
-            "mandame el link",
-            "manda el link",
-            "mándamelo",
-            "mandamelo",
-            "quiero vip",
-            "sí vip",
-            "si vip",
-        ]
-    ) and lead_status_upper in ("VIP_INTERESTED", "VIP_LINK_SENT")
+                    if is_companion_payment:
+                        try:
+                            tp = (
+                                sb.table("touchpoints")
+                                .select("payload,created_at")
+                                .eq("lead_id", lead_id)
+                                .eq("channel", "whatsapp")
+                                .eq("event_type", "companion_created")
+                                .order("created_at", desc=True)
+                                .limit(1)
+                                .execute()
+                            )
+                            row = (tp.data or [{}])[0] or {}
+                            payload = row.get("payload") or {}
+                            comp_id = (payload.get("companion_lead_id") or "").strip()
+                            if comp_id:
+                                checkout_lead_id = comp_id
+                        except Exception:
+                            pass
 
-    # If the model is clearly trying to send a link but used a placeholder, treat it as a link-intent.
-    # This fixes the "primera vez no manda la liga" case (e.g. message contains "[LINK]").
-    model_link_placeholder = (
-        "[link" in clean_low
-        or "link]" in clean_low
-        or "[link]." in clean_low
-        or "te dejo aquí el link" in clean_low
-        or "te dejo aqui el link" in clean_low
-        or "te dejo el link" in clean_low
-        or "aquí tienes el link" in clean_low
-        or "aqui tienes el link" in clean_low
-        or "link para que lo pagues" in clean_low
-        or "link para pagarlo" in clean_low
-    )
+                    url = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id)
+                except Exception:
+                    url = None
+                if url:
+                    url = (url or "").strip()
+                    # Links FIRST, then explanation. People click faster when
+                    # the link is the first thing they see.
+                    clean = (
+                        "\U0001f525 Link de pago VIP:\n"
+                        + url
+                        + "\n\n"
+                        + clean.rstrip()
+                        + "\n\nEn cuanto se confirme tu pago, te mando tu boleto VIP con QR \U0001f39f\ufe0f"
+                    ).strip()
+                else:
+                    clean = (
+                        clean.rstrip()
+                        + "\n\nAhorita no pude generar el link 😅 ¿me pones *VIP* otra vez en 30 segundos?"
+                    ).strip()
 
-    # Also detect when AI response talks about payment options/links (means it WANTS to send links)
-    ai_wants_to_send_link = any(
-        k in clean_low
-        for k in [
-            "opciones para completar",
-            "link de pago",
-            "liga de pago",
-            "puedes elegir",
-            "te comparto las opciones",
-            "completar tu registro vip",
-            "completar tu compra",
-        ]
-    )
-
-    should_send_vip_link = (
-        ("[[SEND_VIP_LINK]]" in tokens)
-        or asks_pay_link
-        or affirmative_vip_intent
-        or ("vip" in low and "pago" in low)
-        or (vip_context and model_link_placeholder)
-        or ai_wants_to_send_link
-    )
-
-    # If the user asks for the payment link but the lead is already PAID, don't send a bogus/placeholder link.
-    if should_send_vip_link and str((lead.get("payment_status") or "")).upper() == "PAID":
-        if "pago" not in clean.lower() and "confirm" not in clean.lower():
-            clean = (clean.rstrip() + "\n\n✅ Tu pago ya está confirmado. Si necesitas tu boleto/QR otra vez, dímelo y te lo reenvío.").strip()
-
-    if should_send_vip_link and str((lead.get("payment_status") or "")).upper() != "PAID":
-        # Avoid duplicating the link if the model already included it
-        if "checkout.stripe.com" not in clean and "https://checkout.stripe.com" not in clean:
-            try:
-                # Si el modelo metió un link placeholder en Markdown, quítalo antes de pegar el link real
-                clean = re.sub(r"\[[^\]]+\]\((https?://[^\)]+)\)", "", clean, flags=re.I).strip()
-                clean = re.sub(r"https?://(?:www\.)?example\.com\S*", "", clean, flags=re.I).strip()
-                clean = re.sub(r"https?://stripe-link-para-pago\S*", "", clean, flags=re.I).strip()
-                clean = re.sub(r"\[\s*link\s*\]", "", clean, flags=re.I).strip()
-                checkout_lead_id = lead_id
-
-                # If the user is asking to pay for a companion ("para ella", "acompañante", etc.),
-                # use the most recently captured companion_lead_id so Stripe link is NEW and not the already-paid one.
-                is_companion_payment = any(
-                    k in low
-                    for k in [
-                        "acompanante",
-                        "acompañante",
-                        "para ella",
-                        "para el",
-                        "para florencia",
-                        "solo para ella",
-                        "solo para el",
-                        "para mi acompañante",
-                        "para mi acompanante",
-                    ]
+        # If model asked to send General ticket
+        if "[[SEND_GENERAL_TICKET]]" in tokens:
+            if not settings.public_base_url:
+                clean = (clean + "\n\n(Nota: falta PUBLIC_BASE_URL para mandar tu QR automático.)").strip()
+            else:
+                ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts)
+                media_urls.append(
+                    f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                 )
 
-                if is_companion_payment:
-                    try:
-                        tp = (
-                            sb.table("touchpoints")
-                            .select("payload,created_at")
-                            .eq("lead_id", lead_id)
-                            .eq("channel", "whatsapp")
-                            .eq("event_type", "companion_created")
-                            .order("created_at", desc=True)
-                            .limit(1)
-                            .execute()
-                        )
-                        row = (tp.data or [{}])[0] or {}
-                        payload = row.get("payload") or {}
-                        comp_id = (payload.get("companion_lead_id") or "").strip()
-                        if comp_id:
-                            checkout_lead_id = comp_id
-                    except Exception:
-                        pass
+        # Refresh lead so we see payment_status updates made by Stripe webhook
+        try:
+            lead_fresh_res = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1).execute()
+            lead_fresh = (lead_fresh_res.data or [None])[0] or lead
+            lead = lead_fresh
+        except Exception:
+            pass
 
-                url = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id)
-            except Exception:
-                url = None
-            if url:
-                url = (url or "").strip()
-                # Links FIRST, then explanation. People click faster when
-                # the link is the first thing they see.
-                clean = (
-                    "\U0001f525 Link de pago VIP:\n"
-                    + url
-                    + "\n\n"
-                    + clean.rstrip()
-                    + "\n\nEn cuanto se confirme tu pago, te mando tu boleto VIP con QR \U0001f39f\ufe0f"
-                ).strip()
-            else:
-                clean = (
-                    clean.rstrip()
-                    + "\n\nAhorita no pude generar el link 😅 ¿me pones *VIP* otra vez en 30 segundos?"
-                ).strip()
-
-    # If model asked to send General ticket
-    if "[[SEND_GENERAL_TICKET]]" in tokens:
-        if not settings.public_base_url:
-            clean = (clean + "\n\n(Nota: falta PUBLIC_BASE_URL para mandar tu QR automático.)").strip()
-        else:
-            ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts)
-            media_urls.append(
-                f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
-            )
-
-    # Refresh lead so we see payment_status updates made by Stripe webhook
-    try:
-        lead_fresh_res = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1).execute()
-        lead_fresh = (lead_fresh_res.data or [None])[0] or lead
-        lead = lead_fresh
-    except Exception:
-        pass
-
-    # If the user explicitly asks again for the QR/ticket after payment, re-send it (on demand).
-    asks_qr = any(
-        k in low
-        for k in [
-            "qr",
-            "código qr",
-            "codigo qr",
-            "mi boleto",
-            "mandas mi boleto",
-            "mándas mi boleto",
-            "me mandas mi boleto",
-            "me mandas el boleto",
-            "boleto vip",
-            "imagen",
-            "ticket",
-        ]
-    )
-
-    if str((lead.get("payment_status") or "")).upper() == "PAID" and asks_qr and settings.public_base_url:
-        ticket = generate_ticket_png(lead=lead, tier="VIP", event=facts)
-        media_urls.append(
-            f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
+        # If the user explicitly asks again for the QR/ticket after payment, re-send it (on demand).
+        asks_qr = any(
+            k in low
+            for k in [
+                "qr",
+                "código qr",
+                "codigo qr",
+                "mi boleto",
+                "mandas mi boleto",
+                "mándas mi boleto",
+                "me mandas mi boleto",
+                "me mandas el boleto",
+                "boleto vip",
+                "imagen",
+                "ticket",
+            ]
         )
-        if "qr" not in clean.lower() and "boleto" not in clean.lower():
-            clean = (clean.rstrip() + "\n\n✅ Aquí tienes tu boleto VIP con QR 👇").strip()
 
-    # If Stripe webhook already marked this lead as PAID, automatically send VIP ticket ONCE (no user trigger needed)
-    if str((lead.get("payment_status") or "")).upper() == "PAID":
-        if settings.public_base_url and not _already_sent_ticket(lead_id, "VIP"):
+        if str((lead.get("payment_status") or "")).upper() == "PAID" and asks_qr and settings.public_base_url:
             ticket = generate_ticket_png(lead=lead, tier="VIP", event=facts)
             media_urls.append(
                 f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
             )
             if "qr" not in clean.lower() and "boleto" not in clean.lower():
-                clean = (clean.rstrip() + "\n\n✅ Pago confirmado. Aquí está tu boleto VIP con QR 👇").strip()
+                clean = (clean.rstrip() + "\n\n✅ Aquí tienes tu boleto VIP con QR 👇").strip()
 
-            # Mark that we already sent the VIP ticket so it doesn't get re-sent on every message
+        # If Stripe webhook already marked this lead as PAID, automatically send VIP ticket ONCE (no user trigger needed)
+        if str((lead.get("payment_status") or "")).upper() == "PAID":
+            if settings.public_base_url and not _already_sent_ticket(lead_id, "VIP"):
+                ticket = generate_ticket_png(lead=lead, tier="VIP", event=facts)
+                media_urls.append(
+                    f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
+                )
+                if "qr" not in clean.lower() and "boleto" not in clean.lower():
+                    clean = (clean.rstrip() + "\n\n✅ Pago confirmado. Aquí está tu boleto VIP con QR 👇").strip()
+
+                # Mark that we already sent the VIP ticket so it doesn't get re-sent on every message
+                try:
+                    sb.table("touchpoints").insert(
+                        {
+                            "lead_id": lead_id,
+                            "channel": "whatsapp",
+                            "event_type": "ticket_sent",
+                            "payload": {"tier": "VIP", "ticket_id": ticket["ticket_id"]},
+                        }
+                    ).execute()
+                except Exception:
+                    pass
+
+
+        # Free GENERAL flow: if the user chooses General (no payment), confirm + send ticket right away.
+        if wants_general and not wants_vip and str((lead.get("status") or "")).upper() not in ["GENERAL_CONFIRMED", "VIP_PAID"]:
             try:
-                sb.table("touchpoints").insert(
-                    {
-                        "lead_id": lead_id,
-                        "channel": "whatsapp",
-                        "event_type": "ticket_sent",
-                        "payload": {"tier": "VIP", "ticket_id": ticket["ticket_id"]},
-                    }
-                ).execute()
+                sb.table("leads").update({"status": "GENERAL_CONFIRMED", "payment_status": "FREE"}).eq("lead_id", lead_id).execute()
+                lead["status"] = "GENERAL_CONFIRMED"
+                lead["payment_status"] = "FREE"
             except Exception:
                 pass
 
+            if settings.public_base_url:
+                ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts)
+                media_urls.append(
+                    f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
+                )
+                clean = (
+                    "✅ Perfecto. Te confirmé en *GENERAL* (sin VIP).\n"
+                    "Aquí está tu boleto con QR 👇\n\n"
+                    "Tip: para aprovecharlo cañón, intenta asistir los *3 días completos*."
+                ).strip()
+            else:
+                clean = (
+                    "✅ Perfecto. Te confirmé en *GENERAL* (sin VIP).\n\n"
+                    "(Nota: falta PUBLIC_BASE_URL para mandar tu QR automático.)"
+                ).strip()
 
-    # Free GENERAL flow: if the user chooses General (no payment), confirm + send ticket right away.
-    if wants_general and not wants_vip and str((lead.get("status") or "")).upper() not in ["GENERAL_CONFIRMED", "VIP_PAID"]:
+        # Save outbound
         try:
-            sb.table("leads").update({"status": "GENERAL_CONFIRMED", "payment_status": "FREE"}).eq("lead_id", lead_id).execute()
-            lead["status"] = "GENERAL_CONFIRMED"
-            lead["payment_status"] = "FREE"
+            sb.table("touchpoints").insert(
+                {
+                    "lead_id": lead_id,
+                    "channel": "whatsapp",
+                    "event_type": "outbound_ai",
+                    "payload": {"to": wa_from, "body": clean, "in_reply_to": message_sid, "tokens": list(tokens)},
+                }
+            ).execute()
         except Exception:
             pass
 
-        if settings.public_base_url:
-            ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts)
-            media_urls.append(
-                f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
-            )
-            clean = (
-                "✅ Perfecto. Te confirmé en *GENERAL* (sin VIP).\n"
-                "Aquí está tu boleto con QR 👇\n\n"
-                "Tip: para aprovecharlo cañón, intenta asistir los *3 días completos*."
-            ).strip()
-        else:
-            clean = (
-                "✅ Perfecto. Te confirmé en *GENERAL* (sin VIP).\n\n"
-                "(Nota: falta PUBLIC_BASE_URL para mandar tu QR automático.)"
-            ).strip()
+        # De-duplicate media URLs (Twilio can be picky)
+        if media_urls:
+            media_urls = list(dict.fromkeys([u for u in media_urls if u]))
 
-    # Save outbound
-    try:
-        sb.table("touchpoints").insert(
-            {
-                "lead_id": lead_id,
-                "channel": "whatsapp",
-                "event_type": "outbound_ai",
-                "payload": {"to": wa_from, "body": clean, "in_reply_to": message_sid, "tokens": list(tokens)},
-            }
-        ).execute()
+        # Send reply via Twilio REST API (background; TwiML already returned empty).
+        await send_whatsapp(to_e164=wa_e164, body=clean, media_urls=media_urls or None)
+
     except Exception:
-        pass
-
-    # De-duplicate media URLs (Twilio can be picky)
-    if media_urls:
-        media_urls = list(dict.fromkeys([u for u in media_urls if u]))
-
-    # Reply via TwiML so Twilio delivers the response to the user.
-    # This is the most reliable path for inbound webhooks (especially Sandbox).
-    return _twiml_message(clean, media_urls=media_urls or None)
+        logger.exception("bg_reply_failed lead=%s", lead_id)
+        try:
+            await send_whatsapp(to_e164=wa_e164, body="Tuve un problema técnico 😅 ¿Me escribes de nuevo?")
+        except Exception:
+            logger.exception("bg_fallback_also_failed lead=%s", lead_id)
