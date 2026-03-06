@@ -279,6 +279,66 @@ def _sync_sales_leads_sync(eligible_leads: list[dict[str, Any]]) -> dict[str, in
     return {"synced": synced, "total_eligible": len(eligible_leads)}
 
 
+def _update_lead_in_sales_sheet_sync(lead: dict[str, Any]) -> None:
+    """Update a single lead's row in the Spartans Sales sheet (synchronous).
+
+    Finds by lead_id (col A) or WhatsApp (col D). If found, updates
+    the status column. If not found, does nothing (lead wasn't a Spartans target).
+    """
+    client = _get_client()
+    if not client or not settings.gsheet_sales_leads_id:
+        return
+
+    try:
+        import gspread
+    except ImportError:
+        return
+
+    try:
+        sh = client.open_by_key(settings.gsheet_sales_leads_id)
+        ws = sh.sheet1
+    except Exception:
+        return
+
+    lead_id = str(lead.get("lead_id") or "")
+    wa = str(lead.get("whatsapp") or "").strip()
+    if not lead_id:
+        return
+
+    # Find existing row
+    cell = None
+    try:
+        cell = ws.find(lead_id, in_column=1)
+    except Exception:
+        pass
+    if not cell and wa:
+        try:
+            cell = ws.find(wa, in_column=4)
+        except Exception:
+            pass
+
+    if cell:
+        # Update the row with current lead data (keep seller columns intact)
+        row_data = [str(lead.get(col) or "") for col in SALES_LEADS_COLUMNS]
+        end_col = _col_letter(len(row_data))
+        try:
+            ws.update(f"A{cell.row}:{end_col}{cell.row}", [row_data])
+            logger.info("gsheet_sales_updated lead=%s row=%d", lead_id, cell.row)
+        except Exception as exc:
+            logger.error("gsheet_sales_update_failed lead=%s err=%s", lead_id, str(exc)[:200])
+
+
+async def sync_lead_to_sales_leads_sheet(lead: dict[str, Any]) -> None:
+    """Fire-and-forget: update a lead in the Spartans Sales sheet.
+
+    Safe to call from asyncio.create_task(). Never raises.
+    """
+    try:
+        await anyio.to_thread.run_sync(lambda: _update_lead_in_sales_sheet_sync(lead))
+    except Exception:
+        logger.exception("sync_lead_to_sales_sheet_failed")
+
+
 async def sync_sales_leads_sheet() -> dict[str, int]:
     """Sync eligible sales leads to the Spartans Google Sheet.
 

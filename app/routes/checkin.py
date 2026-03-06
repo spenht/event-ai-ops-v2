@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..deps import sb
 from ..settings import settings
-from ..services.google_sheets import sync_lead_to_all_leads_sheet
+from ..services.google_sheets import sync_lead_to_all_leads_sheet, sync_lead_to_sales_leads_sheet
 
 logger = logging.getLogger("checkin")
 
@@ -410,11 +410,12 @@ async def checkin_verify(request: Request, key: str = ""):
     except Exception as exc:
         logger.error("lead_status_update_failed lead=%s err=%s", lead_id, str(exc)[:300])
 
-    # 9. Sync to Google Sheets (fire-and-forget, re-fetch with updated status)
+    # 9. Sync to BOTH Google Sheets (fire-and-forget, re-fetch with updated status)
     try:
         lr2 = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1).execute()
         if lr2.data:
             asyncio.create_task(sync_lead_to_all_leads_sheet(lr2.data[0]))
+            asyncio.create_task(sync_lead_to_sales_leads_sheet(lr2.data[0]))
     except Exception:
         pass
 
