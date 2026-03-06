@@ -75,5 +75,9 @@ class Settings:
     gsheet_all_leads_id: str = _env("GSHEET_ALL_LEADS_ID", "")
     gsheet_sales_leads_id: str = _env("GSHEET_SALES_LEADS_ID", "")
 
+    # Meta Conversions API
+    meta_pixel_id: str = _env("META_PIXEL_ID", "")
+    meta_conversions_api_token: str = _env("META_CONVERSIONS_API_TOKEN", "")
+
 
 settings = Settings()

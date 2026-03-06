@@ -13,6 +13,7 @@ from ..services.tickets import generate_ticket_png
 from ..services.twilio_whatsapp import send_whatsapp
 from ..services.url_shortener import create_short_url
 from ..services.google_sheets import sync_lead_to_all_leads_sheet
+from ..services.meta_conversions import send_purchase_event
 
 logger = logging.getLogger("payments")
 
@@ -156,6 +157,13 @@ async def stripe_webhook(request: Request):
             try:
                 import asyncio
                 asyncio.create_task(sync_lead_to_all_leads_sheet(lead))
+            except Exception:
+                pass
+
+            # Meta CAPI: Purchase event
+            try:
+                payment_value = (obj.get("amount_total") or 0) / 100
+                asyncio.create_task(send_purchase_event(lead, value=payment_value))
             except Exception:
                 pass
 

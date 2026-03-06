@@ -15,6 +15,7 @@ from ..services.tickets import generate_ticket_png
 from ..services.twilio_whatsapp import send_whatsapp
 from ..services.url_shortener import create_short_url
 from ..services.google_sheets import sync_lead_to_all_leads_sheet
+from ..services.meta_conversions import send_purchase_event
 
 logger = logging.getLogger("spartans")
 
@@ -322,6 +323,12 @@ async def spartans_confirm(request: Request, key: str = ""):
     # 7. Sync to Google Sheets
     try:
         asyncio.create_task(sync_lead_to_all_leads_sheet(lead))
+    except Exception:
+        pass
+
+    # 7b. Meta CAPI: Purchase event
+    try:
+        asyncio.create_task(send_purchase_event(lead))
     except Exception:
         pass
 
