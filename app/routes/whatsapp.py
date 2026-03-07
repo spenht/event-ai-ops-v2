@@ -21,6 +21,7 @@ from ..services.stripe_checkout import create_vip_checkout_link
 from ..services.twilio_whatsapp import normalize_mx_whatsapp, send_whatsapp
 from ..services.url_shortener import create_short_url
 from ..services.google_sheets import sync_lead_to_all_leads_sheet
+from ..services.meta_conversions import send_lead_event
 
 logger = logging.getLogger("whatsapp")
 
@@ -571,6 +572,33 @@ async def whatsapp_inbound(request: Request):
                     pass
         except Exception:
             pass
+
+        # Capture Click-to-WhatsApp referral data (if present)
+        referral_source = (form.get("ReferralSourceType") or "").strip()
+        if referral_source:
+            referral_data = {
+                "source_type": referral_source,
+                "source_id": (form.get("ReferralSourceId") or "").strip(),
+                "source_url": (form.get("ReferralSourceUrl") or "").strip(),
+                "headline": (form.get("ReferralHeadline") or "").strip(),
+                "body": (form.get("ReferralBody") or "").strip(),
+            }
+            try:
+                sb.table("touchpoints").insert({
+                    "lead_id": lead["lead_id"],
+                    "channel": "meta",
+                    "event_type": "ctwa_referral",
+                    "payload": referral_data,
+                }).execute()
+            except Exception:
+                pass
+            try:
+                sb.table("leads").update({"source": "ctwa"}).eq("lead_id", lead["lead_id"]).execute()
+            except Exception:
+                pass
+
+        # Meta CAPI: Lead event (fire-and-forget)
+        asyncio.create_task(send_lead_event(lead))
 
         # If user already provided name+email in first message, skip the greeting
         # and go straight to auto-confirm GENERAL (background handler).
