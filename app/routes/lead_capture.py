@@ -350,7 +350,12 @@ async def embeddable_form(
 
     theme = (theme or "").strip().lower()
 
+    # Aliases: bare "transparent" maps to light variant
+    if theme in ("transparent", ""):
+        theme = "transparent-light"
+
     if theme == "dark":
+        # Solid dark card on dark background
         v_bg            = _hex(bg,           "0f0f0f")
         v_text          = _hex(text,         "ffffff")
         v_accent        = _hex(accent,       "53c1de")
@@ -363,6 +368,7 @@ async def embeddable_form(
         v_footer_color  = "3a4a5a"
         v_shadow        = "0 0 60px rgba(15,52,96,0.15)"
     elif theme == "light":
+        # Solid white card on light background
         v_bg            = _hex(bg,           "f9fafb")
         v_text          = _hex(text,         "111827")
         v_accent        = _hex(accent,       "3b82f6")
@@ -374,8 +380,21 @@ async def embeddable_form(
         v_placeholder   = "9ca3af"
         v_footer_color  = "9ca3af"
         v_shadow        = "0 4px 24px rgba(0,0,0,0.06)"
+    elif theme == "transparent-dark":
+        # Transparent — tuned for dark parent backgrounds
+        v_bg            = _hex(bg,           "")
+        v_text          = _hex(text,         "")
+        v_accent        = _hex(accent,       "53c1de")
+        v_card_bg       = _hex(card_bg,      "")
+        v_card_border   = _hex(input_border, "")
+        v_input_bg      = _hex(input_bg,     "")
+        v_input_border  = _hex(input_border, "444c56")
+        v_label_color   = _hex(text,         "")
+        v_placeholder   = "6b7280"
+        v_footer_color  = "6b7280"
+        v_shadow        = "none"
     else:
-        # ── transparent / inherit (default) ──
+        # transparent-light (DEFAULT) — tuned for light parent backgrounds
         v_bg            = _hex(bg,           "")
         v_text          = _hex(text,         "")
         v_accent        = _hex(accent,       "3b82f6")
