@@ -277,8 +277,54 @@ async def capture_lead(request: Request, body: CaptureRequest):
 
 
 @router.get("/v1/forms/{campaign_id}", response_class=HTMLResponse)
-async def embeddable_form(campaign_id: str):
-    """Self-contained HTML form for embedding via iframe on external landing pages."""
+async def embeddable_form(
+    campaign_id: str,
+    request: Request,
+    theme: str = "",
+    bg: str = "",
+    text: str = "",
+    accent: str = "",
+    card_bg: str = "",
+    input_bg: str = "",
+    input_border: str = "",
+    radius: str = "",
+    btn_text: str = "",
+    success_color: str = "",
+    vip_color: str = "",
+    hide_header: str = "",
+    hide_footer: str = "",
+    title: str = "",
+    subtitle: str = "",
+    btn_label: str = "",
+):
+    """Self-contained HTML form for embedding via iframe on external landing pages.
+
+    By default renders a transparent/minimal form that inherits from the parent
+    page.  Pass query-params to customise colours and layout:
+
+    **Preset themes** (``?theme=``):
+    - ``dark``  – dark card on dark background (the old default)
+    - ``light`` – white card on light background
+
+    **Custom colours** (hex without ``#``):
+    - ``bg``           – body background  (default: transparent)
+    - ``text``         – body text colour  (default: inherit)
+    - ``accent``       – focus ring, separator, subtitle  (default: ``3b82f6``)
+    - ``card_bg``      – card background  (default: transparent)
+    - ``input_bg``     – input background  (default: transparent)
+    - ``input_border`` – input border colour  (default: ``d1d5db``)
+    - ``radius``       – border-radius in px  (default: ``10``)
+    - ``btn_text``     – submit button text colour  (default: ``ffffff``)
+    - ``success_color``– green button gradient start (default: ``22c55e``)
+    - ``vip_color``    – VIP button gradient start  (default: ``d4af37``)
+
+    **Layout**:
+    - ``hide_header=1``  – hide event name header
+    - ``hide_footer=1``  – hide "Powered by" footer
+    - ``title``          – override header title
+    - ``subtitle``       – override header subtitle
+    - ``btn_label``      – override submit button label
+    """
 
     try:
         r = sb.table("campaigns").select(
@@ -295,6 +341,75 @@ async def embeddable_form(campaign_id: str):
     has_stripe = bool(campaign.get("stripe_secret_key"))
     wa_number = _wa_number_from_campaign(campaign)
 
+    # ── Resolve theme variables ──────────────────────────────────
+    _HEX = re.compile(r"^[0-9a-fA-F]{3,8}$")
+
+    def _hex(val: str, fallback: str) -> str:
+        v = val.strip().lstrip("#")
+        return v if _HEX.match(v) else fallback
+
+    theme = (theme or "").strip().lower()
+
+    if theme == "dark":
+        v_bg            = _hex(bg,           "0f0f0f")
+        v_text          = _hex(text,         "ffffff")
+        v_accent        = _hex(accent,       "53c1de")
+        v_card_bg       = _hex(card_bg,      "1a1a2e")
+        v_card_border   = _hex(input_border, "0f3460")
+        v_input_bg      = _hex(input_bg,     "0a0e1a")
+        v_input_border  = _hex(input_border, "0f3460")
+        v_label_color   = _hex(text,         "8ab4c8")
+        v_placeholder   = "3a4a5a"
+        v_footer_color  = "3a4a5a"
+        v_shadow        = "0 0 60px rgba(15,52,96,0.15)"
+    elif theme == "light":
+        v_bg            = _hex(bg,           "f9fafb")
+        v_text          = _hex(text,         "111827")
+        v_accent        = _hex(accent,       "3b82f6")
+        v_card_bg       = _hex(card_bg,      "ffffff")
+        v_card_border   = _hex(input_border, "e5e7eb")
+        v_input_bg      = _hex(input_bg,     "f9fafb")
+        v_input_border  = _hex(input_border, "d1d5db")
+        v_label_color   = _hex(text,         "374151")
+        v_placeholder   = "9ca3af"
+        v_footer_color  = "9ca3af"
+        v_shadow        = "0 4px 24px rgba(0,0,0,0.06)"
+    else:
+        # ── transparent / inherit (default) ──
+        v_bg            = _hex(bg,           "")
+        v_text          = _hex(text,         "")
+        v_accent        = _hex(accent,       "3b82f6")
+        v_card_bg       = _hex(card_bg,      "")
+        v_card_border   = _hex(input_border, "")
+        v_input_bg      = _hex(input_bg,     "")
+        v_input_border  = _hex(input_border, "d1d5db")
+        v_label_color   = _hex(text,         "")
+        v_placeholder   = "9ca3af"
+        v_footer_color  = "9ca3af"
+        v_shadow        = "none"
+
+    v_radius        = radius.strip() if radius.strip().isdigit() else "10"
+    v_btn_text      = _hex(btn_text,       "ffffff")
+    v_success       = _hex(success_color,  "22c55e")
+    v_vip           = _hex(vip_color,      "d4af37")
+
+    # CSS helpers — only set property if value is non-empty
+    def _prop(prop: str, val: str, prefix: str = "#") -> str:
+        return f"{prop}: {prefix}{val};" if val else ""
+
+    css_body_bg     = _prop("background", v_bg) if v_bg else "background: transparent;"
+    css_body_color  = _prop("color", v_text) if v_text else "color: inherit;"
+    css_card_bg     = _prop("background", v_card_bg) if v_card_bg else "background: transparent;"
+    css_card_border = f"border: 1px solid #{v_card_border};" if v_card_border else "border: none;"
+    css_input_bg    = _prop("background", v_input_bg) if v_input_bg else "background: transparent;"
+    css_label_color = _prop("color", v_label_color) if v_label_color else "color: inherit;"
+
+    show_header     = hide_header.strip() != "1"
+    show_footer     = hide_footer.strip() != "1"
+    form_title      = title.strip() if title.strip() else event_name
+    form_subtitle   = subtitle.strip() if subtitle.strip() else "Registro"
+    form_btn_label  = btn_label.strip() if btn_label.strip() else "Registrarme"
+
     return f"""<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -304,9 +419,9 @@ async def embeddable_form(campaign_id: str):
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{
-  background: #0f0f0f;
-  color: #fff;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  {css_body_bg}
+  {css_body_color}
+  font-family: inherit;
   min-height: 100vh;
   display: flex;
   align-items: center;
@@ -316,11 +431,11 @@ body {{
 .card {{
   width: 100%;
   max-width: 440px;
-  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-  border: 1px solid #0f3460aa;
-  border-radius: 16px;
+  {css_card_bg}
+  {css_card_border}
+  border-radius: {v_radius}px;
   padding: 32px 24px;
-  box-shadow: 0 0 60px rgba(15,52,96,0.15);
+  box-shadow: {v_shadow};
 }}
 .header {{
   text-align: center;
@@ -329,24 +444,24 @@ body {{
 .header h1 {{
   font-size: 22px;
   font-weight: 700;
-  color: #fff;
+  color: inherit;
   letter-spacing: 2px;
   margin-bottom: 4px;
 }}
 .header h2 {{
   font-size: 14px;
   font-weight: 400;
-  color: #53c1de;
+  color: #{v_accent};
 }}
 .sep {{
   height: 1px;
-  background: linear-gradient(90deg, transparent, #53c1de66, transparent);
+  background: linear-gradient(90deg, transparent, #{v_accent}66, transparent);
   margin: 18px 0;
 }}
 label {{
   display: block;
   font-size: 13px;
-  color: #8ab4c8;
+  {css_label_color}
   text-transform: uppercase;
   letter-spacing: 1px;
   margin-bottom: 6px;
@@ -356,15 +471,15 @@ input {{
   width: 100%;
   padding: 13px 16px;
   font-size: 16px;
-  border: 1px solid #0f346066;
-  border-radius: 10px;
-  background: #0a0e1a;
-  color: #fff;
+  border: 1px solid #{v_input_border};
+  border-radius: {v_radius}px;
+  {css_input_bg}
+  color: inherit;
   outline: none;
   transition: border-color 0.2s;
 }}
-input:focus {{ border-color: #53c1de; }}
-input::placeholder {{ color: #3a4a5a; }}
+input:focus {{ border-color: #{v_accent}; }}
+input::placeholder {{ color: #{v_placeholder}; }}
 button {{
   width: 100%;
   margin-top: 20px;
@@ -373,37 +488,37 @@ button {{
   font-weight: 600;
   letter-spacing: 1px;
   border: none;
-  border-radius: 10px;
+  border-radius: {v_radius}px;
   cursor: pointer;
   transition: opacity 0.2s, transform 0.1s;
 }}
 button:hover {{ opacity: 0.9; }}
 button:active {{ transform: scale(0.98); }}
 .btn-primary {{
-  background: linear-gradient(135deg, #53c1de, #0f3460);
-  color: #fff;
+  background: #{v_accent};
+  color: #{v_btn_text};
 }}
 .btn-success {{
-  background: linear-gradient(135deg, #22c55e, #16a34a);
+  background: #{v_success};
   color: #fff;
   text-decoration: none;
   display: inline-block;
   text-align: center;
   padding: 15px;
-  border-radius: 10px;
+  border-radius: {v_radius}px;
   font-size: 16px;
   font-weight: 600;
   margin-top: 12px;
   width: 100%;
 }}
 .btn-vip {{
-  background: linear-gradient(135deg, #d4af37, #b8962e);
+  background: #{v_vip};
   color: #1a1000;
   text-decoration: none;
   display: inline-block;
   text-align: center;
   padding: 15px;
-  border-radius: 10px;
+  border-radius: {v_radius}px;
   font-size: 16px;
   font-weight: 600;
   margin-top: 12px;
@@ -412,37 +527,37 @@ button:active {{ transform: scale(0.98); }}
 .msg {{
   margin-top: 20px;
   padding: 16px;
-  border-radius: 10px;
+  border-radius: {v_radius}px;
   font-size: 15px;
   line-height: 1.5;
   text-align: center;
 }}
 .msg-success {{
-  background: #16a34a22;
-  border: 1px solid #22c55e44;
-  color: #4ade80;
+  background: #{v_success}18;
+  border: 1px solid #{v_success}44;
+  color: #{v_success};
 }}
 .msg-error {{
-  background: #dc262622;
+  background: #dc262618;
   border: 1px solid #ef444444;
-  color: #f87171;
+  color: #ef4444;
 }}
 #result {{ display: none; }}
 .footer {{
   text-align: center;
   margin-top: 20px;
   font-size: 11px;
-  color: #3a4a5a;
+  color: #{v_footer_color};
 }}
 </style>
 </head>
 <body>
 <div class="card">
-  <div class="header">
-    <h1>{event_name}</h1>
-    <h2>Registro</h2>
+  {"" if not show_header else f'''<div class="header">
+    <h1>{form_title}</h1>
+    <h2>{form_subtitle}</h2>
   </div>
-  <div class="sep"></div>
+  <div class="sep"></div>'''}
 
   <form id="captureForm">
     <label for="name">Nombre completo</label>
@@ -454,11 +569,11 @@ button:active {{ transform: scale(0.98); }}
     <label for="whatsapp">WhatsApp</label>
     <input type="tel" id="whatsapp" name="whatsapp" placeholder="+521XXXXXXXXXX" inputmode="tel" required>
 
-    <button type="submit" class="btn-primary" id="submitBtn">Registrarme</button>
+    <button type="submit" class="btn-primary" id="submitBtn">{form_btn_label}</button>
   </form>
 
   <div id="result"></div>
-  <div class="footer">Powered by Event AI Ops</div>
+  {"" if not show_footer else '<div class="footer">Powered by Event AI Ops</div>'}
 </div>
 
 <script>
@@ -520,7 +635,7 @@ document.getElementById('captureForm').addEventListener('submit', async function
 
   }} catch (err) {{
     btn.disabled = false;
-    btn.textContent = 'Registrarme';
+    btn.textContent = '{form_btn_label}';
     const resultDiv = document.getElementById('result');
     resultDiv.style.display = 'block';
     resultDiv.innerHTML = '<div class="msg msg-error">' + (err.message || 'Error') + '</div>';
