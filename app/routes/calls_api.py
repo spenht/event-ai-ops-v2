@@ -21,6 +21,14 @@ from ..services.call_queue import (
     end_session,
     get_active_sessions,
 )
+from ..services.number_pool import (
+    import_existing_numbers,
+    import_selected_numbers,
+    list_available_telnyx_numbers,
+    purchase_number,
+    release_number,
+    get_pool_stats,
+)
 
 logger = logging.getLogger("calls_api")
 
@@ -431,6 +439,391 @@ async def call_stats(request: Request, campaign_id: str):
     }
 
 
+
+@router.get("/stats/agent")
+async def agent_stats(
+    request: Request, campaign_id: str, user_id: str
+):
+    """Get today's call stats for a specific agent."""
+    _validate_auth(request, campaign_id)
+
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    try:
+        r = (
+            sb.table("call_records")
+            .select("status, duration_seconds, outcome")
+            .eq("campaign_id", campaign_id)
+            .eq("caller_id", user_id)
+            .gte("created_at", today)
+            .execute()
+        )
+        records = r.data or []
+        total_calls = len(records)
+        answered = sum(
+            1
+            for rec in records
+            if (rec.get("duration_seconds") or 0) > 0
+        )
+        total_duration = sum(
+            (rec.get("duration_seconds") or 0) for rec in records
+        )
+        answer_rate = (
+            round((answered / total_calls) * 100) if total_calls > 0 else 0
+        )
+
+        return {
+            "calls_today": total_calls,
+            "answered_today": answered,
+            "talk_time_today_seconds": total_duration,
+            "answer_rate": answer_rate,
+        }
+    except Exception as exc:
+        logger.error("agent_stats_failed err=%s", str(exc)[:300])
+        raise HTTPException(
+            status_code=500, detail="failed to get agent stats"
+        )
+
+
+@router.get("/stats/team")
+async def team_stats(request: Request, campaign_id: str):
+    """Get per-agent call stats for today — team leader view."""
+    _validate_auth(request, campaign_id)
+
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    try:
+        r = (
+            sb.table("call_records")
+            .select("caller_id, status, duration_seconds, outcome, created_at")
+            .eq("campaign_id", campaign_id)
+            .gte("created_at", today)
+            .execute()
+        )
+        records = r.data or []
+    except Exception as exc:
+        logger.error("team_stats_records_failed err=%s", str(exc)[:300])
+        raise HTTPException(
+            status_code=500, detail="failed to get team stats"
+        )
+
+    # Group by caller_id
+    agents: dict[str, dict] = {}
+    for rec in records:
+        cid = rec.get("caller_id") or "unknown"
+        if cid not in agents:
+            agents[cid] = {"calls": 0, "answered": 0, "talk_time": 0}
+        agents[cid]["calls"] += 1
+        if (rec.get("duration_seconds") or 0) > 0:
+            agents[cid]["answered"] += 1
+        agents[cid]["talk_time"] += rec.get("duration_seconds") or 0
+
+    # Get active sessions
+    sessions = get_active_sessions(campaign_id)
+    active_agents = {s.get("user_id"): s for s in sessions}
+
+    results = []
+    for agent_id, astats in agents.items():
+        session = active_agents.get(agent_id)
+        results.append(
+            {
+                "user_id": agent_id,
+                "calls_today": astats["calls"],
+                "answered_today": astats["answered"],
+                "talk_time_seconds": astats["talk_time"],
+                "answer_rate": (
+                    round((astats["answered"] / astats["calls"]) * 100)
+                    if astats["calls"] > 0
+                    else 0
+                ),
+                "is_online": agent_id in active_agents,
+                "session_started_at": (
+                    session.get("started_at") if session else None
+                ),
+            }
+        )
+
+    # Sort by calls_today desc
+    results.sort(key=lambda x: x["calls_today"], reverse=True)
+    return {"data": results, "count": len(results)}
+
+
+@router.get("/stats/team/detailed")
+async def team_stats_detailed(request: Request, campaign_id: str):
+    """Detailed per-agent stats with recent calls — team leader dashboard."""
+    _validate_auth(request, campaign_id)
+
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    # 1. Fetch ALL today's call_records for this campaign
+    try:
+        r = (
+            sb.table("call_records")
+            .select(
+                "id, caller_id, lead_id, to_number, status, "
+                "duration_seconds, outcome, notes, tags, "
+                "ai_summary, ai_sentiment, created_at"
+            )
+            .eq("campaign_id", campaign_id)
+            .gte("created_at", today)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        records = r.data or []
+    except Exception as exc:
+        logger.error("team_detailed_failed err=%s", str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to get team stats")
+
+    # 2. Group records by caller_id
+    agents_map: dict[str, dict] = {}
+    for rec in records:
+        cid = rec.get("caller_id") or "unknown"
+        if cid not in agents_map:
+            agents_map[cid] = {
+                "calls": 0,
+                "answered": 0,
+                "talk_time": 0,
+                "tags_set": set(),
+                "recent_calls": [],
+            }
+        a = agents_map[cid]
+        a["calls"] += 1
+        dur = rec.get("duration_seconds") or 0
+        if dur > 0:
+            a["answered"] += 1
+        a["talk_time"] += dur
+        for tag in rec.get("tags") or []:
+            a["tags_set"].add(tag)
+        if len(a["recent_calls"]) < 10:
+            a["recent_calls"].append(rec)
+
+    # 3. Get active sessions
+    sessions = get_active_sessions(campaign_id)
+    active_agents = {s.get("user_id"): s for s in sessions}
+
+    # 4. Build agent results
+    agent_results = []
+    for agent_id, astats in agents_map.items():
+        session = active_agents.get(agent_id)
+        answer_rate = (
+            round((astats["answered"] / astats["calls"]) * 100)
+            if astats["calls"] > 0
+            else 0
+        )
+        avg_dur = (
+            round(astats["talk_time"] / astats["answered"])
+            if astats["answered"] > 0
+            else 0
+        )
+        agent_results.append(
+            {
+                "user_id": agent_id,
+                "calls_today": astats["calls"],
+                "answered_today": astats["answered"],
+                "talk_time_seconds": astats["talk_time"],
+                "answer_rate": answer_rate,
+                "avg_duration_seconds": avg_dur,
+                "is_online": agent_id in active_agents,
+                "session_started_at": (
+                    session.get("started_at") if session else None
+                ),
+                "tags_used": sorted(astats["tags_set"]),
+                "tags_count": len(astats["tags_set"]),
+                "recent_calls": astats["recent_calls"],
+            }
+        )
+
+    agent_results.sort(key=lambda x: x["calls_today"], reverse=True)
+
+    # 5. Build summary
+    total_calls = sum(a["calls_today"] for a in agent_results)
+    total_answered = sum(a["answered_today"] for a in agent_results)
+    total_talk = sum(a["talk_time_seconds"] for a in agent_results)
+    team_rate = (
+        round((total_answered / total_calls) * 100) if total_calls > 0 else 0
+    )
+
+    # 6. Recent activity (last 20 records across all agents)
+    recent_activity = records[:20]
+
+    return {
+        "summary": {
+            "total_calls_today": total_calls,
+            "total_answered_today": total_answered,
+            "team_answer_rate": team_rate,
+            "total_talk_time_seconds": total_talk,
+            "active_agents": len(sessions),
+        },
+        "agents": agent_results,
+        "recent_activity": recent_activity,
+        "count": len(agent_results),
+    }
+
+
+@router.get("/stats/agent/daily-summary")
+async def agent_daily_summary(
+    request: Request, campaign_id: str, user_id: str
+):
+    """Generate an AI daily summary for an agent's performance today."""
+    _validate_auth(request, campaign_id)
+
+    from datetime import datetime, timezone
+    import httpx
+
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    # Fetch today's call records for this agent
+    try:
+        r = (
+            sb.table("call_records")
+            .select("duration_seconds, outcome, notes, tags, ai_summary, to_number, status")
+            .eq("campaign_id", campaign_id)
+            .eq("caller_id", user_id)
+            .gte("created_at", today)
+            .execute()
+        )
+        records = r.data or []
+    except Exception as exc:
+        logger.error("daily_summary_records_failed err=%s", str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to fetch records")
+
+    if not records:
+        return {
+            "ok": True,
+            "summary": "No calls made today yet. Start dialing to see your daily summary!",
+            "stats": {"calls": 0, "answered": 0, "talk_time": 0},
+        }
+
+    # Calculate stats
+    total_calls = len(records)
+    answered = sum(1 for r in records if (r.get("duration_seconds") or 0) > 0)
+    total_duration = sum((r.get("duration_seconds") or 0) for r in records)
+    answer_rate = round((answered / total_calls * 100) if total_calls > 0 else 0)
+    avg_duration = round(total_duration / answered) if answered > 0 else 0
+
+    # Fetch campaign OpenAI key
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("openai_api_key")
+            .eq("id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception:
+        campaign = None
+
+    from ..settings import settings as app_settings
+    openai_key = (campaign or {}).get("openai_api_key") or app_settings.openai_api_key
+    if not openai_key:
+        return {
+            "ok": True,
+            "summary": f"Today: {total_calls} calls, {answered} answered ({answer_rate}%), {total_duration // 60}m talk time.",
+            "stats": {
+                "calls": total_calls,
+                "answered": answered,
+                "talk_time": total_duration,
+                "answer_rate": answer_rate,
+            },
+        }
+
+    # Build call summaries for AI context
+    call_summaries = []
+    for i, rec in enumerate(records[:20], 1):
+        dur = rec.get("duration_seconds") or 0
+        notes = rec.get("notes") or ""
+        outcome = rec.get("outcome") or ""
+        ai_sum = rec.get("ai_summary") or ""
+        tags = rec.get("tags") or []
+        line = f"Call {i}: {dur}s"
+        if tags:
+            line += f", tags=[{', '.join(tags)}]"
+        if outcome:
+            line += f", outcome={outcome}"
+        if ai_sum:
+            line += f", summary={ai_sum}"
+        elif notes:
+            line += f", notes={notes}"
+        call_summaries.append(line)
+
+    prompt = f"""Analyze this agent's daily call performance and provide brief, actionable feedback.
+
+Stats:
+- Total calls: {total_calls}
+- Answered: {answered} ({answer_rate}%)
+- Total talk time: {total_duration // 60}m {total_duration % 60}s
+- Avg call duration: {avg_duration}s
+
+Call details:
+{chr(10).join(call_summaries)}
+
+Provide:
+1. A 1-sentence summary of the day
+2. One thing done well
+3. One thing to improve
+Keep it under 100 words total. Be encouraging but honest."""
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a supportive sales coach reviewing a call agent's daily performance. Be concise and actionable.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "max_tokens": 200,
+                    "temperature": 0.5,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            summary = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+    except Exception as exc:
+        logger.error("daily_summary_openai_failed err=%s", str(exc)[:300])
+        summary = f"Today: {total_calls} calls, {answered} answered ({answer_rate}%), {total_duration // 60}m talk time."
+
+    return {
+        "ok": True,
+        "summary": summary,
+        "stats": {
+            "calls": total_calls,
+            "answered": answered,
+            "talk_time": total_duration,
+            "answer_rate": answer_rate,
+            "avg_duration": avg_duration,
+        },
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PHONE NUMBERS ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -442,16 +835,209 @@ async def list_phone_numbers(request: Request, campaign_id: str):
     _validate_auth(request, campaign_id)
 
     try:
-        r = (
-            sb.table("phone_numbers")
-            .select("*")
-            .eq("campaign_id", campaign_id)
-            .order("created_at", desc=True)
-            .execute()
-        )
+        # Try with health columns (after migration 011)
+        try:
+            r = (
+                sb.table("phone_numbers")
+                .select("*")
+                .eq("campaign_id", campaign_id)
+                .neq("status", "retired")
+                .order("status", desc=False)
+                .order("answer_rate", desc=True)
+                .execute()
+            )
+        except Exception:
+            # Fallback: order by created_at only (before migration)
+            r = (
+                sb.table("phone_numbers")
+                .select("*")
+                .eq("campaign_id", campaign_id)
+                .order("created_at", desc=True)
+                .execute()
+            )
         return {"data": r.data or [], "count": len(r.data or [])}
     except Exception as exc:
         logger.error("list_phones_failed err=%s", str(exc)[:300])
         raise HTTPException(
             status_code=500, detail="failed to list phone numbers"
         )
+
+
+@router.get("/phone-numbers/stats")
+async def phone_numbers_stats(request: Request, campaign_id: str):
+    """Get number pool statistics for a campaign."""
+    _validate_auth(request, campaign_id)
+    stats = await get_pool_stats(campaign_id)
+    return {"ok": True, **stats}
+
+
+class AddPhoneNumberRequest(BaseModel):
+    campaign_id: str
+    number: str
+    country: str = "US"
+    org_id: str = ""
+
+
+@router.post("/phone-numbers")
+async def add_phone_number(request: Request, body: AddPhoneNumberRequest):
+    """Manually add a phone number to the pool."""
+    _validate_auth(request, body.campaign_id)
+
+    try:
+        row = {
+            "campaign_id": body.campaign_id,
+            "org_id": body.org_id or None,
+            "number": body.number.strip(),
+            "country": body.country,
+            "provider": "telnyx",
+            "type": "local",
+            "status": "active",
+            "max_calls_per_day": 50,
+        }
+        r = sb.table("phone_numbers").insert(row).execute()
+        return {"ok": True, "data": (r.data or [None])[0]}
+    except Exception as exc:
+        logger.error("add_phone_failed err=%s", str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to add phone number")
+
+
+class SyncNumbersRequest(BaseModel):
+    campaign_id: str
+    org_id: str = ""
+
+
+@router.post("/phone-numbers/sync")
+async def sync_phone_numbers(request: Request, body: SyncNumbersRequest):
+    """Import existing Telnyx numbers into the pool."""
+    _validate_auth(request, body.campaign_id)
+
+    # Fetch campaign for API key
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("*")
+            .eq("id", body.campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception:
+        campaign = None
+
+    imported = await import_existing_numbers(
+        campaign_id=body.campaign_id,
+        org_id=body.org_id,
+        campaign=campaign,
+    )
+    return {"ok": True, "imported": len(imported), "numbers": imported}
+
+
+@router.get("/phone-numbers/available")
+async def available_telnyx_numbers(request: Request, campaign_id: str):
+    """List all Telnyx numbers with their campaign assignment info."""
+    _validate_auth(request, campaign_id)
+
+    # Fetch campaign for API key
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("*")
+            .eq("id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception:
+        campaign = None
+
+    numbers = await list_available_telnyx_numbers(
+        campaign_id=campaign_id,
+        campaign=campaign,
+    )
+    return {"ok": True, "data": numbers, "count": len(numbers)}
+
+
+class SyncSelectedRequest(BaseModel):
+    campaign_id: str
+    org_id: str = ""
+    numbers: list[dict] = []  # [{phone_number, telnyx_id}, ...]
+
+
+@router.post("/phone-numbers/sync-selected")
+async def sync_selected_numbers(request: Request, body: SyncSelectedRequest):
+    """Import selected Telnyx numbers into the pool."""
+    _validate_auth(request, body.campaign_id)
+
+    imported = await import_selected_numbers(
+        campaign_id=body.campaign_id,
+        org_id=body.org_id,
+        telnyx_numbers=body.numbers,
+    )
+    return {"ok": True, "imported": len(imported), "numbers": imported}
+
+
+class PurchaseNumberRequest(BaseModel):
+    campaign_id: str
+    org_id: str = ""
+    country: str = "US"
+    area_code: str = ""
+
+
+@router.post("/phone-numbers/purchase")
+async def purchase_phone_number(request: Request, body: PurchaseNumberRequest):
+    """Purchase a new phone number from Telnyx and add to pool."""
+    _validate_auth(request, body.campaign_id)
+
+    # Fetch campaign for API key and connection ID
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("*")
+            .eq("id", body.campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception:
+        campaign = None
+
+    result = await purchase_number(
+        campaign_id=body.campaign_id,
+        org_id=body.org_id,
+        campaign=campaign,
+        country=body.country,
+        area_code=body.area_code,
+    )
+    if not result:
+        raise HTTPException(status_code=500, detail="failed to purchase number")
+
+    return {"ok": True, "data": result}
+
+
+@router.delete("/phone-numbers/{phone_number_id}")
+async def delete_phone_number(request: Request, phone_number_id: str, campaign_id: str):
+    """Retire a phone number (release from Telnyx and mark retired)."""
+    _validate_auth(request, campaign_id)
+
+    # Fetch campaign for API key
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("*")
+            .eq("id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception:
+        campaign = None
+
+    success = await release_number(
+        phone_number_id=phone_number_id,
+        campaign_id=campaign_id,
+        campaign=campaign,
+    )
+    if not success:
+        raise HTTPException(status_code=500, detail="failed to release number")
+
+    return {"ok": True}
