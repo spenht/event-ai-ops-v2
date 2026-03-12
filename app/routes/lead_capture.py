@@ -8,6 +8,8 @@ Provides:
 
 from __future__ import annotations
 
+import hashlib
+import json as _json
 import logging
 import re
 import time
@@ -86,6 +88,126 @@ def _build_wa_url(number: str, text: str) -> str:
     return f"https://wa.me/{number}?text={quote_plus(text)}"
 
 
+def _sha256(value: str) -> str:
+    """SHA256 hash (lowercase, stripped) for Meta CAPI user data."""
+    return hashlib.sha256(value.strip().lower().encode()).hexdigest()
+
+
+async def _fire_meta_capi(
+    campaign: dict,
+    event_name: str,
+    lead_data: dict,
+    utm: dict | None = None,
+    event_source_url: str = "",
+):
+    """Fire server-side Meta Conversions API event.
+
+    Requires campaign to have both ``meta_pixel_id`` and ``meta_capi_token``.
+    Runs async and never raises — failures are logged silently.
+    """
+    pixel_id = (campaign.get("meta_pixel_id") or "").strip()
+    access_token = (campaign.get("meta_capi_token") or "").strip()
+    if not pixel_id or not access_token:
+        return
+
+    try:
+        import httpx
+
+        # Build user_data with hashed PII
+        user_data: dict = {}
+        if lead_data.get("email"):
+            user_data["em"] = [_sha256(lead_data["email"])]
+        phone = lead_data.get("whatsapp") or lead_data.get("phone") or ""
+        if phone:
+            # Normalize: ensure starts with country code, no +
+            clean_phone = re.sub(r"[^0-9]", "", phone)
+            user_data["ph"] = [_sha256(clean_phone)]
+        if lead_data.get("name"):
+            # First name only
+            fn = lead_data["name"].strip().split()[0] if lead_data["name"].strip() else ""
+            if fn:
+                user_data["fn"] = [_sha256(fn)]
+            # Last name
+            parts = lead_data["name"].strip().split()
+            if len(parts) > 1:
+                user_data["ln"] = [_sha256(" ".join(parts[1:]))]
+        if lead_data.get("country"):
+            user_data["country"] = [_sha256(lead_data["country"])]
+
+        # Custom data
+        custom_data: dict = {
+            "content_name": campaign.get("event_name") or campaign.get("name") or "",
+            "content_category": "event_registration",
+        }
+        if utm:
+            for k, v in utm.items():
+                if v:
+                    custom_data[k] = v
+
+        event = {
+            "event_name": event_name,
+            "event_time": int(time.time()),
+            "action_source": "website",
+            "user_data": user_data,
+            "custom_data": custom_data,
+        }
+        if event_source_url:
+            event["event_source_url"] = event_source_url
+
+        payload = {
+            "data": [event],
+            "access_token": access_token,
+        }
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"https://graph.facebook.com/v21.0/{pixel_id}/events",
+                json=payload,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    "meta_capi_failed pixel=%s status=%s body=%s",
+                    pixel_id, resp.status_code, resp.text[:200],
+                )
+            else:
+                logger.info("meta_capi_ok pixel=%s event=%s lead=%s", pixel_id, event_name, lead_data.get("lead_id", ""))
+    except Exception as exc:
+        logger.warning("meta_capi_error pixel=%s err=%s", pixel_id, str(exc)[:200])
+
+
+async def _fire_webhook(campaign: dict, lead_data: dict, utm: dict | None = None):
+    """POST lead data to the campaign's webhook URL (if configured).
+
+    The webhook URL is stored in ``ticket_config.webhook_url``.
+    Runs async and never raises.
+    """
+    tc = campaign.get("ticket_config")
+    if not isinstance(tc, dict):
+        return
+    webhook_url = (tc.get("webhook_url") or "").strip()
+    if not webhook_url:
+        return
+
+    try:
+        import httpx
+
+        payload = {
+            "event": "lead_captured",
+            "campaign_id": campaign.get("id", ""),
+            "campaign_name": campaign.get("name", ""),
+            "event_name": campaign.get("event_name", ""),
+            "lead": lead_data,
+            "utm": utm or {},
+            "timestamp": int(time.time()),
+        }
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(webhook_url, json=payload)
+            logger.info("webhook_sent url=%s status=%s lead=%s", webhook_url[:60], resp.status_code, lead_data.get("lead_id", ""))
+    except Exception as exc:
+        logger.warning("webhook_failed url=%s err=%s", webhook_url[:60], str(exc)[:200])
+
+
 # ── Models ─────────────────────────────────────────────────────────
 
 
@@ -97,6 +219,12 @@ class CaptureRequest(BaseModel):
     phone: str = ""
     source: str = "landing_page"
     tier_interest: str = ""
+    # UTM tracking
+    utm_source: str = ""
+    utm_medium: str = ""
+    utm_campaign: str = ""
+    utm_content: str = ""
+    utm_term: str = ""
 
 
 # ── Endpoints ──────────────────────────────────────────────────────
@@ -188,6 +316,31 @@ async def capture_lead(request: Request, body: CaptureRequest):
     else:
         # Create new lead
         lead_id = f"LP-{uuid4().hex[:8]}"
+
+        # Build enriched source with UTM info
+        lead_source = body.source or "landing_page"
+        if body.utm_source:
+            lead_source = f"{lead_source}:{body.utm_source.strip()}"
+            if body.utm_medium:
+                lead_source = f"{lead_source}:{body.utm_medium.strip()}"
+
+        # Store UTM details in notes as parseable JSON
+        utm_parts = {}
+        if body.utm_source:
+            utm_parts["utm_source"] = body.utm_source.strip()
+        if body.utm_medium:
+            utm_parts["utm_medium"] = body.utm_medium.strip()
+        if body.utm_campaign:
+            utm_parts["utm_campaign"] = body.utm_campaign.strip()
+        if body.utm_content:
+            utm_parts["utm_content"] = body.utm_content.strip()
+        if body.utm_term:
+            utm_parts["utm_term"] = body.utm_term.strip()
+        utm_note = ""
+        if utm_parts:
+            import json as _json
+            utm_note = f"[UTM] {_json.dumps(utm_parts)}"
+
         lead = {
             "lead_id": lead_id,
             "campaign_id": body.campaign_id,
@@ -196,9 +349,11 @@ async def capture_lead(request: Request, body: CaptureRequest):
             "whatsapp": wa,
             "phone": wa,
             "status": "NEW",
-            "source": body.source or "landing_page",
+            "source": lead_source,
             "tier_interest": (body.tier_interest or "").strip().upper(),
         }
+        if utm_note:
+            lead["notes"] = utm_note
         try:
             sb.table("leads").insert(lead).execute()
         except Exception as exc:
@@ -264,12 +419,41 @@ async def capture_lead(request: Request, body: CaptureRequest):
         body.campaign_id, lead_id, body.source, lead_name,
     )
 
+    # ── Server-side Meta CAPI + Webhook (async, non-blocking) ─────
+    utm_data = {}
+    for k in ("utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"):
+        v = getattr(body, k, "")
+        if v:
+            utm_data[k] = v.strip()
+
+    lead_payload = {
+        "lead_id": lead_id,
+        "name": lead_name,
+        "email": (body.email or "").strip(),
+        "whatsapp": wa,
+        "phone": wa,
+        "source": body.source,
+        "tier_interest": (body.tier_interest or "").strip().upper(),
+    }
+
+    # Fire CAPI Lead event to Meta (server-side — most reliable)
+    try:
+        await _fire_meta_capi(campaign, "Lead", lead_payload, utm=utm_data)
+    except Exception:
+        pass
+
+    # Fire webhook to CRM (GoHighLevel, 2clicks, etc.)
+    try:
+        await _fire_webhook(campaign, lead_payload, utm=utm_data)
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "lead_id": lead_id,
         "checkout_url": checkout_url,
         "whatsapp_ticket_url": whatsapp_ticket_url,
-        "whatsapp_vip_url": _build_wa_url(wa_number, f"Hola! Quiero la experiencia VIP de {event_name}.") if wa_number else "",
+        "whatsapp_vip_url": _build_wa_url(wa_number, f"Hola! Ya compre mi boleto VIP de {event_name}. Quiero recibir mi boleto por WhatsApp.") if wa_number else "",
     }
 
 
@@ -296,6 +480,13 @@ async def embeddable_form(
     title: str = "",
     subtitle: str = "",
     btn_label: str = "",
+    font: str = "",
+    # UTM tracking — passed through to lead capture + pixel events
+    utm_source: str = "",
+    utm_medium: str = "",
+    utm_campaign: str = "",
+    utm_content: str = "",
+    utm_term: str = "",
 ):
     """Self-contained HTML form for embedding via iframe on external landing pages.
 
@@ -328,7 +519,7 @@ async def embeddable_form(
 
     try:
         r = sb.table("campaigns").select(
-            "id, event_name, name, stripe_secret_key, stripe_price_ids, twilio_whatsapp_from"
+            "id, event_name, name, stripe_secret_key, stripe_price_ids, twilio_whatsapp_from, meta_pixel_id"
         ).eq("id", campaign_id).limit(1).execute()
         campaign = (r.data or [None])[0]
     except Exception:
@@ -340,6 +531,7 @@ async def embeddable_form(
     event_name = (campaign.get("event_name") or campaign.get("name") or "Evento").strip()
     has_stripe = bool(campaign.get("stripe_secret_key"))
     wa_number = _wa_number_from_campaign(campaign)
+    pixel_id = (campaign.get("meta_pixel_id") or "").strip()
 
     # ── Resolve theme variables ──────────────────────────────────
     _HEX = re.compile(r"^[0-9a-fA-F]{3,8}$")
@@ -429,18 +621,65 @@ async def embeddable_form(
     form_subtitle   = subtitle.strip() if subtitle.strip() else "Registro"
     form_btn_label  = btn_label.strip() if btn_label.strip() else "Registrarme"
 
+    # ── Font ──────────────────────────────────────────────────────
+    SAFE_FONTS = {
+        "inter": ("Inter", "sans-serif"),
+        "poppins": ("Poppins", "sans-serif"),
+        "montserrat": ("Montserrat", "sans-serif"),
+        "raleway": ("Raleway", "sans-serif"),
+        "open sans": ("Open Sans", "sans-serif"),
+        "roboto": ("Roboto", "sans-serif"),
+        "lato": ("Lato", "sans-serif"),
+        "oswald": ("Oswald", "sans-serif"),
+        "playfair display": ("Playfair Display", "serif"),
+        "dm sans": ("DM Sans", "sans-serif"),
+        "space grotesk": ("Space Grotesk", "sans-serif"),
+        "outfit": ("Outfit", "sans-serif"),
+        "nunito": ("Nunito", "sans-serif"),
+        "work sans": ("Work Sans", "sans-serif"),
+        "sora": ("Sora", "sans-serif"),
+    }
+    font_clean = font.strip()
+    font_key = font_clean.lower()
+    google_font_link = ""
+    css_font_family = "font-family: inherit;"
+    if font_key in SAFE_FONTS:
+        gf_name, gf_fallback = SAFE_FONTS[font_key]
+        gf_url_name = gf_name.replace(" ", "+")
+        google_font_link = f'<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family={gf_url_name}:wght@300;400;500;600;700&display=swap" rel="stylesheet">'
+        css_font_family = f"font-family: '{gf_name}', {gf_fallback};"
+
+    # ── Meta Pixel ─────────────────────────────────────────────────
+    meta_pixel_snippet = ""
+    if pixel_id:
+        meta_pixel_snippet = f"""<!-- Meta Pixel -->
+<script>
+!function(f,b,e,v,n,t,s){{if(f.fbq)return;n=f.fbq=function(){{n.callMethod?
+n.callMethod.apply(n,arguments):n.queue.push(arguments)}};if(!f._fbq)f._fbq=n;
+n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
+t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}}(window,
+document,'script','https://connect.facebook.net/en_US/fbevents.js');
+fbq('init', '{pixel_id}');
+fbq('track', 'PageView');
+</script>
+<noscript><img height="1" width="1" style="display:none"
+src="https://www.facebook.com/tr?id={pixel_id}&ev=PageView&noscript=1"/></noscript>
+<!-- End Meta Pixel -->"""
+
     return f"""<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+{google_font_link}
+{meta_pixel_snippet}
 <title>Registro — {event_name}</title>
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{
   {css_body_bg}
   {css_body_color}
-  font-family: inherit;
+  {css_font_family}
   min-height: 100vh;
   display: flex;
   align-items: center;
@@ -600,7 +839,38 @@ const CAMPAIGN_ID = "{campaign_id}";
 const EVENT_NAME = "{event_name}";
 const WA_NUMBER = "{wa_number}";
 const HAS_STRIPE = {"true" if has_stripe else "false"};
+const HAS_PIXEL = {"true" if pixel_id else "false"};
 const API_BASE = window.location.origin;
+
+// UTM tracking — from form URL params or parent page
+const UTM = {{}};
+(function() {{
+  // 1. Try to read UTMs from our own iframe URL (set by dashboard/landing page)
+  const sp = new URLSearchParams(window.location.search);
+  ['utm_source','utm_medium','utm_campaign','utm_content','utm_term'].forEach(k => {{
+    if (sp.get(k)) UTM[k] = sp.get(k);
+  }});
+  // 2. Try to read from parent window (works if same-origin)
+  try {{
+    const pp = new URLSearchParams(window.parent.location.search);
+    ['utm_source','utm_medium','utm_campaign','utm_content','utm_term'].forEach(k => {{
+      if (!UTM[k] && pp.get(k)) UTM[k] = pp.get(k);
+    }});
+  }} catch(e) {{}}  // cross-origin, ignore
+  // 3. Check for fbclid (Facebook click ID) for extra attribution
+  const fbclid = sp.get('fbclid') || (() => {{ try {{ return new URLSearchParams(window.parent.location.search).get('fbclid'); }} catch(e) {{ return null; }} }})();
+  if (fbclid) UTM.fbclid = fbclid;
+}})();
+
+function _fbtrack(ev, params) {{
+  if (HAS_PIXEL && typeof fbq === 'function') {{
+    const merged = Object.assign({{}}, params || {{}});
+    // Include UTM data in pixel events for attribution
+    if (UTM.utm_source) merged.content_category = UTM.utm_source;
+    if (UTM.utm_campaign) merged.content_name = UTM.utm_campaign || EVENT_NAME;
+    fbq('track', ev, merged);
+  }}
+}}
 
 document.getElementById('captureForm').addEventListener('submit', async function(e) {{
   e.preventDefault();
@@ -616,20 +886,28 @@ document.getElementById('captureForm').addEventListener('submit', async function
     const res = await fetch(API_BASE + '/v1/leads/capture', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{
+      body: JSON.stringify(Object.assign({{
         campaign_id: CAMPAIGN_ID,
         name: name,
         email: email,
         whatsapp: whatsapp,
         source: 'landing_page_form',
         tier_interest: 'GENERAL',
-      }}),
+      }}, UTM)),
     }});
     const data = await res.json();
 
     if (!res.ok) {{
       throw new Error(data.detail || 'Error al registrar');
     }}
+
+    // Fire Meta Pixel Lead event with UTM attribution data
+    _fbtrack('Lead', {{
+      content_name: EVENT_NAME,
+      content_category: 'event_registration',
+      value: 0,
+      currency: 'MXN',
+    }});
 
     // Hide form, show result
     document.getElementById('captureForm').style.display = 'none';
@@ -646,8 +924,9 @@ document.getElementById('captureForm').addEventListener('submit', async function
 
     // VIP upgrade button
     if (HAS_STRIPE && data.whatsapp_vip_url) {{
-      html += '<a href="' + data.whatsapp_vip_url + '" target="_blank" class="btn-vip">';
-      html += 'Quiero la Experiencia VIP</a>';
+      const vipUrl = data.checkout_url || data.whatsapp_vip_url;
+      html += '<a href="' + vipUrl + '" target="_blank" class="btn-vip" onclick="_fbtrack(\'InitiateCheckout\', {{content_name: EVENT_NAME, content_category: \'vip_upgrade\'}})">';
+      html += 'Upgrade a VIP</a>';
     }}
 
     resultDiv.innerHTML = html;
@@ -704,7 +983,7 @@ async def wa_links(campaign_id: str, key: str = ""):
         ),
         "vip_interest_url": _build_wa_url(
             wa_number,
-            f"Hola! Quiero la experiencia VIP de {event_name}.",
+            f"Hola! Ya compre mi boleto VIP de {event_name}. Quiero recibir mi boleto por WhatsApp.",
         ),
         "general_ticket_url_template": _build_wa_url(
             wa_number,

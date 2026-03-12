@@ -1259,7 +1259,7 @@ async def _handle_existing_lead(
                 "sí vip",
                 "si vip",
             ]
-        ) and lead_status_upper in ("VIP_INTERESTED", "VIP_LINK_SENT")
+        ) and lead_status_upper not in ("PAID", "VIP_PAID")
 
         # If the model is clearly trying to send a link but used a placeholder, treat it as a link-intent.
         # This fixes the "primera vez no manda la liga" case (e.g. message contains "[LINK]").
@@ -1405,7 +1405,8 @@ async def _handle_existing_lead(
                             ).strip()
                         else:
                             clean = (clean.rstrip() + "\n\nAhorita no pude generar el link 😅 ¿Me pones *VIP* otra vez en 30 segundos?").strip()
-                except Exception:
+                except Exception as exc:
+                    logger.exception("vip_link_generation_failed lead=%s event=%s err=%s", lead_id, event_id, str(exc)[:500])
                     url = None
                     clean = (clean.rstrip() + "\n\nAhorita no pude generar el link 😅 ¿Me pones *VIP* otra vez en 30 segundos?").strip()
 

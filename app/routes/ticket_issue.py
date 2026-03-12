@@ -403,6 +403,21 @@ async def ticket_issue_process(campaign_id: str, request: Request, key: str = ""
         except Exception:
             pass
 
+    # 4b. Also search by email (prevents duplicate insert when lead exists with different phone)
+    if not lead and raw_email:
+        try:
+            lr_email = (
+                sb.table("leads")
+                .select("*")
+                .eq("campaign_id", campaign_id)
+                .eq("email", raw_email.strip())
+                .limit(1)
+                .execute()
+            )
+            lead = (lr_email.data or [None])[0]
+        except Exception:
+            pass
+
     new_status = "VIP_PAID" if tier_display == "VIP" else "GENERAL_CONFIRMED"
 
     if lead:

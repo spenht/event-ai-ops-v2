@@ -79,5 +79,18 @@ class Settings:
     meta_pixel_id: str = _env("META_PIXEL_ID", "")
     meta_conversions_api_token: str = _env("META_CONVERSIONS_API_TOKEN", "")
 
+    # Telnyx Voice Calling
+    telnyx_api_key: str = _env("TELNYX_API_KEY", "")
+    telnyx_sip_connection_id: str = _env("TELNYX_SIP_CONNECTION_ID", "")
+    telnyx_from_number: str = _env("TELNYX_FROM_NUMBER", "")
+
+    # ElevenLabs (global fallback — per-campaign DB columns take priority)
+    elevenlabs_api_key: str = _env("ELEVENLABS_API_KEY", "")
+    elevenlabs_voice_id: str = _env("ELEVENLABS_VOICE_ID", "")
+    elevenlabs_model_id: str = _env("ELEVENLABS_TTS_MODEL", "eleven_multilingual_v2")
+
+    # Supabase service role (direct DB access)
+    supabase_service_role_key: str = _env("SUPABASE_SERVICE_ROLE_KEY", "")
+
 
 settings = Settings()
