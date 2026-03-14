@@ -38,6 +38,26 @@ _STATUS_RANK = {
 }
 
 
+def _resolve_telnyx_credentials(campaign: dict) -> tuple[str, str]:
+    """Resolve Telnyx API key and connection ID with fallback to global settings.
+
+    Priority: campaign-specific > global env vars.
+    Returns (api_key, connection_id) tuple.
+    """
+    api_key = (campaign.get("telnyx_api_key") or "").strip()
+    if not api_key:
+        api_key = settings.telnyx_api_key
+
+    connection_id = (
+        (campaign.get("telnyx_webrtc_credential_id") or "").strip()
+        or (campaign.get("telnyx_sip_connection_id") or "").strip()
+    )
+    if not connection_id:
+        connection_id = settings.telnyx_sip_connection_id
+
+    return api_key, connection_id
+
+
 async def schedule_delayed_call(
     *,
     lead_id: str,
@@ -53,12 +73,12 @@ async def schedule_delayed_call(
     1. Lead status hasn't progressed beyond expected_status
     2. Campaign has ai_calls_enabled = True
     3. No recent AI call to this lead in the last 24h
-    4. If a spartan agent is active → enqueue for human
-    5. Otherwise → trigger AI call directly
+    4. Trigger AI call directly (agents get calls via their own queue)
     """
     try:
         await asyncio.sleep(delay_seconds)
     except asyncio.CancelledError:
+        logger.info("delayed_call_cancelled lead=%s", lead_id)
         return
 
     try:
@@ -106,6 +126,7 @@ async def schedule_delayed_call(
 
         # Do not contact
         if lead.get("do_not_contact"):
+            logger.info("delayed_call_skip_dnc lead=%s", lead_id)
             return
 
         # Fetch campaign
@@ -123,22 +144,6 @@ async def schedule_delayed_call(
 
         if not campaign.get("ai_calls_enabled"):
             logger.info("delayed_call_skip_ai_disabled campaign=%s", campaign_id)
-            return
-
-        # Check for active agents — if available, enqueue for human
-        active_agents = get_active_sessions(campaign_id)
-        if active_agents:
-            enqueue_call(
-                campaign_id=campaign_id,
-                lead_id=lead_id,
-                call_type="delayed_auto",
-                priority=priority,
-            )
-            logger.info(
-                "delayed_call_enqueued_human lead=%s agents=%d",
-                lead_id,
-                len(active_agents),
-            )
             return
 
         # Anti-spam: check for recent AI call in last 24h
@@ -160,16 +165,20 @@ async def schedule_delayed_call(
         except Exception:
             pass
 
-        # Telnyx credentials
-        telnyx_api_key = (campaign.get("telnyx_api_key") or "").strip()
-        connection_id = (
-            (campaign.get("telnyx_webrtc_credential_id") or "").strip()
-            or (campaign.get("telnyx_sip_connection_id") or "").strip()
-        )
+        # Telnyx credentials — campaign-specific with fallback to global settings
+        telnyx_api_key, connection_id = _resolve_telnyx_credentials(campaign)
 
-        if not telnyx_api_key or not connection_id:
+        if not telnyx_api_key:
             logger.warning(
-                "delayed_call_skip_no_telnyx campaign=%s", campaign_id
+                "delayed_call_skip_no_telnyx_key campaign=%s (checked campaign + global settings)",
+                campaign_id,
+            )
+            return
+
+        if not connection_id:
+            logger.warning(
+                "delayed_call_skip_no_connection_id campaign=%s (checked campaign + global settings)",
+                campaign_id,
             )
             return
 
@@ -190,6 +199,15 @@ async def schedule_delayed_call(
         if not from_number:
             logger.warning("delayed_call_skip_no_from_number campaign=%s lead=%s", campaign_id, lead_id)
             return
+
+        logger.info(
+            "delayed_call_dialing lead=%s phone=%s from=%s purpose=%s campaign=%s",
+            lead_id,
+            phone,
+            from_number,
+            purpose,
+            campaign_id,
+        )
 
         # Trigger AI call
         client_state = _encode_client_state(
@@ -235,16 +253,18 @@ async def schedule_delayed_call(
             )
 
         logger.info(
-            "delayed_ai_call_triggered lead=%s purpose=%s delay=%ds phone=%s",
+            "delayed_ai_call_triggered lead=%s purpose=%s delay=%ds phone=%s ccid=%s",
             lead_id,
             purpose,
             delay_seconds,
             phone,
+            call_control_id[:20] if call_control_id else "none",
         )
 
     except Exception as exc:
         logger.error(
-            "delayed_call_failed lead=%s err=%s",
+            "delayed_call_failed lead=%s campaign=%s err=%s",
             lead_id,
+            campaign_id,
             str(exc)[:300],
         )

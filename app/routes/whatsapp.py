@@ -22,8 +22,63 @@ from ..services.twilio_whatsapp import normalize_mx_whatsapp, send_whatsapp
 from ..services.url_shortener import create_short_url
 from ..services.google_sheets import sync_lead_to_all_leads_sheet
 from ..services.meta_conversions import send_lead_event
+from ..services.delayed_call_scheduler import schedule_delayed_call
 
 logger = logging.getLogger("whatsapp")
+
+
+def _maybe_schedule_auto_call(
+    lead_id: str,
+    campaign_id: str,
+    campaign: dict,
+    new_status: str,
+) -> None:
+    """Schedule an AI auto-call if the campaign has it enabled.
+
+    Purpose mapping:
+    - GENERAL_CONFIRMED → vip_pitch (upsell to VIP)
+    - VIP_INTERESTED → confirm_attendance (close the sale)
+    """
+    if not campaign_id or not campaign:
+        logger.info(
+            "auto_call_skip_no_campaign lead=%s campaign_id=%s",
+            lead_id, campaign_id,
+        )
+        return
+
+    if not campaign.get("ai_calls_enabled"):
+        logger.debug(
+            "auto_call_skip_disabled lead=%s campaign=%s",
+            lead_id, campaign_id,
+        )
+        return
+
+    purpose_map = {
+        "GENERAL_CONFIRMED": "vip_pitch",
+        "VIP_INTERESTED": "confirm_attendance",
+    }
+    purpose = purpose_map.get(new_status)
+    if not purpose:
+        return
+
+    delay_minutes = campaign.get("ai_call_delay_minutes") or 10
+    try:
+        asyncio.ensure_future(
+            schedule_delayed_call(
+                lead_id=lead_id,
+                campaign_id=campaign_id,
+                delay_seconds=int(delay_minutes) * 60,
+                expected_status=new_status,
+                purpose=purpose,
+                priority=2 if new_status == "VIP_INTERESTED" else 1,
+            )
+        )
+        logger.info(
+            "auto_call_scheduled lead=%s status=%s purpose=%s delay=%dm campaign=%s",
+            lead_id, new_status, purpose, delay_minutes, campaign_id,
+        )
+    except Exception as exc:
+        logger.warning("auto_call_schedule_failed lead=%s err=%s", lead_id, str(exc)[:200])
 
 
 def _sync_to_sheets(lead: dict) -> None:
@@ -38,7 +93,7 @@ router = APIRouter(prefix="/v1/messaging/whatsapp", tags=["whatsapp"])
 @router.get("/media/{filename}")
 async def whatsapp_media_proxy(filename: str):
     """Proxy public Supabase media so Twilio can fetch reliably."""
-    base = "https://isfpcmgadtqzozkwztju.supabase.co/storage/v1/object/public/whatsapp/media/"
+    base = f"{settings.supabase_url}/storage/v1/object/public/whatsapp/media/"
     url = base + filename
 
     async def _iter():
@@ -395,22 +450,36 @@ def _is_first_contact(lead_id: str) -> bool:
 def _google_calendar_url(facts: dict[str, str]) -> str:
     """Build a Google Calendar 'add event' URL from event facts."""
     from urllib.parse import quote_plus
-    name = facts.get("event_name") or "Beyond Wealth"
+    name = facts.get("event_name") or facts.get("name") or "Evento"
     place = facts.get("event_place") or ""
     speakers = facts.get("event_speakers") or ""
     date_raw = facts.get("event_date") or ""
+    end_date_raw = facts.get("event_end_date") or ""
 
     # Try to parse ISO datetime for proper calendar format
-    # Default: 2026-03-27T15:00 to 2026-03-30T01:30
-    start_dt = "20260327T150000Z"
-    end_dt = "20260330T013000Z"
+    start_dt = ""
+    end_dt = ""
     try:
-        if "T" in date_raw:
+        if date_raw and "T" in date_raw:
             clean_dt = date_raw.replace("+00:00", "").replace("-", "").replace(":", "")
             if len(clean_dt) >= 15:
                 start_dt = clean_dt[:15] + "Z"
+        if end_date_raw and "T" in end_date_raw:
+            clean_dt = end_date_raw.replace("+00:00", "").replace("-", "").replace(":", "")
+            if len(clean_dt) >= 15:
+                end_dt = clean_dt[:15] + "Z"
+        # If we have start but no end, add 3 hours by default
+        if start_dt and not end_dt:
+            from datetime import datetime as _dt, timedelta
+            parsed = _dt.strptime(start_dt, "%Y%m%dT%H%M%SZ")
+            end_dt = (parsed + timedelta(hours=3)).strftime("%Y%m%dT%H%M%SZ")
     except Exception:
         pass
+
+    # If no dates at all, skip the dates param
+    if not start_dt:
+        start_dt = ""
+        end_dt = ""
 
     details = f"{name}\nSpeakers: {speakers}\nLugar: {place}"
     url = (
@@ -418,13 +487,19 @@ def _google_calendar_url(facts: dict[str, str]) -> str:
         f"action=TEMPLATE"
         f"&text={quote_plus(name)}"
         f"&details={quote_plus(details)}"
-        f"&dates={start_dt}/{end_dt}"
-        f"&location={quote_plus(place)}"
     )
+    if start_dt and end_dt:
+        url += f"&dates={start_dt}/{end_dt}"
+    if place:
+        url += f"&location={quote_plus(place)}"
     return url
 
 
-def _event_facts(event_id: Optional[str]) -> dict[str, str]:
+def _event_facts(event_id: Optional[str], campaign_data: dict | None = None) -> dict[str, str]:
+    """Build event facts from campaign data, events table, or env fallbacks.
+
+    Priority: campaign_data (DB) > events table > env vars.
+    """
     event: dict[str, Any] = {}
     if event_id:
         try:
@@ -433,14 +508,100 @@ def _event_facts(event_id: Optional[str]) -> dict[str, str]:
         except Exception:
             event = {}
 
+    # If we have campaign data from DB, prefer it over events table and env
+    c = campaign_data or {}
+
     return {
         "event_id": event_id or "",
-        "event_name": (event.get("event_name") or settings.event_name or "el evento").strip(),
-        "event_date": (str(event.get("starts_at") or "") or settings.event_date or "").strip(),
-        "event_place": (event.get("address") or settings.event_place or "").strip(),
-        "event_speakers": (event.get("speakers") or settings.event_speakers or DEFAULT_SPEAKERS).strip(),
-        "vip_price": (str(event.get("vip_price_usd") or "") or settings.vip_price or "").strip(),
+        "event_name": (
+            c.get("event_name")
+            or event.get("event_name")
+            or settings.event_name
+            or "el evento"
+        ).strip(),
+        "event_date": (
+            str(c.get("event_date") or "")
+            or str(event.get("starts_at") or "")
+            or settings.event_date
+            or ""
+        ).strip(),
+        "event_place": (
+            c.get("event_location")
+            or event.get("address")
+            or settings.event_place
+            or ""
+        ).strip(),
+        "event_speakers": (
+            c.get("event_speakers")
+            or event.get("speakers")
+            or settings.event_speakers
+            or DEFAULT_SPEAKERS
+        ).strip(),
+        "vip_price": (
+            str(c.get("vip_price_display") or "")
+            or str(event.get("vip_price_usd") or "")
+            or settings.vip_price
+            or ""
+        ).strip(),
     }
+
+
+def _resolve_campaign_from_to_number(to_number: str) -> tuple[str, dict]:
+    """Resolve the campaign from the Twilio 'To' number.
+
+    Each campaign has a `twilio_whatsapp_from` that identifies the WhatsApp number.
+    When an inbound message arrives, the Twilio 'To' field tells us which number
+    received the message, which maps to a specific campaign.
+
+    Returns (campaign_id, campaign_dict).  Falls back to ("", {}) if not found.
+    """
+    if not to_number:
+        return "", {}
+
+    # Normalize: remove "whatsapp:" prefix, ensure +E164
+    clean = to_number.replace("whatsapp:", "").strip()
+    if not clean.startswith("+"):
+        clean = "+" + clean
+
+    # Try exact match and common variants
+    candidates = [
+        f"whatsapp:{clean}",   # whatsapp:+1XXXXXXXXXX
+        clean,                  # +1XXXXXXXXXX
+    ]
+
+    for candidate in candidates:
+        try:
+            r = (
+                sb.table("campaigns")
+                .select("*")
+                .eq("twilio_whatsapp_from", candidate)
+                .eq("status", "active")
+                .limit(1)
+                .execute()
+            )
+            campaign = (r.data or [None])[0]
+            if campaign:
+                return campaign.get("id", ""), campaign
+        except Exception:
+            pass
+
+    # Fallback: try matching without the whatsapp: prefix in either direction
+    try:
+        r = (
+            sb.table("campaigns")
+            .select("*")
+            .ilike("twilio_whatsapp_from", f"%{clean.lstrip('+')}")
+            .eq("status", "active")
+            .limit(1)
+            .execute()
+        )
+        campaign = (r.data or [None])[0]
+        if campaign:
+            return campaign.get("id", ""), campaign
+    except Exception:
+        pass
+
+    return "", {}
 
 
 @router.post("/inbound")
@@ -455,10 +616,14 @@ async def whatsapp_inbound(request: Request):
     from_raw = (form.get("From") or "").strip()
     body = (form.get("Body") or "").strip()
     message_sid = (form.get("MessageSid") or "").strip()
+    to_raw = (form.get("To") or "").strip()
 
     wa_from = normalize_mx_whatsapp(from_raw)
     # Normalized WhatsApp sender. Twilio uses `whatsapp:+E164`, but our DB stores just `+E164`.
     wa_e164 = wa_from.replace("whatsapp:", "")
+
+    # Resolve which campaign this message belongs to (from the To number)
+    campaign_id, campaign = _resolve_campaign_from_to_number(to_raw)
 
     # Extract contact info from the message (best-effort)
     msg_email = _extract_email(body)
@@ -469,11 +634,14 @@ async def whatsapp_inbound(request: Request):
     if message_sid and _touchpoint_exists(message_sid):
         return _twiml_empty()
 
-    # Find lead by whatsapp variants
+    # Find lead by whatsapp variants (prefer campaign-scoped, fallback to global)
     lead = None
     for candidate in _mx_variants(wa_e164):
         try:
-            lr = sb.table("leads").select("*").eq("whatsapp", candidate).limit(1).execute()
+            q = sb.table("leads").select("*").eq("whatsapp", candidate)
+            if campaign_id:
+                q = q.eq("campaign_id", campaign_id)
+            lr = q.limit(1).execute()
             lead = (lr.data or [None])[0]
             if lead:
                 wa_e164 = candidate
@@ -482,12 +650,35 @@ async def whatsapp_inbound(request: Request):
         except Exception:
             pass
 
+    # Fallback: search without campaign filter (legacy leads without campaign_id)
+    if not lead and campaign_id:
+        for candidate in _mx_variants(wa_e164):
+            try:
+                lr = sb.table("leads").select("*").eq("whatsapp", candidate).limit(1).execute()
+                lead = (lr.data or [None])[0]
+                if lead:
+                    wa_e164 = candidate
+                    wa_from = f"whatsapp:{candidate}"
+                    # Backfill campaign_id on legacy lead
+                    if not lead.get("campaign_id"):
+                        try:
+                            sb.table("leads").update({"campaign_id": campaign_id}).eq("lead_id", lead["lead_id"]).execute()
+                            lead["campaign_id"] = campaign_id
+                        except Exception:
+                            pass
+                    break
+            except Exception:
+                pass
+
     # If not found, allow linking by email in message
     if not lead:
         email = _extract_email(body)
         if email:
             try:
-                by_email = sb.table("leads").select("*").eq("email", email).limit(1).execute()
+                q = sb.table("leads").select("*").eq("email", email)
+                if campaign_id:
+                    q = q.eq("campaign_id", campaign_id)
+                by_email = q.limit(1).execute()
                 lead = (by_email.data or [None])[0]
                 if lead:
                     try:
@@ -501,14 +692,15 @@ async def whatsapp_inbound(request: Request):
 
     # Log inbound
     try:
-        sb.table("touchpoints").insert(
-            {
-                "lead_id": lead["lead_id"] if lead else f"wa:{wa_e164}",
-                "channel": "whatsapp",
-                "event_type": "inbound",
-                "payload": {"from": wa_from, "body": body, "message_sid": message_sid},
-            }
-        ).execute()
+        tp: dict[str, Any] = {
+            "lead_id": lead["lead_id"] if lead else f"wa:{wa_e164}",
+            "channel": "whatsapp",
+            "event_type": "inbound",
+            "payload": {"from": wa_from, "body": body, "message_sid": message_sid},
+        }
+        if campaign_id:
+            tp["campaign_id"] = campaign_id
+        sb.table("touchpoints").insert(tp).execute()
     except Exception:
         pass
 
@@ -528,6 +720,8 @@ async def whatsapp_inbound(request: Request):
             "tier_interest": "NONE",
             "last_contact_at": datetime.now(timezone.utc).isoformat(),
         }
+        if campaign_id:
+            new_lead["campaign_id"] = campaign_id
 
         # If the user already provided contact info in the first message, include it in the insert
         # (this reduces follow-ups and helps satisfy any NOT NULL constraints).
@@ -614,6 +808,8 @@ async def whatsapp_inbound(request: Request):
                     msg_email=msg_email,
                     msg_name=msg_name,
                     msg_name_only=msg_name_only,
+                    campaign_id=campaign_id,
+                    campaign=campaign,
                 )
             )
             return _twiml_empty()
@@ -640,6 +836,8 @@ async def whatsapp_inbound(request: Request):
             msg_email=msg_email,
             msg_name=msg_name,
             msg_name_only=msg_name_only,
+            campaign_id=campaign_id,
+            campaign=campaign,
         )
     )
     return _twiml_empty()
@@ -659,6 +857,8 @@ async def _handle_existing_lead(
     msg_email: Optional[str],
     msg_name: Optional[str],
     msg_name_only: Optional[str],
+    campaign_id: str = "",
+    campaign: dict[str, Any] | None = None,
 ) -> None:
     try:
         # --- Companion capture (only when user provides companion details in-message) ---
@@ -732,6 +932,10 @@ async def _handle_existing_lead(
                         "phone": comp_phone,
                         "whatsapp": comp_phone,
                     }
+                    # Inherit campaign_id from the parent lead
+                    parent_campaign = lead.get("campaign_id")
+                    if parent_campaign:
+                        companion_row["campaign_id"] = parent_campaign
                     try:
                         ins = sb.table("leads").insert(companion_row).execute()
                         if getattr(ins, "data", None):
@@ -826,7 +1030,16 @@ async def _handle_existing_lead(
         except Exception:
             pass
         event_id = lead.get("event_id")
-        facts = _event_facts(event_id)
+        # If campaign wasn't passed, try to load it from lead's campaign_id
+        _campaign = campaign
+        _campaign_id = campaign_id or lead.get("campaign_id") or ""
+        if not _campaign and _campaign_id:
+            try:
+                cr = sb.table("campaigns").select("*").eq("id", _campaign_id).limit(1).execute()
+                _campaign = (cr.data or [None])[0]
+            except Exception:
+                _campaign = None
+        facts = _event_facts(event_id, _campaign)
 
         # ---------------------------------------------------------------
         # AUTO-CONFIRM GENERAL when user provides name + email
@@ -844,6 +1057,7 @@ async def _handle_existing_lead(
                 sb.table("leads").update({"status": "GENERAL_CONFIRMED"}).eq("lead_id", lead_id).execute()
                 lead["status"] = "GENERAL_CONFIRMED"
                 _sync_to_sheets(lead)
+                _maybe_schedule_auto_call(lead_id, campaign_id, campaign, "GENERAL_CONFIRMED")
             except Exception:
                 pass
 
@@ -986,6 +1200,7 @@ async def _handle_existing_lead(
                     sb.table("leads").update({"status": "VIP_INTERESTED"}).eq("lead_id", lead_id).execute()
                     lead["status"] = "VIP_INTERESTED"
                     _sync_to_sheets(lead)
+                    _maybe_schedule_auto_call(lead_id, campaign_id, campaign, "VIP_INTERESTED")
                 except Exception:
                     pass
                 return  # Done — VIP pitch sent, skip AI
@@ -1185,6 +1400,7 @@ async def _handle_existing_lead(
                 sb.table("leads").update({"status": "VIP_INTERESTED"}).eq("lead_id", lead_id).execute()
                 lead["status"] = "VIP_INTERESTED"
                 _sync_to_sheets(lead)
+                _maybe_schedule_auto_call(lead_id, campaign_id, campaign, "VIP_INTERESTED")
             except Exception:
                 pass
 
@@ -1513,6 +1729,7 @@ async def _handle_existing_lead(
             if str((lead.get("status") or "")).upper() != "GENERAL_CONFIRMED":
                 try:
                     sb.table("leads").update({"status": "GENERAL_CONFIRMED"}).eq("lead_id", lead_id).execute()
+                    _maybe_schedule_auto_call(lead_id, campaign_id, campaign, "GENERAL_CONFIRMED")
                 except Exception:
                     pass
             lead["status"] = "GENERAL_CONFIRMED"

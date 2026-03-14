@@ -41,17 +41,20 @@ def _validate_auth(request: Request, campaign_id: str | None = None) -> None:
     """
     Validate request authentication.
 
-    Checks X-Cron-Token header against global cron_token,
-    or campaign-specific spartans_key.
+    Checks (in order):
+    1. X-Cron-Token header against global cron_token
+    2. X-Spartans-Key header against campaign-specific spartans_key (DB)
+    3. X-Spartans-Key header against global settings.spartans_key (fallback)
+    4. No token configured = open (dev mode)
     """
     token = (request.headers.get("x-cron-token") or "").strip()
     spartans_key = (request.headers.get("x-spartans-key") or "").strip()
 
-    # Global cron token
+    # 1. Global cron token
     if settings.cron_token and token == settings.cron_token:
         return
 
-    # Campaign-specific spartans key
+    # 2. Campaign-specific spartans key (from DB)
     if campaign_id and spartans_key:
         try:
             r = (
@@ -62,12 +65,16 @@ def _validate_auth(request: Request, campaign_id: str | None = None) -> None:
                 .execute()
             )
             campaign = (r.data or [None])[0]
-            if campaign and campaign.get("spartans_key") == spartans_key:
+            if campaign and campaign.get("spartans_key") and campaign["spartans_key"] == spartans_key:
                 return
         except Exception:
             pass
 
-    # No token configured = open (dev mode)
+    # 3. Global spartans_key fallback (covers campaigns without DB key)
+    if spartans_key and settings.spartans_key and spartans_key == settings.spartans_key:
+        return
+
+    # 4. No token configured = open (dev mode)
     if not settings.cron_token:
         return
 
@@ -829,6 +836,159 @@ Keep it under 100 words total. Be encouraging but honest."""
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# LEADS ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/leads")
+async def list_leads(
+    request: Request,
+    campaign_id: str,
+    status: str = "",
+    payment_status: str = "",
+    source: str = "",
+    search: str = "",
+    limit: int = 50,
+    offset: int = 0,
+):
+    """List leads for a campaign with optional filters."""
+    _validate_auth(request, campaign_id)
+
+    try:
+        q = (
+            sb.table("leads")
+            .select("*")
+            .eq("campaign_id", campaign_id)
+        )
+        if status:
+            q = q.eq("status", status)
+        if payment_status:
+            q = q.eq("payment_status", payment_status)
+        if source:
+            q = q.ilike("source", f"%{source}%")
+        if search:
+            q = q.or_(
+                f"name.ilike.%{search}%,"
+                f"email.ilike.%{search}%,"
+                f"whatsapp.ilike.%{search}%,"
+                f"lead_id.ilike.%{search}%"
+            )
+
+        q = q.order("created_at", desc=True)
+        q = q.range(offset, offset + limit - 1)
+        r = q.execute()
+
+        # Get total count (separate query without pagination)
+        count_q = (
+            sb.table("leads")
+            .select("lead_id", count="exact")
+            .eq("campaign_id", campaign_id)
+        )
+        if status:
+            count_q = count_q.eq("status", status)
+        if payment_status:
+            count_q = count_q.eq("payment_status", payment_status)
+        count_r = count_q.execute()
+        total = count_r.count if hasattr(count_r, "count") and count_r.count is not None else len(r.data or [])
+
+        return {"data": r.data or [], "count": len(r.data or []), "total": total}
+    except Exception as exc:
+        logger.error("list_leads_failed campaign=%s err=%s", campaign_id, str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to list leads")
+
+
+@router.get("/leads/{lead_id}")
+async def get_lead(lead_id: str, request: Request, campaign_id: str = ""):
+    """Get a single lead by ID."""
+    _validate_auth(request, campaign_id)
+
+    try:
+        q = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1)
+        if campaign_id:
+            q = q.eq("campaign_id", campaign_id)
+        r = q.execute()
+        lead = (r.data or [None])[0]
+        if not lead:
+            raise HTTPException(status_code=404, detail="lead not found")
+        return lead
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("get_lead_failed id=%s err=%s", lead_id, str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to get lead")
+
+
+@router.patch("/leads/{lead_id}")
+async def update_lead(lead_id: str, request: Request, body: dict):
+    """Update lead fields."""
+    campaign_id = body.pop("campaign_id", "")
+    _validate_auth(request, campaign_id)
+
+    # Only allow safe fields to be updated
+    allowed = {
+        "name", "email", "phone", "whatsapp", "status", "payment_status",
+        "tier_interest", "source", "notes", "tags", "vip_count",
+    }
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if not updates:
+        return {"ok": True, "message": "no updates"}
+
+    try:
+        r = sb.table("leads").update(updates).eq("lead_id", lead_id).execute()
+        updated = (r.data or [None])[0]
+        if not updated:
+            raise HTTPException(status_code=404, detail="lead not found")
+        return {"ok": True, "data": updated}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("update_lead_failed id=%s err=%s", lead_id, str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to update lead")
+
+
+@router.get("/leads/stats/summary")
+async def leads_stats(request: Request, campaign_id: str):
+    """Get lead statistics for a campaign."""
+    _validate_auth(request, campaign_id)
+
+    try:
+        r = (
+            sb.table("leads")
+            .select("status, payment_status, tier_interest, source")
+            .eq("campaign_id", campaign_id)
+            .execute()
+        )
+        leads = r.data or []
+        total = len(leads)
+
+        status_counts: dict[str, int] = {}
+        payment_counts: dict[str, int] = {}
+        source_counts: dict[str, int] = {}
+        for lead in leads:
+            s = lead.get("status") or "UNKNOWN"
+            status_counts[s] = status_counts.get(s, 0) + 1
+            ps = lead.get("payment_status") or "NONE"
+            payment_counts[ps] = payment_counts.get(ps, 0) + 1
+            src = (lead.get("source") or "unknown").split(":")[0]
+            source_counts[src] = source_counts.get(src, 0) + 1
+
+        return {
+            "total": total,
+            "by_status": status_counts,
+            "by_payment_status": payment_counts,
+            "by_source": source_counts,
+        }
+    except Exception as exc:
+        logger.error("leads_stats_failed campaign=%s err=%s", campaign_id, str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to get lead stats")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHONE NUMBERS ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 @router.get("/phone-numbers")
 async def list_phone_numbers(request: Request, campaign_id: str):
     """List phone numbers for a campaign."""
@@ -1041,3 +1201,177 @@ async def delete_phone_number(request: Request, phone_number_id: str, campaign_i
         raise HTTPException(status_code=500, detail="failed to release number")
 
     return {"ok": True}
+
+
+# ─── AI Call Diagnostics ─────────────────────────────────────────────────────
+
+
+@router.get("/ai-calls/diagnostics")
+async def ai_calls_diagnostics(request: Request, campaign_id: str):
+    """Diagnostic endpoint to check AI call configuration for a campaign.
+
+    Returns a checklist of all requirements for AI calls to work,
+    highlighting which are passing and which are failing.
+    """
+    _validate_auth(request, campaign_id)
+
+    from datetime import datetime, timedelta, timezone
+    from ..services.delayed_call_scheduler import _resolve_telnyx_credentials
+
+    checks: list[dict] = []
+    now = datetime.now(timezone.utc)
+
+    # 1. Campaign exists
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("*")
+            .eq("id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception as exc:
+        return {"ok": False, "error": f"Failed to fetch campaign: {str(exc)[:200]}"}
+
+    checks.append({
+        "check": "Campaign exists",
+        "pass": bool(campaign),
+        "detail": campaign.get("name", "") if campaign else "NOT FOUND",
+    })
+    if not campaign:
+        return {"ok": False, "checks": checks}
+
+    # 2. ai_calls_enabled
+    ai_enabled = bool(campaign.get("ai_calls_enabled"))
+    checks.append({
+        "check": "ai_calls_enabled",
+        "pass": ai_enabled,
+        "detail": str(ai_enabled),
+    })
+
+    # 3. Telnyx API key
+    api_key, conn_id = _resolve_telnyx_credentials(campaign)
+    has_api_key = bool(api_key)
+    api_key_source = "campaign" if (campaign.get("telnyx_api_key") or "").strip() else ("global" if api_key else "MISSING")
+    checks.append({
+        "check": "Telnyx API key",
+        "pass": has_api_key,
+        "detail": f"Source: {api_key_source}" + (f" ({api_key[:8]}...)" if api_key else ""),
+    })
+
+    # 4. Telnyx connection ID
+    has_conn = bool(conn_id)
+    conn_source = "campaign" if (
+        (campaign.get("telnyx_webrtc_credential_id") or "").strip()
+        or (campaign.get("telnyx_sip_connection_id") or "").strip()
+    ) else ("global" if conn_id else "MISSING")
+    checks.append({
+        "check": "Telnyx connection ID",
+        "pass": has_conn,
+        "detail": f"Source: {conn_source}" + (f" ({conn_id[:12]}...)" if conn_id else ""),
+    })
+
+    # 5. From number available
+    from_number = (campaign.get("telnyx_from_number") or "").strip()
+    if not from_number:
+        from_number = settings.telnyx_from_number
+    checks.append({
+        "check": "From number (fallback)",
+        "pass": bool(from_number),
+        "detail": from_number or "MISSING — need telnyx_from_number or number pool",
+    })
+
+    # 6. Number pool status
+    try:
+        pool_stats = await get_pool_stats(campaign_id)
+        pool_active = pool_stats.get("active", 0)
+        checks.append({
+            "check": "Number pool",
+            "pass": pool_active > 0 or bool(from_number),
+            "detail": f"active={pool_active} warming={pool_stats.get('warming', 0)} (fallback={from_number or 'none'})",
+        })
+    except Exception:
+        checks.append({
+            "check": "Number pool",
+            "pass": bool(from_number),
+            "detail": f"Query failed, fallback={from_number or 'none'}",
+        })
+
+    # 7. Webhook URL
+    has_webhook = bool(settings.public_base_url)
+    checks.append({
+        "check": "Webhook URL (PUBLIC_BASE_URL)",
+        "pass": has_webhook,
+        "detail": f"{settings.public_base_url}/v1/calls/telnyx/webhooks/{campaign_id}" if has_webhook else "MISSING",
+    })
+
+    # 8. Active spartan sessions (informational)
+    active_agents = get_active_sessions(campaign_id)
+    checks.append({
+        "check": "Active spartan agents",
+        "pass": True,
+        "detail": f"{len(active_agents)} agent(s) online (AI calls proceed regardless)",
+    })
+
+    # 9. Eligible leads count
+    try:
+        eligible_r = (
+            sb.table("leads")
+            .select("lead_id", count="exact")
+            .eq("campaign_id", campaign_id)
+            .eq("status", "NEW")
+            .neq("do_not_contact", True)
+            .execute()
+        )
+        eligible_count = eligible_r.count or 0
+        checks.append({
+            "check": "Eligible NEW leads",
+            "pass": eligible_count > 0,
+            "detail": f"{eligible_count} leads in NEW status",
+        })
+    except Exception:
+        checks.append({
+            "check": "Eligible NEW leads",
+            "pass": False,
+            "detail": "Query failed",
+        })
+
+    # 10. Recent AI calls (last 24h)
+    try:
+        recent_r = (
+            sb.table("call_records")
+            .select("id", count="exact")
+            .eq("campaign_id", campaign_id)
+            .eq("caller_type", "ai")
+            .gte("created_at", (now - timedelta(hours=24)).isoformat())
+            .execute()
+        )
+        recent_count = recent_r.count or 0
+        checks.append({
+            "check": "Recent AI calls (24h)",
+            "pass": True,
+            "detail": f"{recent_count} AI calls in last 24 hours",
+        })
+    except Exception:
+        checks.append({
+            "check": "Recent AI calls (24h)",
+            "pass": True,
+            "detail": "Query failed",
+        })
+
+    # 11. ai_call_delay_minutes
+    delay_min = campaign.get("ai_call_delay_minutes") or 10
+    checks.append({
+        "check": "AI call delay",
+        "pass": True,
+        "detail": f"{delay_min} minutes after lead event",
+    })
+
+    all_pass = all(c["pass"] for c in checks)
+    return {
+        "ok": all_pass,
+        "campaign_id": campaign_id,
+        "campaign_name": campaign.get("name", ""),
+        "checks": checks,
+    }
