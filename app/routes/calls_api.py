@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -240,6 +241,190 @@ async def cancel_queued_call(queue_id: str, request: Request):
     except Exception as exc:
         logger.error("cancel_failed queue=%s err=%s", queue_id, str(exc)[:300])
         raise HTTPException(status_code=500, detail="failed to cancel")
+
+
+# ─── Bulk re-queue ────────────────────────────────────────────────────────────
+
+
+class BulkRequeueRequest(BaseModel):
+    campaign_id: str
+    caller_type: str = "ai"  # "ai" or "spartan"
+    call_type: str = "followup"
+    priority: int = 0
+    filters: dict = {}  # e.g. {"no_answer": true, "not_confirmed": true, "no_vip": true}
+
+
+@router.post("/queue/bulk-requeue")
+async def bulk_requeue(request: Request, body: BulkRequeueRequest):
+    """
+    Re-queue leads matching filter conditions.
+
+    Supported filters:
+    - no_answer: leads that were called but never answered (by specified caller_type)
+    - not_confirmed: leads whose status is NOT 'CONFIRMED'
+    - no_vip: leads whose tier_interest is NOT 'VIP'
+    - status_in: list of statuses to include (e.g. ["NEW", "CONTACTED"])
+    - never_called: leads that have never been called (by specified caller_type)
+
+    Skips leads already in queue (pending/assigned) and do_not_contact leads.
+    """
+    _validate_auth(request, body.campaign_id)
+
+    try:
+        filters = body.filters or {}
+        caller_type = body.caller_type  # "ai" or "spartan"
+
+        # 1. Get all leads for campaign
+        leads_q = (
+            sb.table("leads")
+            .select("lead_id, status, tier_interest, payment_status, do_not_contact, phone, whatsapp")
+            .eq("campaign_id", body.campaign_id)
+        )
+        leads_r = leads_q.execute()
+        all_leads = leads_r.data or []
+
+        # 2. Filter out do_not_contact and leads without phone
+        eligible = [
+            l for l in all_leads
+            if not l.get("do_not_contact")
+            and (l.get("phone") or l.get("whatsapp"))
+        ]
+
+        # 3. Get existing pending/assigned queue entries to avoid duplicates
+        existing_q = (
+            sb.table("call_queue")
+            .select("lead_id")
+            .eq("campaign_id", body.campaign_id)
+            .in_("status", ["pending", "assigned"])
+        )
+        existing_r = existing_q.execute()
+        already_queued = {e["lead_id"] for e in (existing_r.data or [])}
+
+        # 4. Get call records to check who was called and outcomes
+        records_q = (
+            sb.table("call_records")
+            .select("lead_id, status, caller_type, outcome")
+            .eq("campaign_id", body.campaign_id)
+        )
+        records_r = records_q.execute()
+        call_records = records_r.data or []
+
+        # Build per-lead call history
+        lead_calls: dict[str, list[dict]] = {}
+        for rec in call_records:
+            lid = rec["lead_id"]
+            if lid not in lead_calls:
+                lead_calls[lid] = []
+            lead_calls[lid].append(rec)
+
+        # 5. Apply filters
+        selected_lead_ids: set[str] = set()
+
+        if filters.get("no_answer"):
+            # Leads called by caller_type but never answered
+            for lead in eligible:
+                lid = lead["lead_id"]
+                calls = lead_calls.get(lid, [])
+                type_calls = [c for c in calls if c.get("caller_type") == caller_type]
+                if type_calls and all(c.get("status") != "completed" for c in type_calls):
+                    selected_lead_ids.add(lid)
+
+        if filters.get("not_confirmed"):
+            # Leads whose status is not CONFIRMED
+            for lead in eligible:
+                if (lead.get("status") or "").upper() != "CONFIRMED":
+                    selected_lead_ids.add(lead["lead_id"])
+
+        if filters.get("no_vip"):
+            # Leads whose tier_interest is not VIP
+            for lead in eligible:
+                if (lead.get("tier_interest") or "").upper() != "VIP":
+                    selected_lead_ids.add(lead["lead_id"])
+
+        if filters.get("never_called"):
+            # Leads never called by the specified caller_type
+            for lead in eligible:
+                lid = lead["lead_id"]
+                calls = lead_calls.get(lid, [])
+                type_calls = [c for c in calls if c.get("caller_type") == caller_type]
+                if not type_calls:
+                    selected_lead_ids.add(lid)
+
+        if filters.get("status_in"):
+            allowed = {s.upper() for s in filters["status_in"]}
+            for lead in eligible:
+                if (lead.get("status") or "").upper() in allowed:
+                    selected_lead_ids.add(lead["lead_id"])
+
+        if not filters:
+            # No filters = re-queue all eligible leads
+            selected_lead_ids = {l["lead_id"] for l in eligible}
+
+        # 6. Remove already-queued leads
+        to_enqueue = selected_lead_ids - already_queued
+
+        if not to_enqueue:
+            return {
+                "ok": True,
+                "enqueued": 0,
+                "skipped_already_queued": len(selected_lead_ids & already_queued),
+                "message": "No new leads to enqueue — all matching leads are already in queue",
+            }
+
+        # 7. Bulk insert into call_queue
+        from uuid import uuid4
+
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            {
+                "id": str(uuid4()),
+                "campaign_id": body.campaign_id,
+                "lead_id": lid,
+                "call_type": body.call_type,
+                "priority": body.priority,
+                "status": "pending",
+                "attempt_count": 0,
+                "max_attempts": 3,
+                "cycle_count": 0,
+                "max_cycles": 7,
+                "created_at": now,
+            }
+            for lid in to_enqueue
+        ]
+
+        # Insert in batches of 200
+        total_inserted = 0
+        batch_size = 200
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i : i + batch_size]
+            r = sb.table("call_queue").insert(batch).execute()
+            total_inserted += len(r.data or [])
+
+        logger.info(
+            "bulk_requeue campaign=%s caller_type=%s filters=%s enqueued=%d skipped=%d",
+            body.campaign_id,
+            caller_type,
+            filters,
+            total_inserted,
+            len(selected_lead_ids & already_queued),
+        )
+
+        return {
+            "ok": True,
+            "enqueued": total_inserted,
+            "skipped_already_queued": len(selected_lead_ids & already_queued),
+            "total_matching": len(selected_lead_ids),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "bulk_requeue_failed campaign=%s err=%s",
+            body.campaign_id,
+            str(exc)[:300],
+        )
+        raise HTTPException(status_code=500, detail=f"bulk requeue failed: {str(exc)[:200]}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -982,6 +1167,115 @@ async def leads_stats(request: Request, campaign_id: str):
     except Exception as exc:
         logger.error("leads_stats_failed campaign=%s err=%s", campaign_id, str(exc)[:300])
         raise HTTPException(status_code=500, detail="failed to get lead stats")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI CALL STATS ENDPOINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/ai-calls/stats")
+async def ai_call_stats(request: Request, campaign_id: str):
+    """Get AI calling stats for the campaign overview control center."""
+    _validate_auth(request, campaign_id)
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Fetch campaign config
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("ai_calls_enabled, ai_call_delay_minutes")
+            .eq("id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        camp = (cr.data or [None])[0] or {}
+    except Exception:
+        camp = {}
+
+    # Fetch AI call records
+    try:
+        all_r = (
+            sb.table("call_records")
+            .select("id, lead_id, status, duration_seconds, notes, purpose, created_at")
+            .eq("campaign_id", campaign_id)
+            .eq("caller_type", "ai")
+            .order("created_at", desc=True)
+            .limit(500)
+            .execute()
+        )
+        all_calls = all_r.data or []
+    except Exception:
+        all_calls = []
+
+    total = len(all_calls)
+    calls_today = sum(1 for c in all_calls if c.get("created_at", "") >= today_start.isoformat())
+    calls_24h = sum(1 for c in all_calls if c.get("created_at", "") >= (now - timedelta(hours=24)).isoformat())
+
+    completed = [c for c in all_calls if (c.get("duration_seconds") or 0) > 0]
+    answer_rate = round(len(completed) / total * 100, 1) if total > 0 else 0
+    avg_duration = round(sum(c["duration_seconds"] for c in completed) / len(completed), 0) if completed else 0
+
+    # Recent calls with lead names
+    recent = all_calls[:10]
+    lead_ids = list({c["lead_id"] for c in recent if c.get("lead_id")})
+    lead_names: dict[str, str] = {}
+    if lead_ids:
+        try:
+            lr = (
+                sb.table("leads")
+                .select("lead_id, name")
+                .in_("lead_id", lead_ids)
+                .execute()
+            )
+            for l in lr.data or []:
+                lead_names[l["lead_id"]] = l.get("name") or ""
+        except Exception:
+            pass
+
+    recent_formatted = [
+        {
+            "id": c["id"],
+            "lead_id": c["lead_id"],
+            "lead_name": lead_names.get(c["lead_id"], ""),
+            "status": c.get("status", ""),
+            "duration_seconds": c.get("duration_seconds", 0),
+            "purpose": c.get("purpose") or (c.get("notes") or "").split("|")[0].replace("purpose:", ""),
+            "created_at": c.get("created_at", ""),
+        }
+        for c in recent
+    ]
+
+    # Eligible leads by status
+    eligible: dict[str, int] = {}
+    for status in ["NEW", "GENERAL_CONFIRMED", "VIP_INTERESTED"]:
+        try:
+            er = (
+                sb.table("leads")
+                .select("lead_id", count="exact")
+                .eq("campaign_id", campaign_id)
+                .eq("status", status)
+                .neq("do_not_contact", True)
+                .execute()
+            )
+            eligible[status] = er.count if er.count is not None else len(er.data or [])
+        except Exception:
+            eligible[status] = 0
+
+    return {
+        "ok": True,
+        "ai_calls_enabled": camp.get("ai_calls_enabled", False),
+        "ai_call_delay_minutes": camp.get("ai_call_delay_minutes", 10),
+        "total_ai_calls": total,
+        "calls_today": calls_today,
+        "calls_last_24h": calls_24h,
+        "answer_rate": answer_rate,
+        "avg_duration_seconds": int(avg_duration),
+        "recent_calls": recent_formatted,
+        "eligible_leads": eligible,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
