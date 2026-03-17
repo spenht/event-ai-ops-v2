@@ -20,7 +20,7 @@ logger = logging.getLogger("payments")
 router = APIRouter(prefix="/v1/payments", tags=["payments"])
 
 
-def _event_facts(event_id: str | None) -> dict:
+def _event_facts(event_id: str | None, campaign_id: str | None = None) -> dict:
     # Minimal (ENV overrides DB)
     event = {}
     if event_id:
@@ -30,12 +30,24 @@ def _event_facts(event_id: str | None) -> dict:
         except Exception:
             event = {}
 
+    # Load ticket_config from campaign if available
+    ticket_config: dict = {}
+    campaign: dict = {}
+    if campaign_id:
+        try:
+            cr = sb.table("campaigns").select("ticket_config,event_name,event_date,event_location,event_speakers,vip_price_display").eq("id", campaign_id).limit(1).execute()
+            campaign = (cr.data or [{}])[0] or {}
+            ticket_config = campaign.get("ticket_config") or {}
+        except Exception:
+            pass
+
     return {
         "event_id": event_id,
-        "event_name": (event.get("event_name") or settings.event_name or "Evento").strip(),
-        "event_date": (str(event.get("starts_at") or "") or settings.event_date or "").strip(),
-        "event_place": (event.get("address") or settings.event_place or "").strip(),
-        "event_speakers": (event.get("speakers") or settings.event_speakers or "").strip(),
+        "event_name": (campaign.get("event_name") or event.get("event_name") or settings.event_name or "Evento").strip(),
+        "event_date": (campaign.get("event_date") or str(event.get("starts_at") or "") or settings.event_date or "").strip(),
+        "event_place": (campaign.get("event_location") or event.get("address") or settings.event_place or "").strip(),
+        "event_speakers": (campaign.get("event_speakers") or event.get("speakers") or settings.event_speakers or "").strip(),
+        "ticket_config": ticket_config,
     }
 
 
@@ -169,7 +181,7 @@ async def stripe_webhook(request: Request):
 
             wa = (lead.get("whatsapp") or meta.get("whatsapp") or "").strip()
             if wa:
-                facts = _event_facts(event_id or lead.get("event_id"))
+                facts = _event_facts(event_id or lead.get("event_id"), campaign_id=lead.get("campaign_id"))
                 ticket = generate_ticket_png(lead=lead, tier=tier, event=facts)
                 if not settings.public_base_url:
                     # Best effort; still send without media

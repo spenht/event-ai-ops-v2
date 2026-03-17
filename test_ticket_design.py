@@ -32,10 +32,6 @@ CENTER_X = WIDTH // 2
 OUTPUT_DIR = Path("/tmp/tickets")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-FONT_PATH = "/System/Library/Fonts/HelveticaNeue.ttc"
-# Font indices: 0=Regular, 1=Bold, 4=Condensed Bold, 5=UltraLight,
-#               7=Light, 10=Medium, 12=Thin
-
 SAMPLE_DATA = {
     "name": "Florencia Montoya",
     "email": "florencia@example.com",
@@ -43,25 +39,49 @@ SAMPLE_DATA = {
     "place": "Miami, FL",
     "address": "Hilton Miami Downtown, 1601 Biscayne Blvd",
     "code": "BW-2026-FLM-4829",
+    "title": "BEYOND WEALTH",
+    "subtitle": "MIAMI 2026",
+    "footer": "Present this ticket at the door",
+    "website": "beyondwealth.miami",
+    "brand": "BEYOND WEALTH EXPERIENCES",
+}
+
+# Inter.ttc indices: 0=Thin,1=ExtraLight,2=Light,3=Regular,4=Medium,5=SemiBold,6=Bold,7=ExtraBold,8=Black
+_INTER_INDEX = {
+    "thin": 0, "ultralight": 1, "light": 2, "regular": 3,
+    "medium": 4, "semibold": 5, "bold": 6, "condensed_bold": 6,
+    "extrabold": 7, "black": 8,
+}
+# HelveticaNeue.ttc indices: 0=Regular, 1=Bold, 7=Light, 10=Medium
+_HN_INDEX = {"bold": 1, "medium": 10, "light": 7, "regular": 0}
+
+_FONT_PATHS_PRIORITY = [
+    "/usr/share/fonts/truetype/inter/Inter.ttc",
+    "/System/Library/Fonts/HelveticaNeue.ttc",
+]
+
+_DEJAVU_FALLBACK = {
+    "bold": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "regular": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 }
 
 
 def _font(size: int, weight: str = "regular") -> ImageFont.FreeTypeFont:
-    """Load Helvetica Neue at desired weight with fallbacks."""
-    weight_map = {
-        "bold": 1, "condensed_bold": 4, "medium": 10,
-        "regular": 0, "light": 7, "thin": 12, "ultralight": 5,
-    }
-    idx = weight_map.get(weight, 0)
+    """Load a font at the desired weight with cross-platform fallbacks."""
+    for path in _FONT_PATHS_PRIORITY:
+        try:
+            if "inter" in path.lower():
+                idx = _INTER_INDEX.get(weight, 3)
+                return ImageFont.truetype(path, size, index=idx)
+            elif "helvetica" in path.lower():
+                idx = _HN_INDEX.get(weight, 0)
+                return ImageFont.truetype(path, size, index=idx)
+        except Exception:
+            continue
+    family = "bold" if weight in ("bold", "condensed_bold", "semibold") else "regular"
     try:
-        return ImageFont.truetype(FONT_PATH, size, index=idx)
+        return ImageFont.truetype(_DEJAVU_FALLBACK[family], size)
     except Exception:
-        for fb in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                   "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]:
-            try:
-                return ImageFont.truetype(fb, size)
-            except Exception:
-                continue
         return ImageFont.load_default()
 
 
@@ -311,17 +331,24 @@ def generate_ticket(tier: str, data: dict, output_path: Path):
 
     y = 100  # Start cursor (more top padding for taller canvas)
 
+    # Dynamic branding
+    ticket_title = data.get("title", "BEYOND WEALTH")
+    ticket_subtitle = data.get("subtitle", "MIAMI 2026")
+
     # ===================================================================
-    # 1. HEADER — "BEYOND WEALTH" centered
+    # 1. HEADER — dynamic title centered
     # ===================================================================
-    th = draw_centered_text(draw, y, "BEYOND WEALTH", f_title, white)
+    th = draw_centered_text(draw, y, ticket_title, f_title, white)
     y += th + 20
 
     # ===================================================================
-    # 2. "MIAMI 2026" centered
+    # 2. Subtitle centered (skip if empty)
     # ===================================================================
-    th = draw_centered_text(draw, y, "MIAMI 2026", f_subtitle, subtitle_color)
-    y += th + 60
+    if ticket_subtitle:
+        th = draw_centered_text(draw, y, ticket_subtitle, f_subtitle, subtitle_color)
+        y += th + 60
+    else:
+        y += 40
 
     # ===================================================================
     # 3. Separator line
@@ -463,20 +490,28 @@ def generate_ticket(tier: str, data: dict, output_path: Path):
     y = container_y + container_dim + 40
 
     # ===================================================================
-    # 10. FOOTER
+    # 10. FOOTER (dynamic)
     # ===================================================================
     footer_draw = ImageDraw.Draw(img)
 
-    footer_text = "Present this ticket at the door  •  beyondwealth.miami"
+    ticket_footer = data.get("footer", "Present this ticket at the door")
+    ticket_website = data.get("website", "")
+    ticket_brand = data.get("brand", "")
+
+    footer_parts = [ticket_footer]
+    if ticket_website:
+        footer_parts.append(ticket_website)
+    footer_text = "  \u2022  ".join(footer_parts)
     ft_x = center_x(footer_draw, footer_text, f_footer)
     footer_draw.text((ft_x, y), footer_text,
                      fill=(*muted[:3], 150), font=f_footer)
     y += 44
 
-    brand_text = "BEYOND WEALTH EXPERIENCES"
-    bx = center_x(footer_draw, brand_text, f_brand)
-    footer_draw.text((bx, y), brand_text,
-                     fill=(*accent[:3], 80), font=f_brand)
+    if ticket_brand:
+        brand_text = ticket_brand.upper()
+        bx = center_x(footer_draw, brand_text, f_brand)
+        footer_draw.text((bx, y), brand_text,
+                         fill=(*accent[:3], 80), font=f_brand)
 
     # ===================================================================
     # SAVE

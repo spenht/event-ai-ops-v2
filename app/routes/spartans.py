@@ -25,8 +25,8 @@ router = APIRouter(prefix="/spartans", tags=["spartans"])
 # ── helpers ────────────────────────────────────────────────────────
 
 
-def _event_facts(event_id: str | None) -> dict:
-    """Load event data (copy from payments.py — kept independent)."""
+def _event_facts(event_id: str | None, campaign_id: str | None = None) -> dict:
+    """Load event data with optional campaign ticket_config."""
     event = {}
     if event_id:
         try:
@@ -35,12 +35,23 @@ def _event_facts(event_id: str | None) -> dict:
         except Exception:
             event = {}
 
+    ticket_config: dict = {}
+    campaign: dict = {}
+    if campaign_id:
+        try:
+            cr = sb.table("campaigns").select("ticket_config,event_name,event_date,event_location,event_speakers,vip_price_display").eq("id", campaign_id).limit(1).execute()
+            campaign = (cr.data or [{}])[0] or {}
+            ticket_config = campaign.get("ticket_config") or {}
+        except Exception:
+            pass
+
     return {
         "event_id": event_id,
-        "event_name": (event.get("event_name") or settings.event_name or "Evento").strip(),
-        "event_date": (str(event.get("starts_at") or "") or settings.event_date or "").strip(),
-        "event_place": (event.get("address") or settings.event_place or "").strip(),
-        "event_speakers": (event.get("speakers") or settings.event_speakers or "").strip(),
+        "event_name": (campaign.get("event_name") or event.get("event_name") or settings.event_name or "Evento").strip(),
+        "event_date": (campaign.get("event_date") or str(event.get("starts_at") or "") or settings.event_date or "").strip(),
+        "event_place": (campaign.get("event_location") or event.get("address") or settings.event_place or "").strip(),
+        "event_speakers": (campaign.get("event_speakers") or event.get("speakers") or settings.event_speakers or "").strip(),
+        "ticket_config": ticket_config,
     }
 
 
@@ -334,7 +345,7 @@ async def spartans_confirm(request: Request, key: str = ""):
 
     # 8. Event facts
     event_id = (lead.get("event_id") or settings.default_event_id or "").strip() or None
-    facts = _event_facts(event_id)
+    facts = _event_facts(event_id, campaign_id=lead.get("campaign_id"))
 
     # 9. Generate VIP ticket
     ticket = generate_ticket_png(lead=lead, tier="VIP", event=facts)

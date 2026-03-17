@@ -424,7 +424,7 @@ def _google_calendar_url(facts: dict[str, str]) -> str:
     return url
 
 
-def _event_facts(event_id: Optional[str]) -> dict[str, str]:
+def _event_facts(event_id: Optional[str], campaign_id: Optional[str] = None) -> dict[str, str]:
     event: dict[str, Any] = {}
     if event_id:
         try:
@@ -433,13 +433,25 @@ def _event_facts(event_id: Optional[str]) -> dict[str, str]:
         except Exception:
             event = {}
 
+    # Load ticket_config from campaign if available
+    ticket_config: dict[str, Any] = {}
+    campaign: dict[str, Any] = {}
+    if campaign_id:
+        try:
+            cr = sb.table("campaigns").select("ticket_config,name,event_name,event_date,event_end_date,event_location,event_speakers,vip_price_display").eq("id", campaign_id).limit(1).execute()
+            campaign = (cr.data or [{}])[0] or {}
+            ticket_config = campaign.get("ticket_config") or {}
+        except Exception:
+            pass
+
     return {
         "event_id": event_id or "",
-        "event_name": (event.get("event_name") or settings.event_name or "el evento").strip(),
-        "event_date": (str(event.get("starts_at") or "") or settings.event_date or "").strip(),
-        "event_place": (event.get("address") or settings.event_place or "").strip(),
-        "event_speakers": (event.get("speakers") or settings.event_speakers or DEFAULT_SPEAKERS).strip(),
-        "vip_price": (str(event.get("vip_price_usd") or "") or settings.vip_price or "").strip(),
+        "event_name": (campaign.get("event_name") or event.get("event_name") or settings.event_name or "el evento").strip(),
+        "event_date": (campaign.get("event_date") or str(event.get("starts_at") or "") or settings.event_date or "").strip(),
+        "event_place": (campaign.get("event_location") or event.get("address") or settings.event_place or "").strip(),
+        "event_speakers": (campaign.get("event_speakers") or event.get("speakers") or settings.event_speakers or DEFAULT_SPEAKERS).strip(),
+        "vip_price": (campaign.get("vip_price_display") or str(event.get("vip_price_usd") or "") or settings.vip_price or "").strip(),
+        "ticket_config": ticket_config,
     }
 
 
@@ -826,7 +838,7 @@ async def _handle_existing_lead(
         except Exception:
             pass
         event_id = lead.get("event_id")
-        facts = _event_facts(event_id)
+        facts = _event_facts(event_id, campaign_id=lead.get("campaign_id"))
 
         # ---------------------------------------------------------------
         # AUTO-CONFIRM GENERAL when user provides name + email
