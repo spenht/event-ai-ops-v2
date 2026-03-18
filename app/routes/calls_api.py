@@ -775,6 +775,18 @@ async def team_stats(request: Request, campaign_id: str):
 
     # Sort by calls_today desc
     results.sort(key=lambda x: x["calls_today"], reverse=True)
+
+    # Enrich with agent emails from org_members
+    agent_ids = [r["user_id"] for r in results]
+    if agent_ids:
+        try:
+            mr = sb.table("org_members").select("user_id, email, display_name").in_("user_id", agent_ids).execute()
+            email_map = {m["user_id"]: m.get("email") or m.get("display_name") or "" for m in (mr.data or []) if m.get("user_id")}
+            for r in results:
+                r["email"] = email_map.get(r["user_id"], "")
+        except Exception:
+            pass
+
     return {"data": results, "count": len(results)}
 
 
@@ -868,6 +880,22 @@ async def team_stats_detailed(request: Request, campaign_id: str):
         )
 
     agent_results.sort(key=lambda x: x["calls_today"], reverse=True)
+
+    # 4b. Enrich with agent emails/names from org_members
+    agent_ids = [a["user_id"] for a in agent_results]
+    email_map: dict[str, str] = {}
+    if agent_ids:
+        try:
+            # Look up by user_id in org_members
+            mr = sb.table("org_members").select("user_id, email, display_name").in_("user_id", agent_ids).execute()
+            for m in (mr.data or []):
+                uid = m.get("user_id")
+                if uid:
+                    email_map[uid] = m.get("email") or m.get("display_name") or uid
+        except Exception:
+            pass
+    for a in agent_results:
+        a["email"] = email_map.get(a["user_id"], "")
 
     # 5. Build summary
     total_calls = sum(a["calls_today"] for a in agent_results)
