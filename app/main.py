@@ -13,6 +13,7 @@ from .routes.broadcasts import router as broadcasts_router
 from .routes.spartans import router as spartans_router
 from .routes.checkin import router as checkin_router
 from .routes.calls_api import router as calls_api_router
+from .routes.stripe_connect import router as stripe_connect_router
 
 logging.basicConfig(level=logging.INFO)
 
@@ -27,6 +28,7 @@ app.include_router(broadcasts_router)
 app.include_router(spartans_router)
 app.include_router(checkin_router)
 app.include_router(calls_api_router)
+app.include_router(stripe_connect_router)
 
 
 @app.get("/health")

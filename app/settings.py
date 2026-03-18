@@ -42,7 +42,7 @@ class Settings:
     whatsapp_video_vip_pitch: str = _env("WHATSAPP_VIDEO_VIP_PITCH", "")
     whatsapp_video_testimonios: str = _env("WHATSAPP_VIDEO_TESTIMONIOS", "")
 
-    # Stripe
+    # Stripe (direct — legacy per-event keys)
     stripe_secret_key: str = _env("STRIPE_SECRET_KEY", "")
     stripe_webhook_secret: str = _env("STRIPE_WEBHOOK_SECRET", "")
     stripe_vip_price_id: str = _env("STRIPE_VIP_PRICE_ID", "")
@@ -50,6 +50,12 @@ class Settings:
     stripe_vip_price_id_2: str = _env("VIP_PRICE_USA_2", "")   # 2 VIPs x 97 USD
     stripe_success_url: str = _env("STRIPE_SUCCESS_URL", "")
     stripe_cancel_url: str = _env("STRIPE_CANCEL_URL", "")
+
+    # Stripe Connect (platform — 2clicks.com)
+    stripe_platform_secret_key: str = _env("STRIPE_PLATFORM_SECRET_KEY", "")
+    stripe_platform_webhook_secret: str = _env("STRIPE_PLATFORM_WEBHOOK_SECRET", "")
+    stripe_connect_return_url: str = _env("STRIPE_CONNECT_RETURN_URL", "")
+    stripe_connect_refresh_url: str = _env("STRIPE_CONNECT_REFRESH_URL", "")
 
     # Automation
     cron_token: str = _env("CRON_TOKEN", "")
