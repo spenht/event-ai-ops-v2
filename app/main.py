@@ -30,7 +30,7 @@ app = FastAPI(title="Event AI Ops v2")
 # CORS — allow dashboard and other frontends to call our API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allow any origin (landing pages, dashboard, etc.)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -110,66 +110,34 @@ _PAGE_STYLE = """
 
 
 @app.get("/vip/success", response_class=HTMLResponse)
-def vip_success(campaign_id: str = ""):
-    from .deps import sb
-    event_name = "el evento"
-    wa_number = ""
-    footer_text = ""
-    if campaign_id:
-        try:
-            r = sb.table("campaigns").select("event_name, name, twilio_whatsapp_from").eq("id", campaign_id).limit(1).execute()
-            c = (r.data or [None])[0]
-            if c:
-                event_name = c.get("event_name") or c.get("name") or "el evento"
-                raw_wa = (c.get("twilio_whatsapp_from") or "").replace("whatsapp:", "").lstrip("+")
-                wa_number = raw_wa
-                footer_text = event_name
-        except Exception:
-            pass
-    wa_link = f"https://wa.me/{wa_number}" if wa_number else "#"
+def vip_success():
     return f"""<!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pago Exitoso - {event_name}</title>{_PAGE_STYLE}</head>
+<title>Pago Exitoso - Beyond Wealth</title>{_PAGE_STYLE}</head>
 <body class="success-bg">
   <div class="card success-card">
-    <div class="icon">\U0001f389</div>
+    <div class="icon">🎉</div>
     <h1 class="success-title">¡Pago exitoso!</h1>
-    <p>Tu boleto VIP para <strong>{event_name}</strong> ha sido confirmado.<br>
+    <p>Tu boleto VIP para <strong>Beyond Wealth Miami</strong> ha sido confirmado.<br>
     En unos momentos recibirás tu boleto con QR por WhatsApp.</p>
-    <a href="{wa_link}" class="btn success-btn">Regresar a WhatsApp</a>
-    <div class="footer">{footer_text}</div>
+    <a href="https://wa.me/17543549055" class="btn success-btn">Regresar a WhatsApp</a>
+    <div class="footer">Beyond Wealth Miami 2026 &bull; Spencer Hoffmann</div>
   </div>
 </body></html>"""
 
 
 @app.get("/vip/cancel", response_class=HTMLResponse)
-def vip_cancel(campaign_id: str = ""):
-    from .deps import sb
-    event_name = "el evento"
-    wa_number = ""
-    footer_text = ""
-    if campaign_id:
-        try:
-            r = sb.table("campaigns").select("event_name, name, twilio_whatsapp_from").eq("id", campaign_id).limit(1).execute()
-            c = (r.data or [None])[0]
-            if c:
-                event_name = c.get("event_name") or c.get("name") or "el evento"
-                raw_wa = (c.get("twilio_whatsapp_from") or "").replace("whatsapp:", "").lstrip("+")
-                wa_number = raw_wa
-                footer_text = event_name
-        except Exception:
-            pass
-    wa_link = f"https://wa.me/{wa_number}" if wa_number else "#"
+def vip_cancel():
     return f"""<!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pago No Completado - {event_name}</title>{_PAGE_STYLE}</head>
+<title>Pago No Completado - Beyond Wealth</title>{_PAGE_STYLE}</head>
 <body class="cancel-bg">
   <div class="card cancel-card">
-    <div class="icon">\U0001f615</div>
+    <div class="icon">😕</div>
     <h1 class="cancel-title">Pago no completado</h1>
     <p>Parece que el pago no se pudo procesar o fue cancelado.<br>
     No te preocupes, puedes intentarlo de nuevo desde WhatsApp.</p>
-    <a href="{wa_link}" class="btn cancel-btn">Regresar a WhatsApp</a>
-    <div class="footer">{footer_text}</div>
+    <a href="https://wa.me/17543549055" class="btn cancel-btn">Regresar a WhatsApp</a>
+    <div class="footer">Beyond Wealth Miami 2026 &bull; Spencer Hoffmann</div>
   </div>
 </body></html>"""

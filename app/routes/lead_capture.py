@@ -24,7 +24,6 @@ from pydantic import BaseModel
 
 from ..deps import sb
 from ..settings import settings
-from ..services.delayed_call_scheduler import schedule_delayed_call
 
 logger = logging.getLogger("lead_capture")
 
@@ -100,42 +99,15 @@ async def _fire_meta_capi(
     lead_data: dict,
     utm: dict | None = None,
     event_source_url: str = "",
-    traffic_source_id: str = "",
 ):
     """Fire server-side Meta Conversions API event.
 
     Requires campaign to have both ``meta_pixel_id`` and ``meta_capi_token``.
-    If traffic_source_id is provided, uses that source's pixel/token first.
     Runs async and never raises — failures are logged silently.
     """
-    pixel_id = ""
-    access_token = ""
-
-    # 1. Try traffic source credentials first
-    if traffic_source_id:
-        try:
-            r = sb.table("traffic_sources").select("pixel_id, api_token").eq("id", traffic_source_id).limit(1).execute()
-            src = (r.data or [None])[0]
-            if src:
-                pixel_id = (src.get("pixel_id") or "").strip()
-                access_token = (src.get("api_token") or "").strip()
-        except Exception:
-            pass
-
-    # 2. Fallback to campaign-level creds
-    if not pixel_id:
-        pixel_id = (campaign.get("meta_pixel_id") or "").strip()
-    if not access_token:
-        access_token = (campaign.get("meta_capi_token") or "").strip()
-
-    # 3. Fallback to env vars
-    if not pixel_id:
-        pixel_id = (settings.meta_pixel_id or "").strip()
-    if not access_token:
-        access_token = (settings.meta_conversions_api_token or "").strip()
-
+    pixel_id = (campaign.get("meta_pixel_id") or "").strip()
+    access_token = (campaign.get("meta_capi_token") or "").strip()
     if not pixel_id or not access_token:
-        logger.info("meta_capi_skip no_credentials campaign=%s", campaign.get("id", ""))
         return
 
     try:
@@ -253,9 +225,6 @@ class CaptureRequest(BaseModel):
     utm_campaign: str = ""
     utm_content: str = ""
     utm_term: str = ""
-    # Multi-form / multi-source tracking
-    form_id: str = ""
-    traffic_source_id: str = ""
 
 
 # ── Endpoints ──────────────────────────────────────────────────────
@@ -324,14 +293,10 @@ async def capture_lead(request: Request, body: CaptureRequest):
         except Exception:
             pass
 
-    is_new_lead = lead is None
-
     if lead:
         # Update existing lead
-        from datetime import datetime, timezone
-
         lead_id = lead["lead_id"]
-        updates: dict = {"last_contact_at": datetime.now(timezone.utc).isoformat()}
+        updates: dict = {}
         if body.name and not lead.get("name"):
             updates["name"] = body.name.strip()
         if body.email and not lead.get("email"):
@@ -343,10 +308,11 @@ async def capture_lead(request: Request, body: CaptureRequest):
             updates["tier_interest"] = body.tier_interest.strip().upper()
         if body.source and (lead.get("source") or "") == "":
             updates["source"] = body.source
-        try:
-            sb.table("leads").update(updates).eq("lead_id", lead_id).execute()
-        except Exception:
-            pass
+        if updates:
+            try:
+                sb.table("leads").update(updates).eq("lead_id", lead_id).execute()
+            except Exception:
+                pass
     else:
         # Create new lead
         lead_id = f"LP-{uuid4().hex[:8]}"
@@ -375,41 +341,24 @@ async def capture_lead(request: Request, body: CaptureRequest):
             import json as _json
             utm_note = f"[UTM] {_json.dumps(utm_parts)}"
 
-        # Map tier_interest to DB-valid values (check constraint: NONE, VIP only)
-        raw_tier = (body.tier_interest or "").strip().upper()
-        if raw_tier not in ("VIP",):
-            raw_tier = "NONE"  # GENERAL → NONE, empty → NONE
-
-        from datetime import datetime, timezone
-
         lead = {
             "lead_id": lead_id,
             "campaign_id": body.campaign_id,
-            "name": (body.name or "").strip() or None,
-            "email": (body.email or "").strip() or None,
-            "whatsapp": wa or None,
-            "phone": wa or None,
+            "name": (body.name or "").strip(),
+            "email": (body.email or "").strip(),
+            "whatsapp": wa,
+            "phone": wa,
             "status": "NEW",
             "source": lead_source,
-            "tier_interest": raw_tier,
-            "last_contact_at": datetime.now(timezone.utc).isoformat(),
+            "tier_interest": (body.tier_interest or "").strip().upper(),
         }
-
-        # Include event_id from campaign (required by DB)
-        event_id = campaign.get("event_id") or settings.default_event_id or None
-        if event_id:
-            lead["event_id"] = event_id
         if utm_note:
             lead["notes"] = utm_note
-        if body.form_id:
-            lead["form_id"] = body.form_id
-        if body.traffic_source_id:
-            lead["traffic_source_id"] = body.traffic_source_id
         try:
             sb.table("leads").insert(lead).execute()
         except Exception as exc:
-            logger.error("capture_lead_create_failed err=%s", str(exc)[:500])
-            raise HTTPException(status_code=500, detail=f"Error al crear lead: {str(exc)[:300]}")
+            logger.error("capture_lead_create_failed err=%s", str(exc)[:200])
+            raise HTTPException(status_code=500, detail="Error al crear lead")
 
     # Log touchpoint
     try:
@@ -489,7 +438,7 @@ async def capture_lead(request: Request, body: CaptureRequest):
 
     # Fire CAPI Lead event to Meta (server-side — most reliable)
     try:
-        await _fire_meta_capi(campaign, "Lead", lead_payload, utm=utm_data, traffic_source_id=body.traffic_source_id)
+        await _fire_meta_capi(campaign, "Lead", lead_payload, utm=utm_data)
     except Exception:
         pass
 
@@ -498,28 +447,6 @@ async def capture_lead(request: Request, body: CaptureRequest):
         await _fire_webhook(campaign, lead_payload, utm=utm_data)
     except Exception:
         pass
-
-    # ── AI Auto-Call — schedule delayed call for new leads ────────
-    if is_new_lead and campaign.get("ai_calls_enabled"):
-        delay_minutes = campaign.get("ai_call_delay_minutes") or 10
-        try:
-            import asyncio
-            asyncio.ensure_future(
-                schedule_delayed_call(
-                    lead_id=lead_id,
-                    campaign_id=body.campaign_id,
-                    delay_seconds=int(delay_minutes) * 60,
-                    expected_status="NEW",
-                    purpose="confirm_attendance",
-                    priority=1,
-                )
-            )
-            logger.info(
-                "auto_call_scheduled lead=%s delay=%dm campaign=%s",
-                lead_id, delay_minutes, body.campaign_id,
-            )
-        except Exception as exc:
-            logger.warning("auto_call_schedule_failed lead=%s err=%s", lead_id, str(exc)[:200])
 
     return {
         "ok": True,
@@ -560,9 +487,6 @@ async def embeddable_form(
     utm_campaign: str = "",
     utm_content: str = "",
     utm_term: str = "",
-    # Multi-form / multi-source attribution (set by slug redirect)
-    _form_id: str = "",
-    _traffic_source_id: str = "",
 ):
     """Self-contained HTML form for embedding via iframe on external landing pages.
 
@@ -917,8 +841,6 @@ const WA_NUMBER = "{wa_number}";
 const HAS_STRIPE = {"true" if has_stripe else "false"};
 const HAS_PIXEL = {"true" if pixel_id else "false"};
 const API_BASE = window.location.origin;
-const FORM_ID = "{_form_id}";
-const TRAFFIC_SOURCE_ID = "{_traffic_source_id}";
 
 // UTM tracking — from form URL params or parent page
 const UTM = {{}};
@@ -970,9 +892,7 @@ document.getElementById('captureForm').addEventListener('submit', async function
         email: email,
         whatsapp: whatsapp,
         source: 'landing_page_form',
-        tier_interest: 'NONE',
-        form_id: FORM_ID || undefined,
-        traffic_source_id: TRAFFIC_SOURCE_ID || undefined,
+        tier_interest: 'GENERAL',
       }}, UTM)),
     }});
     const data = await res.json();
@@ -1023,74 +943,6 @@ document.getElementById('captureForm').addEventListener('submit', async function
 </script>
 </body>
 </html>"""
-
-
-# ── Multi-form slug-based serving ─────────────────────────────────
-
-
-@router.get("/v1/forms/{campaign_id}/{form_slug}", response_class=HTMLResponse)
-async def embeddable_form_by_slug(
-    campaign_id: str,
-    form_slug: str,
-    request: Request,
-):
-    """Serve a form by slug. Looks up config from `forms` table and
-    delegates to the main embeddable_form() with the stored config as params.
-
-    Also injects form_id and traffic_source_id into the HTML so the
-    lead capture POST includes attribution.
-    """
-    from urllib.parse import urlencode
-    from fastapi.responses import RedirectResponse
-
-    try:
-        r = (
-            sb.table("forms")
-            .select("*, traffic_sources(id, utm_source, utm_medium)")
-            .eq("campaign_id", campaign_id)
-            .eq("slug", form_slug)
-            .eq("is_active", True)
-            .limit(1)
-            .execute()
-        )
-        form = (r.data or [None])[0]
-    except Exception:
-        form = None
-
-    if not form:
-        return HTMLResponse("<h2>Form not found</h2>", status_code=404)
-
-    # Build query params from form config + traffic source UTMs
-    params: dict = {}
-    config = form.get("config") or {}
-    for k in ("theme", "bg", "text", "accent", "card_bg", "input_bg", "input_border",
-              "radius", "btn_text", "success_color", "vip_color", "hide_header",
-              "hide_footer", "title", "subtitle", "btn_label", "font"):
-        if config.get(k):
-            params[k] = config[k]
-
-    # Pass through UTM from traffic source
-    ts = form.get("traffic_sources")
-    if ts:
-        if ts.get("utm_source"):
-            params["utm_source"] = ts["utm_source"]
-        if ts.get("utm_medium"):
-            params["utm_medium"] = ts["utm_medium"]
-
-    # Pass through any incoming query params (UTM overrides from ad URL)
-    for k, v in request.query_params.items():
-        if v:
-            params[k] = v
-
-    # Add form_id and traffic_source_id
-    params["_form_id"] = form["id"]
-    if form.get("traffic_source_id"):
-        params["_traffic_source_id"] = form["traffic_source_id"]
-
-    # Redirect to main form endpoint with merged params
-    qs = urlencode(params)
-    redirect_url = f"/v1/forms/{campaign_id}?{qs}"
-    return RedirectResponse(url=redirect_url, status_code=302)
 
 
 # ── WhatsApp link generator ───────────────────────────────────────

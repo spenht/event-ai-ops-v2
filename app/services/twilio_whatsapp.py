@@ -55,32 +55,42 @@ async def send_whatsapp(
     body: str,
     *,
     media_urls: Optional[Iterable[str]] = None,
+    account_sid: str = "",
+    auth_token: str = "",
+    whatsapp_from: str = "",
 ) -> str:
     """Send WhatsApp message via Twilio REST API.
 
     Uses synchronous httpx.Client inside a thread to avoid async/sync
     conflicts with the event loop (known httpx issue).
 
+    Accepts optional explicit Twilio credentials for multi-campaign support.
+    Falls back to global settings if not provided.
+
     Returns Twilio Message SID.
     """
 
-    if not settings.twilio_account_sid or not settings.twilio_auth_token:
+    sid = (account_sid or "").strip() or settings.twilio_account_sid
+    token = (auth_token or "").strip() or settings.twilio_auth_token
+    from_num = (whatsapp_from or "").strip() or settings.twilio_whatsapp_from
+
+    if not sid or not token:
         raise RuntimeError("Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN")
 
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Messages.json"
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
     to_value = f"whatsapp:{to_e164}" if not to_e164.startswith("whatsapp:") else to_e164
 
     media_list = [u.strip() for u in (media_urls or []) if (u or "").strip()]
 
     data: list[tuple[str, str]] = [
-        ("From", settings.twilio_whatsapp_from),
+        ("From", from_num),
         ("To", to_value),
         ("Body", body or ""),
     ]
     for u in media_list:
         data.append(("MediaUrl", u))
 
-    headers = {"Authorization": _basic_auth_header(settings.twilio_account_sid, settings.twilio_auth_token)}
+    headers = {"Authorization": _basic_auth_header(sid, token)}
 
     return await anyio.to_thread.run_sync(
         lambda: _send_whatsapp_sync(url, data, headers, to_value, len(media_list))

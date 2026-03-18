@@ -600,7 +600,7 @@ async def import_existing_numbers(
         try:
             row = {
                 "campaign_id": campaign_id,
-                "org_id": org_id or None,
+                "org_id": org_id,
                 "number": phone,
                 "country": country,
                 "provider": "telnyx",
@@ -767,7 +767,7 @@ async def import_selected_numbers(
         try:
             row = {
                 "campaign_id": campaign_id,
-                "org_id": org_id or None,
+                "org_id": org_id,
                 "number": phone,
                 "country": country,
                 "provider": "telnyx",
@@ -937,7 +937,7 @@ async def purchase_number(
     detected_country = detect_lead_country(chosen_number)
     row = {
         "campaign_id": campaign_id,
-        "org_id": org_id or None,
+        "org_id": org_id,
         "number": chosen_number,
         "country": detected_country,
         "provider": "telnyx",

@@ -110,6 +110,15 @@ async def schedule_delayed_call(
             )
             return
 
+        # For NEW leads: if they now have a name, they progressed (even if status didn't change)
+        if expected_status.upper() == "NEW" and lead.get("name"):
+            logger.info(
+                "delayed_call_skip_has_name lead=%s name=%s",
+                lead_id,
+                lead.get("name", "")[:30],
+            )
+            return
+
         # Check if already paid
         if (lead.get("payment_status") or "").upper() == "PAID":
             logger.info("delayed_call_skip_paid lead=%s", lead_id)

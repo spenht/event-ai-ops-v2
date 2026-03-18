@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, Optional
 
@@ -47,20 +46,17 @@ def _validate_auth(request: Request, campaign_id: str | None = None) -> None:
     """
     Validate request authentication.
 
-    Checks (in order):
-    1. X-Cron-Token header against global cron_token
-    2. X-Spartans-Key header against campaign-specific spartans_key (DB)
-    3. X-Spartans-Key header against global settings.spartans_key (fallback)
-    4. No token configured = open (dev mode)
+    Checks X-Cron-Token header against global cron_token,
+    or campaign-specific spartans_key.
     """
     token = (request.headers.get("x-cron-token") or "").strip()
     spartans_key = (request.headers.get("x-spartans-key") or "").strip()
 
-    # 1. Global cron token
+    # Global cron token
     if settings.cron_token and token == settings.cron_token:
         return
 
-    # 2. Campaign-specific spartans key (from DB)
+    # Campaign-specific spartans key
     if campaign_id and spartans_key:
         try:
             r = (
@@ -71,16 +67,12 @@ def _validate_auth(request: Request, campaign_id: str | None = None) -> None:
                 .execute()
             )
             campaign = (r.data or [None])[0]
-            if campaign and campaign.get("spartans_key") and campaign["spartans_key"] == spartans_key:
+            if campaign and campaign.get("spartans_key") == spartans_key:
                 return
         except Exception:
             pass
 
-    # 3. Global spartans_key fallback (covers campaigns without DB key)
-    if spartans_key and settings.spartans_key and spartans_key == settings.spartans_key:
-        return
-
-    # 4. No token configured = open (dev mode)
+    # No token configured = open (dev mode)
     if not settings.cron_token:
         return
 
@@ -334,7 +326,6 @@ async def webrtc_call_ended(request: Request, body: CallEndedRequest):
     if body.outcome in ("vip_interesado", "confirmed", "callback"):
         lead_id = ""
         try:
-            # Get lead_id from the call record
             rec_r = sb.table("call_records").select("lead_id").eq("id", body.record_id).limit(1).execute()
             rec_data = (rec_r.data or [None])[0]
             if rec_data:
@@ -738,155 +729,4 @@ async def webrtc_ai_call(request: Request, body: AICallRequest):
         "ok": True,
         "call_control_id": call_control_id,
         "record_id": record_id,
-    }
-
-
-# ─── Bulk AI Call ─────────────────────────────────────────────────────────────
-
-
-class BulkAICallRequest(BaseModel):
-    campaign_id: str
-    lead_ids: list[str]
-    purpose: str = "confirm_attendance"
-
-
-@router.post("/ai-calls/bulk")
-async def bulk_ai_call(request: Request, body: BulkAICallRequest):
-    """Trigger AI calls to multiple leads at once."""
-    _validate_auth(request, body.campaign_id)
-
-    if len(body.lead_ids) > 100:
-        raise HTTPException(status_code=400, detail="max 100 leads per bulk request")
-
-    if not body.lead_ids:
-        return {"ok": True, "total": 0, "initiated": 0, "failed": 0, "results": []}
-
-    # Fetch campaign once
-    try:
-        cr = (
-            sb.table("campaigns")
-            .select("*")
-            .eq("id", body.campaign_id)
-            .limit(1)
-            .execute()
-        )
-        campaign = (cr.data or [None])[0]
-    except Exception:
-        raise HTTPException(status_code=500, detail="failed to fetch campaign")
-
-    if not campaign:
-        raise HTTPException(status_code=404, detail="campaign not found")
-
-    telnyx_api_key = (campaign.get("telnyx_api_key") or "").strip()
-    connection_id = (
-        (campaign.get("telnyx_webrtc_credential_id") or "").strip()
-        or (campaign.get("telnyx_sip_connection_id") or "").strip()
-    )
-    from_number = (campaign.get("telnyx_from_number") or "").strip()
-
-    if not telnyx_api_key or not connection_id:
-        raise HTTPException(status_code=400, detail="campaign missing Telnyx credentials")
-
-    webhook_url = (
-        f"{settings.public_base_url}/v1/calls/telnyx/webhooks/{body.campaign_id}"
-        if settings.public_base_url
-        else ""
-    )
-
-    results: list[dict] = []
-    initiated = 0
-    failed = 0
-
-    for lead_id in body.lead_ids:
-        try:
-            # Fetch lead
-            lr = (
-                sb.table("leads")
-                .select("lead_id, phone, whatsapp, do_not_contact")
-                .eq("lead_id", lead_id)
-                .limit(1)
-                .execute()
-            )
-            lead = (lr.data or [None])[0]
-
-            if not lead:
-                results.append({"lead_id": lead_id, "status": "failed", "error": "lead not found"})
-                failed += 1
-                continue
-
-            if lead.get("do_not_contact"):
-                results.append({"lead_id": lead_id, "status": "failed", "error": "do not contact"})
-                failed += 1
-                continue
-
-            phone = (lead.get("phone") or lead.get("whatsapp") or "").strip()
-            if phone.startswith("whatsapp:"):
-                phone = phone[len("whatsapp:"):]
-            phone = _normalize_phone_for_voice(phone)
-
-            if not phone:
-                results.append({"lead_id": lead_id, "status": "failed", "error": "no phone"})
-                failed += 1
-                continue
-
-            client_state = _encode_client_state(
-                {
-                    "campaign_id": body.campaign_id,
-                    "lead_id": lead_id,
-                    "caller_type": "ai",
-                    "purpose": body.purpose,
-                }
-            )
-
-            dial_result = await dial_outbound(
-                to_number=phone,
-                from_number=from_number,
-                connection_id=connection_id,
-                telnyx_api_key=telnyx_api_key,
-                webhook_url=webhook_url,
-                client_state=client_state,
-                amd="",
-            )
-
-            call_control_id = dial_result.get("call_control_id", "")
-
-            record = create_call_record(
-                campaign_id=body.campaign_id,
-                lead_id=lead_id,
-                caller_type="ai",
-                from_number=from_number,
-                to_number=phone,
-                status="initiated",
-                purpose=body.purpose,
-                notes=f"purpose:{body.purpose}|trigger:bulk",
-            )
-            if record and call_control_id:
-                update_call_record(record["id"], {"telnyx_call_control_id": call_control_id})
-
-            results.append({"lead_id": lead_id, "status": "initiated"})
-            initiated += 1
-
-            logger.info("bulk_ai_call_initiated lead=%s phone=%s", lead_id, phone)
-
-            # Rate limit: 1 second between calls
-            await asyncio.sleep(1)
-
-        except Exception as exc:
-            logger.error("bulk_ai_call_failed lead=%s err=%s", lead_id, str(exc)[:200])
-            results.append({"lead_id": lead_id, "status": "failed", "error": str(exc)[:100]})
-            failed += 1
-
-    logger.info(
-        "bulk_ai_call_done campaign=%s total=%d initiated=%d failed=%d",
-        body.campaign_id,
-        len(body.lead_ids),
-        initiated,
-        failed,
-    )
-    return {
-        "ok": True,
-        "total": len(body.lead_ids),
-        "initiated": initiated,
-        "failed": failed,
-        "results": results,
     }
