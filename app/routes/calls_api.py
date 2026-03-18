@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -21,6 +22,14 @@ from ..services.call_queue import (
     end_session,
     get_active_sessions,
 )
+from ..services.number_pool import (
+    import_existing_numbers,
+    import_selected_numbers,
+    list_available_telnyx_numbers,
+    purchase_number,
+    release_number,
+    get_pool_stats,
+)
 
 logger = logging.getLogger("calls_api")
 
@@ -33,17 +42,20 @@ def _validate_auth(request: Request, campaign_id: str | None = None) -> None:
     """
     Validate request authentication.
 
-    Checks X-Cron-Token header against global cron_token,
-    or campaign-specific spartans_key.
+    Checks (in order):
+    1. X-Cron-Token header against global cron_token
+    2. X-Spartans-Key header against campaign-specific spartans_key (DB)
+    3. X-Spartans-Key header against global settings.spartans_key (fallback)
+    4. No token configured = open (dev mode)
     """
     token = (request.headers.get("x-cron-token") or "").strip()
     spartans_key = (request.headers.get("x-spartans-key") or "").strip()
 
-    # Global cron token
+    # 1. Global cron token
     if settings.cron_token and token == settings.cron_token:
         return
 
-    # Campaign-specific spartans key
+    # 2. Campaign-specific spartans key (from DB)
     if campaign_id and spartans_key:
         try:
             r = (
@@ -54,12 +66,16 @@ def _validate_auth(request: Request, campaign_id: str | None = None) -> None:
                 .execute()
             )
             campaign = (r.data or [None])[0]
-            if campaign and campaign.get("spartans_key") == spartans_key:
+            if campaign and campaign.get("spartans_key") and campaign["spartans_key"] == spartans_key:
                 return
         except Exception:
             pass
 
-    # No token configured = open (dev mode)
+    # 3. Global spartans_key fallback (covers campaigns without DB key)
+    if spartans_key and settings.spartans_key and spartans_key == settings.spartans_key:
+        return
+
+    # 4. No token configured = open (dev mode)
     if not settings.cron_token:
         return
 
@@ -227,6 +243,215 @@ async def cancel_queued_call(queue_id: str, request: Request):
         raise HTTPException(status_code=500, detail="failed to cancel")
 
 
+# ─── Bulk re-queue ────────────────────────────────────────────────────────────
+
+
+class BulkRequeueRequest(BaseModel):
+    campaign_id: str
+    caller_type: str = "ai"  # "ai" or "spartan"
+    call_type: str = "followup"
+    priority: int = 0
+    filters: dict = {}  # e.g. {"no_answer": true, "not_confirmed": true, "no_vip": true}
+
+
+@router.post("/queue/bulk-requeue")
+async def bulk_requeue(request: Request, body: BulkRequeueRequest):
+    """
+    Re-queue leads matching filter conditions.
+
+    Supported filters:
+    - no_answer: leads that were called but never answered (by specified caller_type)
+    - not_confirmed: leads whose status is NOT 'CONFIRMED'
+    - no_vip: leads whose tier_interest is NOT 'VIP'
+    - status_in: list of statuses to include (e.g. ["NEW", "CONTACTED"])
+    - never_called: leads that have never been called (by specified caller_type)
+
+    Skips leads already in queue (pending/assigned) and do_not_contact leads.
+    """
+    _validate_auth(request, body.campaign_id)
+
+    try:
+        filters = body.filters or {}
+        caller_type = body.caller_type  # "ai" or "spartan"
+
+        # 1. Get all leads for campaign (paginate to avoid Supabase 1000 default)
+        all_leads: list[dict] = []
+        page_from = 0
+        page_size = 1000
+        while True:
+            leads_r = (
+                sb.table("leads")
+                .select("lead_id, status, tier_interest, payment_status, do_not_contact, phone, whatsapp")
+                .eq("campaign_id", body.campaign_id)
+                .range(page_from, page_from + page_size - 1)
+                .execute()
+            )
+            page_data = leads_r.data or []
+            all_leads.extend(page_data)
+            if len(page_data) < page_size:
+                break
+            page_from += page_size
+
+        # 2. Filter out do_not_contact and leads without phone
+        eligible = [
+            l for l in all_leads
+            if not l.get("do_not_contact")
+            and (l.get("phone") or l.get("whatsapp"))
+        ]
+
+        # 3. Get existing pending/assigned queue entries to avoid duplicates (paginated)
+        already_queued: set[str] = set()
+        eq_from = 0
+        while True:
+            existing_r = (
+                sb.table("call_queue")
+                .select("lead_id")
+                .eq("campaign_id", body.campaign_id)
+                .in_("status", ["pending", "assigned"])
+                .range(eq_from, eq_from + page_size - 1)
+                .execute()
+            )
+            eq_page = existing_r.data or []
+            already_queued.update(e["lead_id"] for e in eq_page)
+            if len(eq_page) < page_size:
+                break
+            eq_from += page_size
+
+        # 4. Get call records to check who was called and outcomes (paginated)
+        call_records: list[dict] = []
+        rec_from = 0
+        while True:
+            records_r = (
+                sb.table("call_records")
+                .select("lead_id, status, caller_type, outcome")
+                .eq("campaign_id", body.campaign_id)
+                .range(rec_from, rec_from + page_size - 1)
+                .execute()
+            )
+            rec_page = records_r.data or []
+            call_records.extend(rec_page)
+            if len(rec_page) < page_size:
+                break
+            rec_from += page_size
+
+        # Build per-lead call history
+        lead_calls: dict[str, list[dict]] = {}
+        for rec in call_records:
+            lid = rec["lead_id"]
+            if lid not in lead_calls:
+                lead_calls[lid] = []
+            lead_calls[lid].append(rec)
+
+        # 5. Apply filters
+        selected_lead_ids: set[str] = set()
+
+        if filters.get("no_answer"):
+            # Leads called by caller_type but never answered
+            for lead in eligible:
+                lid = lead["lead_id"]
+                calls = lead_calls.get(lid, [])
+                type_calls = [c for c in calls if c.get("caller_type") == caller_type]
+                if type_calls and all(c.get("status") != "completed" for c in type_calls):
+                    selected_lead_ids.add(lid)
+
+        if filters.get("not_confirmed"):
+            # Leads whose status is not CONFIRMED
+            for lead in eligible:
+                if (lead.get("status") or "").upper() != "CONFIRMED":
+                    selected_lead_ids.add(lead["lead_id"])
+
+        if filters.get("no_vip"):
+            # Leads whose tier_interest is not VIP
+            for lead in eligible:
+                if (lead.get("tier_interest") or "").upper() != "VIP":
+                    selected_lead_ids.add(lead["lead_id"])
+
+        if filters.get("never_called"):
+            # Leads never called by the specified caller_type
+            for lead in eligible:
+                lid = lead["lead_id"]
+                calls = lead_calls.get(lid, [])
+                type_calls = [c for c in calls if c.get("caller_type") == caller_type]
+                if not type_calls:
+                    selected_lead_ids.add(lid)
+
+        if filters.get("status_in"):
+            allowed = {s.upper() for s in filters["status_in"]}
+            for lead in eligible:
+                if (lead.get("status") or "").upper() in allowed:
+                    selected_lead_ids.add(lead["lead_id"])
+
+        if not filters:
+            # No filters = re-queue all eligible leads
+            selected_lead_ids = {l["lead_id"] for l in eligible}
+
+        # 6. Remove already-queued leads
+        to_enqueue = selected_lead_ids - already_queued
+
+        if not to_enqueue:
+            return {
+                "ok": True,
+                "enqueued": 0,
+                "skipped_already_queued": len(selected_lead_ids & already_queued),
+                "message": "No new leads to enqueue — all matching leads are already in queue",
+            }
+
+        # 7. Bulk insert into call_queue
+        from uuid import uuid4
+
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            {
+                "id": str(uuid4()),
+                "campaign_id": body.campaign_id,
+                "lead_id": lid,
+                "call_type": body.call_type,
+                "priority": body.priority,
+                "status": "pending",
+                "attempt_count": 0,
+                "max_attempts": 3,
+                "cycle_count": 0,
+                "max_cycles": 7,
+                "created_at": now,
+            }
+            for lid in to_enqueue
+        ]
+
+        # Insert in batches of 200
+        total_inserted = 0
+        batch_size = 200
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i : i + batch_size]
+            r = sb.table("call_queue").insert(batch).execute()
+            total_inserted += len(r.data or [])
+
+        logger.info(
+            "bulk_requeue campaign=%s caller_type=%s filters=%s enqueued=%d skipped=%d",
+            body.campaign_id,
+            caller_type,
+            filters,
+            total_inserted,
+            len(selected_lead_ids & already_queued),
+        )
+
+        return {
+            "ok": True,
+            "enqueued": total_inserted,
+            "skipped_already_queued": len(selected_lead_ids & already_queued),
+            "total_matching": len(selected_lead_ids),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "bulk_requeue_failed campaign=%s err=%s",
+            body.campaign_id,
+            str(exc)[:300],
+        )
+        raise HTTPException(status_code=500, detail=f"bulk requeue failed: {str(exc)[:200]}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CALL RECORDS ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -236,18 +461,23 @@ async def cancel_queued_call(queue_id: str, request: Request):
 async def list_records(
     request: Request,
     campaign_id: str,
+    user_id: str = "",
     limit: int = 50,
     offset: int = 0,
 ):
-    """List call records (history) for a campaign."""
+    """List call records (history) for a campaign, optionally filtered by agent."""
     _validate_auth(request, campaign_id)
 
     try:
-        r = (
+        q = (
             sb.table("call_records")
             .select("*")
             .eq("campaign_id", campaign_id)
-            .order("created_at", desc=True)
+        )
+        if user_id:
+            q = q.eq("user_id", user_id)
+        r = (
+            q.order("created_at", desc=True)
             .range(offset, offset + limit - 1)
             .execute()
         )
@@ -431,6 +661,653 @@ async def call_stats(request: Request, campaign_id: str):
     }
 
 
+
+@router.get("/stats/agent")
+async def agent_stats(
+    request: Request, campaign_id: str, user_id: str
+):
+    """Get today's call stats for a specific agent."""
+    _validate_auth(request, campaign_id)
+
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    try:
+        r = (
+            sb.table("call_records")
+            .select("status, duration_seconds, outcome")
+            .eq("campaign_id", campaign_id)
+            .eq("caller_id", user_id)
+            .gte("created_at", today)
+            .execute()
+        )
+        records = r.data or []
+        total_calls = len(records)
+        answered = sum(
+            1
+            for rec in records
+            if (rec.get("duration_seconds") or 0) > 0
+        )
+        total_duration = sum(
+            (rec.get("duration_seconds") or 0) for rec in records
+        )
+        answer_rate = (
+            round((answered / total_calls) * 100) if total_calls > 0 else 0
+        )
+
+        return {
+            "calls_today": total_calls,
+            "answered_today": answered,
+            "talk_time_today_seconds": total_duration,
+            "answer_rate": answer_rate,
+        }
+    except Exception as exc:
+        logger.error("agent_stats_failed err=%s", str(exc)[:300])
+        raise HTTPException(
+            status_code=500, detail="failed to get agent stats"
+        )
+
+
+@router.get("/stats/team")
+async def team_stats(request: Request, campaign_id: str):
+    """Get per-agent call stats for today — team leader view."""
+    _validate_auth(request, campaign_id)
+
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    try:
+        r = (
+            sb.table("call_records")
+            .select("caller_id, status, duration_seconds, outcome, created_at")
+            .eq("campaign_id", campaign_id)
+            .gte("created_at", today)
+            .execute()
+        )
+        records = r.data or []
+    except Exception as exc:
+        logger.error("team_stats_records_failed err=%s", str(exc)[:300])
+        raise HTTPException(
+            status_code=500, detail="failed to get team stats"
+        )
+
+    # Group by caller_id
+    agents: dict[str, dict] = {}
+    for rec in records:
+        cid = rec.get("caller_id") or "unknown"
+        if cid not in agents:
+            agents[cid] = {"calls": 0, "answered": 0, "talk_time": 0}
+        agents[cid]["calls"] += 1
+        if (rec.get("duration_seconds") or 0) > 0:
+            agents[cid]["answered"] += 1
+        agents[cid]["talk_time"] += rec.get("duration_seconds") or 0
+
+    # Get active sessions
+    sessions = get_active_sessions(campaign_id)
+    active_agents = {s.get("user_id"): s for s in sessions}
+
+    results = []
+    for agent_id, astats in agents.items():
+        session = active_agents.get(agent_id)
+        results.append(
+            {
+                "user_id": agent_id,
+                "calls_today": astats["calls"],
+                "answered_today": astats["answered"],
+                "talk_time_seconds": astats["talk_time"],
+                "answer_rate": (
+                    round((astats["answered"] / astats["calls"]) * 100)
+                    if astats["calls"] > 0
+                    else 0
+                ),
+                "is_online": agent_id in active_agents,
+                "session_started_at": (
+                    session.get("started_at") if session else None
+                ),
+            }
+        )
+
+    # Sort by calls_today desc
+    results.sort(key=lambda x: x["calls_today"], reverse=True)
+    return {"data": results, "count": len(results)}
+
+
+@router.get("/stats/team/detailed")
+async def team_stats_detailed(request: Request, campaign_id: str):
+    """Detailed per-agent stats with recent calls — team leader dashboard."""
+    _validate_auth(request, campaign_id)
+
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    # 1. Fetch ALL today's call_records for this campaign
+    try:
+        r = (
+            sb.table("call_records")
+            .select(
+                "id, caller_id, lead_id, to_number, status, "
+                "duration_seconds, outcome, notes, tags, "
+                "ai_summary, ai_sentiment, created_at"
+            )
+            .eq("campaign_id", campaign_id)
+            .gte("created_at", today)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        records = r.data or []
+    except Exception as exc:
+        logger.error("team_detailed_failed err=%s", str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to get team stats")
+
+    # 2. Group records by caller_id
+    agents_map: dict[str, dict] = {}
+    for rec in records:
+        cid = rec.get("caller_id") or "unknown"
+        if cid not in agents_map:
+            agents_map[cid] = {
+                "calls": 0,
+                "answered": 0,
+                "talk_time": 0,
+                "tags_set": set(),
+                "recent_calls": [],
+            }
+        a = agents_map[cid]
+        a["calls"] += 1
+        dur = rec.get("duration_seconds") or 0
+        if dur > 0:
+            a["answered"] += 1
+        a["talk_time"] += dur
+        for tag in rec.get("tags") or []:
+            a["tags_set"].add(tag)
+        if len(a["recent_calls"]) < 10:
+            a["recent_calls"].append(rec)
+
+    # 3. Get active sessions
+    sessions = get_active_sessions(campaign_id)
+    active_agents = {s.get("user_id"): s for s in sessions}
+
+    # 4. Build agent results
+    agent_results = []
+    for agent_id, astats in agents_map.items():
+        session = active_agents.get(agent_id)
+        answer_rate = (
+            round((astats["answered"] / astats["calls"]) * 100)
+            if astats["calls"] > 0
+            else 0
+        )
+        avg_dur = (
+            round(astats["talk_time"] / astats["answered"])
+            if astats["answered"] > 0
+            else 0
+        )
+        agent_results.append(
+            {
+                "user_id": agent_id,
+                "calls_today": astats["calls"],
+                "answered_today": astats["answered"],
+                "talk_time_seconds": astats["talk_time"],
+                "answer_rate": answer_rate,
+                "avg_duration_seconds": avg_dur,
+                "is_online": agent_id in active_agents,
+                "session_started_at": (
+                    session.get("started_at") if session else None
+                ),
+                "tags_used": sorted(astats["tags_set"]),
+                "tags_count": len(astats["tags_set"]),
+                "recent_calls": astats["recent_calls"],
+            }
+        )
+
+    agent_results.sort(key=lambda x: x["calls_today"], reverse=True)
+
+    # 5. Build summary
+    total_calls = sum(a["calls_today"] for a in agent_results)
+    total_answered = sum(a["answered_today"] for a in agent_results)
+    total_talk = sum(a["talk_time_seconds"] for a in agent_results)
+    team_rate = (
+        round((total_answered / total_calls) * 100) if total_calls > 0 else 0
+    )
+
+    # 6. Recent activity (last 20 records across all agents)
+    recent_activity = records[:20]
+
+    return {
+        "summary": {
+            "total_calls_today": total_calls,
+            "total_answered_today": total_answered,
+            "team_answer_rate": team_rate,
+            "total_talk_time_seconds": total_talk,
+            "active_agents": len(sessions),
+        },
+        "agents": agent_results,
+        "recent_activity": recent_activity,
+        "count": len(agent_results),
+    }
+
+
+@router.get("/stats/agent/daily-summary")
+async def agent_daily_summary(
+    request: Request, campaign_id: str, user_id: str
+):
+    """Generate an AI daily summary for an agent's performance today."""
+    _validate_auth(request, campaign_id)
+
+    from datetime import datetime, timezone
+    import httpx
+
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    # Fetch today's call records for this agent
+    try:
+        r = (
+            sb.table("call_records")
+            .select("duration_seconds, outcome, notes, tags, ai_summary, to_number, status")
+            .eq("campaign_id", campaign_id)
+            .eq("caller_id", user_id)
+            .gte("created_at", today)
+            .execute()
+        )
+        records = r.data or []
+    except Exception as exc:
+        logger.error("daily_summary_records_failed err=%s", str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to fetch records")
+
+    if not records:
+        return {
+            "ok": True,
+            "summary": "No calls made today yet. Start dialing to see your daily summary!",
+            "stats": {"calls": 0, "answered": 0, "talk_time": 0},
+        }
+
+    # Calculate stats
+    total_calls = len(records)
+    answered = sum(1 for r in records if (r.get("duration_seconds") or 0) > 0)
+    total_duration = sum((r.get("duration_seconds") or 0) for r in records)
+    answer_rate = round((answered / total_calls * 100) if total_calls > 0 else 0)
+    avg_duration = round(total_duration / answered) if answered > 0 else 0
+
+    # Fetch campaign OpenAI key
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("openai_api_key")
+            .eq("id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception:
+        campaign = None
+
+    from ..settings import settings as app_settings
+    openai_key = (campaign or {}).get("openai_api_key") or app_settings.openai_api_key
+    if not openai_key:
+        return {
+            "ok": True,
+            "summary": f"Today: {total_calls} calls, {answered} answered ({answer_rate}%), {total_duration // 60}m talk time.",
+            "stats": {
+                "calls": total_calls,
+                "answered": answered,
+                "talk_time": total_duration,
+                "answer_rate": answer_rate,
+            },
+        }
+
+    # Build call summaries for AI context
+    call_summaries = []
+    for i, rec in enumerate(records[:20], 1):
+        dur = rec.get("duration_seconds") or 0
+        notes = rec.get("notes") or ""
+        outcome = rec.get("outcome") or ""
+        ai_sum = rec.get("ai_summary") or ""
+        tags = rec.get("tags") or []
+        line = f"Call {i}: {dur}s"
+        if tags:
+            line += f", tags=[{', '.join(tags)}]"
+        if outcome:
+            line += f", outcome={outcome}"
+        if ai_sum:
+            line += f", summary={ai_sum}"
+        elif notes:
+            line += f", notes={notes}"
+        call_summaries.append(line)
+
+    prompt = f"""Analyze this agent's daily call performance and provide brief, actionable feedback.
+
+Stats:
+- Total calls: {total_calls}
+- Answered: {answered} ({answer_rate}%)
+- Total talk time: {total_duration // 60}m {total_duration % 60}s
+- Avg call duration: {avg_duration}s
+
+Call details:
+{chr(10).join(call_summaries)}
+
+Provide:
+1. A 1-sentence summary of the day
+2. One thing done well
+3. One thing to improve
+Keep it under 100 words total. Be encouraging but honest."""
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a supportive sales coach reviewing a call agent's daily performance. Be concise and actionable.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "max_tokens": 200,
+                    "temperature": 0.5,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            summary = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+    except Exception as exc:
+        logger.error("daily_summary_openai_failed err=%s", str(exc)[:300])
+        summary = f"Today: {total_calls} calls, {answered} answered ({answer_rate}%), {total_duration // 60}m talk time."
+
+    return {
+        "ok": True,
+        "summary": summary,
+        "stats": {
+            "calls": total_calls,
+            "answered": answered,
+            "talk_time": total_duration,
+            "answer_rate": answer_rate,
+            "avg_duration": avg_duration,
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHONE NUMBERS ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LEADS ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/leads")
+async def list_leads(
+    request: Request,
+    campaign_id: str,
+    status: str = "",
+    payment_status: str = "",
+    source: str = "",
+    search: str = "",
+    limit: int = 50,
+    offset: int = 0,
+):
+    """List leads for a campaign with optional filters."""
+    _validate_auth(request, campaign_id)
+
+    try:
+        q = (
+            sb.table("leads")
+            .select("*")
+            .eq("campaign_id", campaign_id)
+        )
+        if status:
+            q = q.eq("status", status)
+        if payment_status:
+            q = q.eq("payment_status", payment_status)
+        if source:
+            q = q.ilike("source", f"%{source}%")
+        if search:
+            q = q.or_(
+                f"name.ilike.%{search}%,"
+                f"email.ilike.%{search}%,"
+                f"whatsapp.ilike.%{search}%,"
+                f"lead_id.ilike.%{search}%"
+            )
+
+        q = q.order("created_at", desc=True)
+        q = q.range(offset, offset + limit - 1)
+        r = q.execute()
+
+        # Get total count (separate query without pagination)
+        count_q = (
+            sb.table("leads")
+            .select("lead_id", count="exact")
+            .eq("campaign_id", campaign_id)
+        )
+        if status:
+            count_q = count_q.eq("status", status)
+        if payment_status:
+            count_q = count_q.eq("payment_status", payment_status)
+        count_r = count_q.execute()
+        total = count_r.count if hasattr(count_r, "count") and count_r.count is not None else len(r.data or [])
+
+        return {"data": r.data or [], "count": len(r.data or []), "total": total}
+    except Exception as exc:
+        logger.error("list_leads_failed campaign=%s err=%s", campaign_id, str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to list leads")
+
+
+@router.get("/leads/{lead_id}")
+async def get_lead(lead_id: str, request: Request, campaign_id: str = ""):
+    """Get a single lead by ID."""
+    _validate_auth(request, campaign_id)
+
+    try:
+        q = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1)
+        if campaign_id:
+            q = q.eq("campaign_id", campaign_id)
+        r = q.execute()
+        lead = (r.data or [None])[0]
+        if not lead:
+            raise HTTPException(status_code=404, detail="lead not found")
+        return lead
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("get_lead_failed id=%s err=%s", lead_id, str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to get lead")
+
+
+@router.patch("/leads/{lead_id}")
+async def update_lead(lead_id: str, request: Request, body: dict):
+    """Update lead fields."""
+    campaign_id = body.pop("campaign_id", "")
+    _validate_auth(request, campaign_id)
+
+    # Only allow safe fields to be updated
+    allowed = {
+        "name", "email", "phone", "whatsapp", "status", "payment_status",
+        "tier_interest", "source", "notes", "tags", "vip_count",
+    }
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if not updates:
+        return {"ok": True, "message": "no updates"}
+
+    try:
+        r = sb.table("leads").update(updates).eq("lead_id", lead_id).execute()
+        updated = (r.data or [None])[0]
+        if not updated:
+            raise HTTPException(status_code=404, detail="lead not found")
+        return {"ok": True, "data": updated}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("update_lead_failed id=%s err=%s", lead_id, str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to update lead")
+
+
+@router.get("/leads/stats/summary")
+async def leads_stats(request: Request, campaign_id: str):
+    """Get lead statistics for a campaign."""
+    _validate_auth(request, campaign_id)
+
+    try:
+        r = (
+            sb.table("leads")
+            .select("status, payment_status, tier_interest, source")
+            .eq("campaign_id", campaign_id)
+            .execute()
+        )
+        leads = r.data or []
+        total = len(leads)
+
+        status_counts: dict[str, int] = {}
+        payment_counts: dict[str, int] = {}
+        source_counts: dict[str, int] = {}
+        for lead in leads:
+            s = lead.get("status") or "UNKNOWN"
+            status_counts[s] = status_counts.get(s, 0) + 1
+            ps = lead.get("payment_status") or "NONE"
+            payment_counts[ps] = payment_counts.get(ps, 0) + 1
+            src = (lead.get("source") or "unknown").split(":")[0]
+            source_counts[src] = source_counts.get(src, 0) + 1
+
+        return {
+            "total": total,
+            "by_status": status_counts,
+            "by_payment_status": payment_counts,
+            "by_source": source_counts,
+        }
+    except Exception as exc:
+        logger.error("leads_stats_failed campaign=%s err=%s", campaign_id, str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to get lead stats")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI CALL STATS ENDPOINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/ai-calls/stats")
+async def ai_call_stats(request: Request, campaign_id: str):
+    """Get AI calling stats for the campaign overview control center."""
+    _validate_auth(request, campaign_id)
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Fetch campaign config
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("ai_calls_enabled, ai_call_delay_minutes")
+            .eq("id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        camp = (cr.data or [None])[0] or {}
+    except Exception:
+        camp = {}
+
+    # Fetch AI call records
+    try:
+        all_r = (
+            sb.table("call_records")
+            .select("id, lead_id, status, duration_seconds, notes, purpose, created_at")
+            .eq("campaign_id", campaign_id)
+            .eq("caller_type", "ai")
+            .order("created_at", desc=True)
+            .limit(500)
+            .execute()
+        )
+        all_calls = all_r.data or []
+    except Exception:
+        all_calls = []
+
+    total = len(all_calls)
+    calls_today = sum(1 for c in all_calls if c.get("created_at", "") >= today_start.isoformat())
+    calls_24h = sum(1 for c in all_calls if c.get("created_at", "") >= (now - timedelta(hours=24)).isoformat())
+
+    completed = [c for c in all_calls if (c.get("duration_seconds") or 0) > 0]
+    answer_rate = round(len(completed) / total * 100, 1) if total > 0 else 0
+    avg_duration = round(sum(c["duration_seconds"] for c in completed) / len(completed), 0) if completed else 0
+
+    # Recent calls with lead names
+    recent = all_calls[:10]
+    lead_ids = list({c["lead_id"] for c in recent if c.get("lead_id")})
+    lead_names: dict[str, str] = {}
+    if lead_ids:
+        try:
+            lr = (
+                sb.table("leads")
+                .select("lead_id, name")
+                .in_("lead_id", lead_ids)
+                .execute()
+            )
+            for l in lr.data or []:
+                lead_names[l["lead_id"]] = l.get("name") or ""
+        except Exception:
+            pass
+
+    recent_formatted = [
+        {
+            "id": c["id"],
+            "lead_id": c["lead_id"],
+            "lead_name": lead_names.get(c["lead_id"], ""),
+            "status": c.get("status", ""),
+            "duration_seconds": c.get("duration_seconds", 0),
+            "purpose": c.get("purpose") or (c.get("notes") or "").split("|")[0].replace("purpose:", ""),
+            "created_at": c.get("created_at", ""),
+        }
+        for c in recent
+    ]
+
+    # Eligible leads by status
+    eligible: dict[str, int] = {}
+    for status in ["NEW", "GENERAL_CONFIRMED", "VIP_INTERESTED"]:
+        try:
+            er = (
+                sb.table("leads")
+                .select("lead_id", count="exact")
+                .eq("campaign_id", campaign_id)
+                .eq("status", status)
+                .neq("do_not_contact", True)
+                .execute()
+            )
+            eligible[status] = er.count if er.count is not None else len(er.data or [])
+        except Exception:
+            eligible[status] = 0
+
+    return {
+        "ok": True,
+        "ai_calls_enabled": camp.get("ai_calls_enabled", False),
+        "ai_call_delay_minutes": camp.get("ai_call_delay_minutes", 10),
+        "total_ai_calls": total,
+        "calls_today": calls_today,
+        "calls_last_24h": calls_24h,
+        "answer_rate": answer_rate,
+        "avg_duration_seconds": int(avg_duration),
+        "recent_calls": recent_formatted,
+        "eligible_leads": eligible,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PHONE NUMBERS ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -442,16 +1319,383 @@ async def list_phone_numbers(request: Request, campaign_id: str):
     _validate_auth(request, campaign_id)
 
     try:
-        r = (
-            sb.table("phone_numbers")
-            .select("*")
-            .eq("campaign_id", campaign_id)
-            .order("created_at", desc=True)
-            .execute()
-        )
+        # Try with health columns (after migration 011)
+        try:
+            r = (
+                sb.table("phone_numbers")
+                .select("*")
+                .eq("campaign_id", campaign_id)
+                .neq("status", "retired")
+                .order("status", desc=False)
+                .order("answer_rate", desc=True)
+                .execute()
+            )
+        except Exception:
+            # Fallback: order by created_at only (before migration)
+            r = (
+                sb.table("phone_numbers")
+                .select("*")
+                .eq("campaign_id", campaign_id)
+                .order("created_at", desc=True)
+                .execute()
+            )
         return {"data": r.data or [], "count": len(r.data or [])}
     except Exception as exc:
         logger.error("list_phones_failed err=%s", str(exc)[:300])
         raise HTTPException(
             status_code=500, detail="failed to list phone numbers"
         )
+
+
+@router.get("/phone-numbers/stats")
+async def phone_numbers_stats(request: Request, campaign_id: str):
+    """Get number pool statistics for a campaign."""
+    _validate_auth(request, campaign_id)
+    stats = await get_pool_stats(campaign_id)
+    return {"ok": True, **stats}
+
+
+class AddPhoneNumberRequest(BaseModel):
+    campaign_id: str
+    number: str
+    country: str = "US"
+    org_id: str = ""
+
+
+@router.post("/phone-numbers")
+async def add_phone_number(request: Request, body: AddPhoneNumberRequest):
+    """Manually add a phone number to the pool."""
+    _validate_auth(request, body.campaign_id)
+
+    try:
+        row = {
+            "campaign_id": body.campaign_id,
+            "org_id": body.org_id or None,
+            "number": body.number.strip(),
+            "country": body.country,
+            "provider": "telnyx",
+            "type": "local",
+            "status": "active",
+            "max_calls_per_day": 50,
+        }
+        r = sb.table("phone_numbers").insert(row).execute()
+        return {"ok": True, "data": (r.data or [None])[0]}
+    except Exception as exc:
+        logger.error("add_phone_failed err=%s", str(exc)[:300])
+        raise HTTPException(status_code=500, detail="failed to add phone number")
+
+
+class SyncNumbersRequest(BaseModel):
+    campaign_id: str
+    org_id: str = ""
+
+
+@router.post("/phone-numbers/sync")
+async def sync_phone_numbers(request: Request, body: SyncNumbersRequest):
+    """Import existing Telnyx numbers into the pool."""
+    _validate_auth(request, body.campaign_id)
+
+    # Fetch campaign for API key
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("*")
+            .eq("id", body.campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception:
+        campaign = None
+
+    imported = await import_existing_numbers(
+        campaign_id=body.campaign_id,
+        org_id=body.org_id,
+        campaign=campaign,
+    )
+    return {"ok": True, "imported": len(imported), "numbers": imported}
+
+
+@router.get("/phone-numbers/available")
+async def available_telnyx_numbers(request: Request, campaign_id: str):
+    """List all Telnyx numbers with their campaign assignment info."""
+    _validate_auth(request, campaign_id)
+
+    # Fetch campaign for API key
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("*")
+            .eq("id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception:
+        campaign = None
+
+    numbers = await list_available_telnyx_numbers(
+        campaign_id=campaign_id,
+        campaign=campaign,
+    )
+    return {"ok": True, "data": numbers, "count": len(numbers)}
+
+
+class SyncSelectedRequest(BaseModel):
+    campaign_id: str
+    org_id: str = ""
+    numbers: list[dict] = []  # [{phone_number, telnyx_id}, ...]
+
+
+@router.post("/phone-numbers/sync-selected")
+async def sync_selected_numbers(request: Request, body: SyncSelectedRequest):
+    """Import selected Telnyx numbers into the pool."""
+    _validate_auth(request, body.campaign_id)
+
+    imported = await import_selected_numbers(
+        campaign_id=body.campaign_id,
+        org_id=body.org_id,
+        telnyx_numbers=body.numbers,
+    )
+    return {"ok": True, "imported": len(imported), "numbers": imported}
+
+
+class PurchaseNumberRequest(BaseModel):
+    campaign_id: str
+    org_id: str = ""
+    country: str = "US"
+    area_code: str = ""
+
+
+@router.post("/phone-numbers/purchase")
+async def purchase_phone_number(request: Request, body: PurchaseNumberRequest):
+    """Purchase a new phone number from Telnyx and add to pool."""
+    _validate_auth(request, body.campaign_id)
+
+    # Fetch campaign for API key and connection ID
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("*")
+            .eq("id", body.campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception:
+        campaign = None
+
+    result = await purchase_number(
+        campaign_id=body.campaign_id,
+        org_id=body.org_id,
+        campaign=campaign,
+        country=body.country,
+        area_code=body.area_code,
+    )
+    if not result:
+        raise HTTPException(status_code=500, detail="failed to purchase number")
+
+    return {"ok": True, "data": result}
+
+
+@router.delete("/phone-numbers/{phone_number_id}")
+async def delete_phone_number(request: Request, phone_number_id: str, campaign_id: str):
+    """Retire a phone number (release from Telnyx and mark retired)."""
+    _validate_auth(request, campaign_id)
+
+    # Fetch campaign for API key
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("*")
+            .eq("id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception:
+        campaign = None
+
+    success = await release_number(
+        phone_number_id=phone_number_id,
+        campaign_id=campaign_id,
+        campaign=campaign,
+    )
+    if not success:
+        raise HTTPException(status_code=500, detail="failed to release number")
+
+    return {"ok": True}
+
+
+# ─── AI Call Diagnostics ─────────────────────────────────────────────────────
+
+
+@router.get("/ai-calls/diagnostics")
+async def ai_calls_diagnostics(request: Request, campaign_id: str):
+    """Diagnostic endpoint to check AI call configuration for a campaign.
+
+    Returns a checklist of all requirements for AI calls to work,
+    highlighting which are passing and which are failing.
+    """
+    _validate_auth(request, campaign_id)
+
+    from datetime import datetime, timedelta, timezone
+    from ..services.delayed_call_scheduler import _resolve_telnyx_credentials
+
+    checks: list[dict] = []
+    now = datetime.now(timezone.utc)
+
+    # 1. Campaign exists
+    try:
+        cr = (
+            sb.table("campaigns")
+            .select("*")
+            .eq("id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        campaign = (cr.data or [None])[0]
+    except Exception as exc:
+        return {"ok": False, "error": f"Failed to fetch campaign: {str(exc)[:200]}"}
+
+    checks.append({
+        "check": "Campaign exists",
+        "pass": bool(campaign),
+        "detail": campaign.get("name", "") if campaign else "NOT FOUND",
+    })
+    if not campaign:
+        return {"ok": False, "checks": checks}
+
+    # 2. ai_calls_enabled
+    ai_enabled = bool(campaign.get("ai_calls_enabled"))
+    checks.append({
+        "check": "ai_calls_enabled",
+        "pass": ai_enabled,
+        "detail": str(ai_enabled),
+    })
+
+    # 3. Telnyx API key
+    api_key, conn_id = _resolve_telnyx_credentials(campaign)
+    has_api_key = bool(api_key)
+    api_key_source = "campaign" if (campaign.get("telnyx_api_key") or "").strip() else ("global" if api_key else "MISSING")
+    checks.append({
+        "check": "Telnyx API key",
+        "pass": has_api_key,
+        "detail": f"Source: {api_key_source}" + (f" ({api_key[:8]}...)" if api_key else ""),
+    })
+
+    # 4. Telnyx connection ID
+    has_conn = bool(conn_id)
+    conn_source = "campaign" if (
+        (campaign.get("telnyx_webrtc_credential_id") or "").strip()
+        or (campaign.get("telnyx_sip_connection_id") or "").strip()
+    ) else ("global" if conn_id else "MISSING")
+    checks.append({
+        "check": "Telnyx connection ID",
+        "pass": has_conn,
+        "detail": f"Source: {conn_source}" + (f" ({conn_id[:12]}...)" if conn_id else ""),
+    })
+
+    # 5. From number available
+    from_number = (campaign.get("telnyx_from_number") or "").strip()
+    if not from_number:
+        from_number = settings.telnyx_from_number
+    checks.append({
+        "check": "From number (fallback)",
+        "pass": bool(from_number),
+        "detail": from_number or "MISSING — need telnyx_from_number or number pool",
+    })
+
+    # 6. Number pool status
+    try:
+        pool_stats = await get_pool_stats(campaign_id)
+        pool_active = pool_stats.get("active", 0)
+        checks.append({
+            "check": "Number pool",
+            "pass": pool_active > 0 or bool(from_number),
+            "detail": f"active={pool_active} warming={pool_stats.get('warming', 0)} (fallback={from_number or 'none'})",
+        })
+    except Exception:
+        checks.append({
+            "check": "Number pool",
+            "pass": bool(from_number),
+            "detail": f"Query failed, fallback={from_number or 'none'}",
+        })
+
+    # 7. Webhook URL
+    has_webhook = bool(settings.public_base_url)
+    checks.append({
+        "check": "Webhook URL (PUBLIC_BASE_URL)",
+        "pass": has_webhook,
+        "detail": f"{settings.public_base_url}/v1/calls/telnyx/webhooks/{campaign_id}" if has_webhook else "MISSING",
+    })
+
+    # 8. Active spartan sessions (informational)
+    active_agents = get_active_sessions(campaign_id)
+    checks.append({
+        "check": "Active spartan agents",
+        "pass": True,
+        "detail": f"{len(active_agents)} agent(s) online (AI calls proceed regardless)",
+    })
+
+    # 9. Eligible leads count
+    try:
+        eligible_r = (
+            sb.table("leads")
+            .select("lead_id", count="exact")
+            .eq("campaign_id", campaign_id)
+            .eq("status", "NEW")
+            .neq("do_not_contact", True)
+            .execute()
+        )
+        eligible_count = eligible_r.count or 0
+        checks.append({
+            "check": "Eligible NEW leads",
+            "pass": eligible_count > 0,
+            "detail": f"{eligible_count} leads in NEW status",
+        })
+    except Exception:
+        checks.append({
+            "check": "Eligible NEW leads",
+            "pass": False,
+            "detail": "Query failed",
+        })
+
+    # 10. Recent AI calls (last 24h)
+    try:
+        recent_r = (
+            sb.table("call_records")
+            .select("id", count="exact")
+            .eq("campaign_id", campaign_id)
+            .eq("caller_type", "ai")
+            .gte("created_at", (now - timedelta(hours=24)).isoformat())
+            .execute()
+        )
+        recent_count = recent_r.count or 0
+        checks.append({
+            "check": "Recent AI calls (24h)",
+            "pass": True,
+            "detail": f"{recent_count} AI calls in last 24 hours",
+        })
+    except Exception:
+        checks.append({
+            "check": "Recent AI calls (24h)",
+            "pass": True,
+            "detail": "Query failed",
+        })
+
+    # 11. ai_call_delay_minutes
+    delay_min = campaign.get("ai_call_delay_minutes") or 10
+    checks.append({
+        "check": "AI call delay",
+        "pass": True,
+        "detail": f"{delay_min} minutes after lead event",
+    })
+
+    all_pass = all(c["pass"] for c in checks)
+    return {
+        "ok": all_pass,
+        "campaign_id": campaign_id,
+        "campaign_name": campaign.get("name", ""),
+        "checks": checks,
+    }
