@@ -322,6 +322,34 @@ async def webrtc_call_ended(request: Request, body: CallEndedRequest):
             "call_ended_record_update_failed record=%s", body.record_id
         )
 
+    # Update lead status based on outcome
+    if body.outcome in ("vip_interesado", "confirmed", "callback"):
+        lead_id = ""
+        try:
+            rec_r = sb.table("call_records").select("lead_id").eq("id", body.record_id).limit(1).execute()
+            rec_data = (rec_r.data or [None])[0]
+            if rec_data:
+                lead_id = rec_data.get("lead_id", "")
+        except Exception:
+            pass
+
+        if lead_id:
+            lead_updates: dict[str, str] = {}
+            if body.outcome == "vip_interesado":
+                lead_updates["tier_interest"] = "VIP"
+                lead_updates["status"] = "VIP_INTERESTED"
+            elif body.outcome == "confirmed":
+                lead_updates["status"] = "GENERAL_CONFIRMED"
+            elif body.outcome == "callback":
+                lead_updates["status"] = "CALLBACK_REQUESTED"
+
+            if lead_updates:
+                try:
+                    sb.table("leads").update(lead_updates).eq("lead_id", lead_id).execute()
+                    logger.info("lead_status_updated lead=%s outcome=%s", lead_id, body.outcome)
+                except Exception as exc:
+                    logger.error("lead_status_update_failed lead=%s err=%s", lead_id, str(exc)[:200])
+
     # Complete the queue entry if applicable
     if body.queue_id:
         complete_call(

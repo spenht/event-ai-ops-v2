@@ -251,18 +251,23 @@ async def cancel_queued_call(queue_id: str, request: Request):
 async def list_records(
     request: Request,
     campaign_id: str,
+    user_id: str = "",
     limit: int = 50,
     offset: int = 0,
 ):
-    """List call records (history) for a campaign."""
+    """List call records (history) for a campaign, optionally filtered by agent."""
     _validate_auth(request, campaign_id)
 
     try:
-        r = (
+        q = (
             sb.table("call_records")
             .select("*")
             .eq("campaign_id", campaign_id)
-            .order("created_at", desc=True)
+        )
+        if user_id:
+            q = q.eq("user_id", user_id)
+        r = (
+            q.order("created_at", desc=True)
             .range(offset, offset + limit - 1)
             .execute()
         )
@@ -560,6 +565,18 @@ async def team_stats(request: Request, campaign_id: str):
 
     # Sort by calls_today desc
     results.sort(key=lambda x: x["calls_today"], reverse=True)
+
+    # Enrich with agent emails from org_members
+    agent_ids = [r["user_id"] for r in results]
+    if agent_ids:
+        try:
+            mr = sb.table("org_members").select("user_id, email, display_name").in_("user_id", agent_ids).execute()
+            email_map = {m["user_id"]: m.get("email") or m.get("display_name") or "" for m in (mr.data or []) if m.get("user_id")}
+            for r in results:
+                r["email"] = email_map.get(r["user_id"], "")
+        except Exception:
+            pass
+
     return {"data": results, "count": len(results)}
 
 
@@ -653,6 +670,17 @@ async def team_stats_detailed(request: Request, campaign_id: str):
         )
 
     agent_results.sort(key=lambda x: x["calls_today"], reverse=True)
+
+    # 4b. Enrich with agent emails from org_members
+    agent_ids = [a["user_id"] for a in agent_results]
+    if agent_ids:
+        try:
+            mr = sb.table("org_members").select("user_id, email, display_name").in_("user_id", agent_ids).execute()
+            email_map = {m["user_id"]: m.get("email") or m.get("display_name") or "" for m in (mr.data or []) if m.get("user_id")}
+            for a in agent_results:
+                a["email"] = email_map.get(a["user_id"], "")
+        except Exception:
+            pass
 
     # 5. Build summary
     total_calls = sum(a["calls_today"] for a in agent_results)

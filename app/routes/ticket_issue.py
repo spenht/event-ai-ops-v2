@@ -468,14 +468,14 @@ async def ticket_issue_process(campaign_id: str, request: Request, key: str = ""
     # 5. Generate ticket
     facts = _event_facts_from_campaign(campaign)
     ticket_config = campaign.get("ticket_config") if isinstance(campaign.get("ticket_config"), dict) else None
+    if ticket_config:
+        facts["ticket_config"] = ticket_config
 
     try:
         ticket = generate_ticket_png(
             lead=lead,
             tier=tier_display,
             event=facts,
-            ticket_config=ticket_config,
-            campaign_id=campaign_id,
         )
     except Exception as exc:
         logger.error("ticket_gen_failed lead=%s err=%s", lead_id, str(exc)[:200])

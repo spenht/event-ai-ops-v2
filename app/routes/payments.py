@@ -20,7 +20,7 @@ logger = logging.getLogger("payments")
 router = APIRouter(prefix="/v1/payments", tags=["payments"])
 
 
-def _event_facts(event_id: str | None) -> dict:
+def _event_facts(event_id: str | None, campaign_id: str | None = None) -> dict:
     # Minimal (ENV overrides DB)
     event = {}
     if event_id:
@@ -30,12 +30,24 @@ def _event_facts(event_id: str | None) -> dict:
         except Exception:
             event = {}
 
+    # Load ticket_config from campaign if available
+    ticket_config: dict = {}
+    campaign: dict = {}
+    if campaign_id:
+        try:
+            cr = sb.table("campaigns").select("ticket_config,event_name,event_date,event_location,event_speakers,vip_price_display").eq("id", campaign_id).limit(1).execute()
+            campaign = (cr.data or [{}])[0] or {}
+            ticket_config = campaign.get("ticket_config") or {}
+        except Exception:
+            pass
+
     return {
         "event_id": event_id,
-        "event_name": (event.get("event_name") or settings.event_name or "Evento").strip(),
-        "event_date": (str(event.get("starts_at") or "") or settings.event_date or "").strip(),
-        "event_place": (event.get("address") or settings.event_place or "").strip(),
-        "event_speakers": (event.get("speakers") or settings.event_speakers or "").strip(),
+        "event_name": (campaign.get("event_name") or event.get("event_name") or settings.event_name or "Evento").strip(),
+        "event_date": (campaign.get("event_date") or str(event.get("starts_at") or "") or settings.event_date or "").strip(),
+        "event_place": (campaign.get("event_location") or event.get("address") or settings.event_place or "").strip(),
+        "event_speakers": (campaign.get("event_speakers") or event.get("speakers") or settings.event_speakers or "").strip(),
+        "ticket_config": ticket_config,
     }
 
 
@@ -44,12 +56,10 @@ async def create_link(payload: dict):
     """Create a Stripe Checkout session for VIP.
 
     payload: {lead_id, event_id, tier, price_id, success_url, cancel_url}
+
+    Automatically routes through Stripe Connect when the lead's campaign org
+    has a connected Stripe account. Falls back to direct charge otherwise.
     """
-    if not settings.stripe_secret_key:
-        raise HTTPException(status_code=500, detail="Missing STRIPE_SECRET_KEY")
-
-    stripe.api_key = settings.stripe_secret_key
-
     lead_id = (payload.get("lead_id") or "").strip()
     if not lead_id:
         raise HTTPException(status_code=400, detail="lead_id required")
@@ -63,37 +73,96 @@ async def create_link(payload: dict):
     tier = (payload.get("tier") or "VIP").strip().upper()
 
     price_id = (payload.get("price_id") or settings.stripe_vip_price_id).strip()
-    if not price_id:
-        raise HTTPException(status_code=500, detail="Missing STRIPE_VIP_PRICE_ID")
-
     success_url = (payload.get("success_url") or settings.stripe_success_url or "").strip()
     cancel_url = (payload.get("cancel_url") or settings.stripe_cancel_url or "").strip()
-    if not success_url or not cancel_url:
-        raise HTTPException(status_code=500, detail="Missing STRIPE_SUCCESS_URL / STRIPE_CANCEL_URL")
 
-    try:
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            line_items=[{"price": price_id, "quantity": 1}],
-            success_url=success_url + "?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url=cancel_url,
-            customer_email=lead.get("email") or None,
-            metadata={
-                "lead_id": lead_id,
-                "event_id": event_id or "",
-                "tier": tier,
-                "whatsapp": lead.get("whatsapp") or "",
-            },
-        )
-    except Exception as e:
-        logger.exception("stripe_create_session_failed %s", str(e)[:300])
-        raise HTTPException(status_code=500, detail="stripe create session failed")
+    # Check if org has Stripe Connect — route through platform
+    stripe_account_id = None
+    campaign_id = lead.get("campaign_id") or ""
+    if campaign_id and settings.stripe_platform_secret_key:
+        try:
+            camp_r = sb.table("campaigns").select("org_id").eq("id", campaign_id).limit(1).execute()
+            camp = (camp_r.data or [None])[0]
+            if camp and camp.get("org_id"):
+                org_r = sb.table("orgs").select("stripe_account_id, stripe_account_status").eq("id", camp["org_id"]).limit(1).execute()
+                org = (org_r.data or [None])[0]
+                if org and org.get("stripe_account_id") and org.get("stripe_account_status") == "active":
+                    stripe_account_id = org["stripe_account_id"]
+        except Exception:
+            pass
+
+    if stripe_account_id:
+        # ── Connect flow (destination charge) ──
+        stripe.api_key = settings.stripe_platform_secret_key
+
+        if not price_id:
+            raise HTTPException(status_code=500, detail="Missing price_id for Connect checkout")
+        if not success_url or not cancel_url:
+            raise HTTPException(status_code=500, detail="Missing success/cancel URL")
+
+        fee_percent = float(payload.get("fee_percent", 4.5))
+
+        try:
+            session = stripe.checkout.Session.create(
+                mode="payment",
+                line_items=[{"price": price_id, "quantity": 1}],
+                success_url=success_url + "?session_id={CHECKOUT_SESSION_ID}",
+                cancel_url=cancel_url,
+                customer_email=lead.get("email") or None,
+                payment_intent_data={
+                    "application_fee_amount": None,  # auto-calculated by Stripe based on line item
+                    "transfer_data": {"destination": stripe_account_id},
+                },
+                metadata={
+                    "lead_id": lead_id,
+                    "event_id": event_id or "",
+                    "campaign_id": campaign_id,
+                    "tier": tier,
+                    "whatsapp": lead.get("whatsapp") or "",
+                    "connect": "true",
+                },
+            )
+        except Exception as e:
+            logger.exception("stripe_connect_session_failed %s", str(e)[:300])
+            raise HTTPException(status_code=500, detail="stripe connect session failed")
+
+        channel = "stripe_connect"
+    else:
+        # ── Direct charge (legacy) ──
+        if not settings.stripe_secret_key:
+            raise HTTPException(status_code=500, detail="Missing STRIPE_SECRET_KEY")
+        stripe.api_key = settings.stripe_secret_key
+
+        if not price_id:
+            raise HTTPException(status_code=500, detail="Missing STRIPE_VIP_PRICE_ID")
+        if not success_url or not cancel_url:
+            raise HTTPException(status_code=500, detail="Missing STRIPE_SUCCESS_URL / STRIPE_CANCEL_URL")
+
+        try:
+            session = stripe.checkout.Session.create(
+                mode="payment",
+                line_items=[{"price": price_id, "quantity": 1}],
+                success_url=success_url + "?session_id={CHECKOUT_SESSION_ID}",
+                cancel_url=cancel_url,
+                customer_email=lead.get("email") or None,
+                metadata={
+                    "lead_id": lead_id,
+                    "event_id": event_id or "",
+                    "tier": tier,
+                    "whatsapp": lead.get("whatsapp") or "",
+                },
+            )
+        except Exception as e:
+            logger.exception("stripe_create_session_failed %s", str(e)[:300])
+            raise HTTPException(status_code=500, detail="stripe create session failed")
+
+        channel = "stripe"
 
     try:
         sb.table("touchpoints").insert(
             {
                 "lead_id": lead_id,
-                "channel": "stripe",
+                "channel": channel,
                 "event_type": "checkout_created",
                 "payload": {"session_id": session.id, "url": session.url, "tier": tier, "event_id": event_id},
             }
@@ -169,7 +238,7 @@ async def stripe_webhook(request: Request):
 
             wa = (lead.get("whatsapp") or meta.get("whatsapp") or "").strip()
             if wa:
-                facts = _event_facts(event_id or lead.get("event_id"))
+                facts = _event_facts(event_id or lead.get("event_id"), campaign_id=lead.get("campaign_id"))
                 ticket = generate_ticket_png(lead=lead, tier=tier, event=facts)
                 if not settings.public_base_url:
                     # Best effort; still send without media

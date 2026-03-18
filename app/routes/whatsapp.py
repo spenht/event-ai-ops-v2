@@ -510,6 +510,7 @@ def _event_facts(event_id: Optional[str], campaign_data: dict | None = None) -> 
 
     # If we have campaign data from DB, prefer it over events table and env
     c = campaign_data or {}
+    ticket_config = c.get("ticket_config") or {}
 
     return {
         "event_id": event_id or "",
@@ -543,6 +544,7 @@ def _event_facts(event_id: Optional[str], campaign_data: dict | None = None) -> 
             or settings.vip_price
             or ""
         ).strip(),
+        "ticket_config": ticket_config,
     }
 
 
