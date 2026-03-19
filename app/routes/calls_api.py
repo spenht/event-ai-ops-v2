@@ -174,11 +174,11 @@ async def enqueue(request: Request, body: EnqueueRequest):
 
 
 @router.post("/queue/next")
-async def next_call(request: Request, campaign_id: str, user_id: str = ""):
+async def next_call(request: Request, campaign_id: str):
     """Get the next call to dial for a campaign."""
     _validate_auth(request, campaign_id)
 
-    call = get_next_call(campaign_id, agent_id=user_id or None)
+    call = get_next_call(campaign_id)
     if not call:
         return {"data": None, "message": "no pending calls"}
     return {"data": call}
@@ -252,7 +252,6 @@ class BulkRequeueRequest(BaseModel):
     call_type: str = "followup"
     priority: int = 0
     filters: dict = {}  # e.g. {"no_answer": true, "not_confirmed": true, "no_vip": true}
-    assignment_mode: str = "random"  # "random" | "prefer_original" | "force_original"
 
 
 @router.post("/queue/bulk-requeue")
@@ -351,11 +350,63 @@ async def bulk_requeue(request: Request, body: BulkRequeueRequest):
                 if not type_calls:
                     selected_lead_ids.add(lid)
 
-        if filters.get("status_in"):
-            allowed = {s.upper() for s in filters["status_in"]}
+        if filters.get("confirmed"):
+            # Leads whose status IS CONFIRMED
             for lead in eligible:
-                if (lead.get("status") or "").upper() in allowed:
+                if (lead.get("status") or "").upper() == "CONFIRMED":
                     selected_lead_ids.add(lead["lead_id"])
+
+        if filters.get("answered"):
+            # Leads that were called and answered (have a completed call)
+            for lead in eligible:
+                lid = lead["lead_id"]
+                calls = lead_calls.get(lid, [])
+                type_calls = [c for c in calls if c.get("caller_type") == caller_type]
+                if type_calls and any(c.get("status") == "completed" for c in type_calls):
+                    selected_lead_ids.add(lid)
+
+        if filters.get("vip_interested"):
+            # Leads whose tier_interest IS VIP (they showed interest but haven't paid)
+            for lead in eligible:
+                if (lead.get("tier_interest") or "").upper() == "VIP" and (lead.get("payment_status") or "").upper() != "PAID":
+                    selected_lead_ids.add(lead["lead_id"])
+
+        if filters.get("vip_paid"):
+            # Leads who already paid VIP
+            for lead in eligible:
+                if (lead.get("payment_status") or "").upper() == "PAID" and (lead.get("tier_interest") or "").upper() == "VIP":
+                    selected_lead_ids.add(lead["lead_id"])
+
+        if filters.get("general_only"):
+            # Leads who are general (not VIP interest, not paid)
+            for lead in eligible:
+                if (lead.get("tier_interest") or "").upper() != "VIP" and (lead.get("payment_status") or "").upper() != "PAID":
+                    selected_lead_ids.add(lead["lead_id"])
+
+        if filters.get("not_paid"):
+            # Leads who haven't paid anything
+            for lead in eligible:
+                if (lead.get("payment_status") or "").upper() != "PAID":
+                    selected_lead_ids.add(lead["lead_id"])
+
+        if filters.get("status_in"):
+            allowed = [s.upper() for s in (filters["status_in"] if isinstance(filters["status_in"], list) else [])]
+            if allowed:
+                for lead in eligible:
+                    if (lead.get("status") or "").upper() in allowed:
+                        selected_lead_ids.add(lead["lead_id"])
+
+        if filters.get("outcome_in"):
+            # Leads whose LAST call had a specific outcome (e.g. ["callback", "interested"])
+            allowed_outcomes = [o.lower() for o in (filters["outcome_in"] if isinstance(filters["outcome_in"], list) else [])]
+            if allowed_outcomes:
+                for lead in eligible:
+                    lid = lead["lead_id"]
+                    calls = lead_calls.get(lid, [])
+                    if calls:
+                        last_outcome = (calls[-1].get("outcome") or "").lower()
+                        if last_outcome in allowed_outcomes:
+                            selected_lead_ids.add(lid)
 
         if not filters:
             # No filters = re-queue all eligible leads
@@ -372,35 +423,12 @@ async def bulk_requeue(request: Request, body: BulkRequeueRequest):
                 "message": "No new leads to enqueue — all matching leads are already in queue",
             }
 
-        # 6b. Build lead → last spartan agent mapping for smart assignment
-        lead_agent_map: dict[str, str] = {}
-        if body.assignment_mode != "random" and to_enqueue:
-            try:
-                all_records = (
-                    sb.table("call_records")
-                    .select("lead_id, caller_id, created_at")
-                    .eq("campaign_id", body.campaign_id)
-                    .eq("caller_type", "spartan")
-                    .in_("lead_id", list(to_enqueue)[:500])
-                    .order("created_at", desc=True)
-                    .execute()
-                )
-                seen: set[str] = set()
-                for rec in (all_records.data or []):
-                    lid = rec["lead_id"]
-                    if lid not in seen and rec.get("caller_id"):
-                        lead_agent_map[lid] = rec["caller_id"]
-                        seen.add(lid)
-            except Exception:
-                logger.warning("failed to build lead_agent_map, falling back to random")
-
         # 7. Bulk insert into call_queue
         from uuid import uuid4
 
         now = datetime.now(timezone.utc).isoformat()
-        rows = []
-        for lid in to_enqueue:
-            row = {
+        rows = [
+            {
                 "id": str(uuid4()),
                 "campaign_id": body.campaign_id,
                 "lead_id": lid,
@@ -413,10 +441,8 @@ async def bulk_requeue(request: Request, body: BulkRequeueRequest):
                 "max_cycles": 7,
                 "created_at": now,
             }
-            agent = lead_agent_map.get(lid)
-            if agent:
-                row["preferred_agent"] = agent
-            rows.append(row)
+            for lid in to_enqueue
+        ]
 
         # Insert in batches of 200
         total_inserted = 0
@@ -462,23 +488,18 @@ async def bulk_requeue(request: Request, body: BulkRequeueRequest):
 async def list_records(
     request: Request,
     campaign_id: str,
-    user_id: str = "",
     limit: int = 50,
     offset: int = 0,
 ):
-    """List call records (history) for a campaign, optionally filtered by agent."""
+    """List call records (history) for a campaign."""
     _validate_auth(request, campaign_id)
 
     try:
-        q = (
+        r = (
             sb.table("call_records")
             .select("*")
             .eq("campaign_id", campaign_id)
-        )
-        if user_id:
-            q = q.eq("caller_id", user_id)
-        r = (
-            q.order("created_at", desc=True)
+            .order("created_at", desc=True)
             .range(offset, offset + limit - 1)
             .execute()
         )
@@ -776,18 +797,6 @@ async def team_stats(request: Request, campaign_id: str):
 
     # Sort by calls_today desc
     results.sort(key=lambda x: x["calls_today"], reverse=True)
-
-    # Enrich with agent emails from org_members
-    agent_ids = [r["user_id"] for r in results]
-    if agent_ids:
-        try:
-            mr = sb.table("org_members").select("user_id, email, display_name").in_("user_id", agent_ids).execute()
-            email_map = {m["user_id"]: m.get("email") or m.get("display_name") or "" for m in (mr.data or []) if m.get("user_id")}
-            for r in results:
-                r["email"] = email_map.get(r["user_id"], "")
-        except Exception:
-            pass
-
     return {"data": results, "count": len(results)}
 
 
@@ -881,17 +890,6 @@ async def team_stats_detailed(request: Request, campaign_id: str):
         )
 
     agent_results.sort(key=lambda x: x["calls_today"], reverse=True)
-
-    # 4b. Enrich with agent emails from org_members
-    agent_ids = [a["user_id"] for a in agent_results]
-    if agent_ids:
-        try:
-            mr = sb.table("org_members").select("user_id, email, display_name").in_("user_id", agent_ids).execute()
-            email_map = {m["user_id"]: m.get("email") or m.get("display_name") or "" for m in (mr.data or []) if m.get("user_id")}
-            for a in agent_results:
-                a["email"] = email_map.get(a["user_id"], "")
-        except Exception:
-            pass
 
     # 5. Build summary
     total_calls = sum(a["calls_today"] for a in agent_results)
