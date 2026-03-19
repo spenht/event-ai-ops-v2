@@ -536,7 +536,7 @@ Summary:"""
                 # Append to lead's existing notes/tags
                 existing_lead = (
                     sb.table("leads")
-                    .select("notes, tags")
+                    .select("notes")
                     .eq("lead_id", lead_id)
                     .limit(1)
                     .execute()

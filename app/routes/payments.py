@@ -93,7 +93,7 @@ async def create_link(payload: dict):
 
     if stripe_account_id:
         # ── Connect flow (destination charge) ──
-        stripe.api_key = settings.stripe_platform_secret_key
+        _stripe_key = settings.stripe_platform_secret_key
 
         if not price_id:
             raise HTTPException(status_code=500, detail="Missing price_id for Connect checkout")
@@ -121,6 +121,7 @@ async def create_link(payload: dict):
                     "whatsapp": lead.get("whatsapp") or "",
                     "connect": "true",
                 },
+                api_key=_stripe_key,
             )
         except Exception as e:
             logger.exception("stripe_connect_session_failed %s", str(e)[:300])
@@ -131,7 +132,7 @@ async def create_link(payload: dict):
         # ── Direct charge (legacy) ──
         if not settings.stripe_secret_key:
             raise HTTPException(status_code=500, detail="Missing STRIPE_SECRET_KEY")
-        stripe.api_key = settings.stripe_secret_key
+        _stripe_key = settings.stripe_secret_key
 
         if not price_id:
             raise HTTPException(status_code=500, detail="Missing STRIPE_VIP_PRICE_ID")
@@ -151,6 +152,7 @@ async def create_link(payload: dict):
                     "tier": tier,
                     "whatsapp": lead.get("whatsapp") or "",
                 },
+                api_key=_stripe_key,
             )
         except Exception as e:
             logger.exception("stripe_create_session_failed %s", str(e)[:300])
@@ -177,8 +179,6 @@ async def create_link(payload: dict):
 async def stripe_webhook(request: Request):
     if not settings.stripe_secret_key or not settings.stripe_webhook_secret:
         raise HTTPException(status_code=500, detail="Missing stripe config")
-
-    stripe.api_key = settings.stripe_secret_key
 
     raw = await request.body()
     sig = request.headers.get("stripe-signature", "")
@@ -216,7 +216,7 @@ async def stripe_webhook(request: Request):
             try:
                 sb.table("leads").update({"payment_status": "PAID", "status": f"{tier}_PAID"}).eq("lead_id", lead_id).execute()
             except Exception:
-                pass
+                logger.exception("webhook_lead_status_update_failed lead=%s", lead_id)
 
             # Generate ticket + send
             lead_res = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1).execute()
@@ -238,6 +238,18 @@ async def stripe_webhook(request: Request):
 
             wa = (lead.get("whatsapp") or meta.get("whatsapp") or "").strip()
             if wa:
+                # Idempotency: check if ticket was already sent for this lead
+                _already_sent = False
+                try:
+                    _ts_r = sb.table("touchpoints").select("id").eq("lead_id", lead_id).eq("event_type", "ticket_sent").limit(1).execute()
+                    _already_sent = bool(_ts_r.data)
+                except Exception:
+                    pass
+
+                if _already_sent:
+                    logger.info("webhook_ticket_already_sent lead=%s — skipping", lead_id)
+                    return {"ok": True}
+
                 facts = _event_facts(event_id or lead.get("event_id"))
                 # Fetch ticket_config and per-campaign credentials
                 _ticket_cfg = None
@@ -269,14 +281,20 @@ async def stripe_webhook(request: Request):
                     except Exception:
                         pass
                 _evt = facts.get("event_name") or "el evento"
-                ticket = generate_ticket_png(lead=lead, tier=tier, event=facts, ticket_config=_ticket_cfg)
+
+                try:
+                    ticket = generate_ticket_png(lead=lead, tier=tier, event=facts, ticket_config=_ticket_cfg)
+                except Exception:
+                    logger.exception("webhook_ticket_gen_failed lead=%s", lead_id)
+                    raise HTTPException(status_code=500, detail="ticket generation failed — Stripe will retry")
+
                 if not settings.public_base_url:
                     # Best effort; still send without media
                     msg = "✅ Pago recibido. Ya quedaste como VIP.\n\n(Nota: falta PUBLIC_BASE_URL para mandar el QR automático.)"
                     try:
                         await send_whatsapp(wa, msg, **_wa_kw)
                     except Exception:
-                        pass
+                        logger.exception("webhook_whatsapp_ticket_send_failed lead=%s", lead_id)
                 else:
                     media = f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                     msg = (
@@ -287,7 +305,8 @@ async def stripe_webhook(request: Request):
                     try:
                         await send_whatsapp(wa, msg, media_urls=[media], **_wa_kw)
                     except Exception as e:
-                        logger.error("send_ticket_failed %s", str(e)[:300])
+                        logger.exception("webhook_send_ticket_failed lead=%s", lead_id)
+                        raise HTTPException(status_code=500, detail="ticket WhatsApp send failed — Stripe will retry")
 
                     # Mark ticket as sent so whatsapp handler doesn't re-send
                     try:
@@ -300,14 +319,14 @@ async def stripe_webhook(request: Request):
                             }
                         ).execute()
                     except Exception:
-                        pass
+                        logger.exception("webhook_ticket_sent_touchpoint_failed lead=%s", lead_id)
 
                     # Small delay so WhatsApp delivers the ticket before the video
                     import asyncio
                     await asyncio.sleep(5)
 
                     # Send testimonials video (once)
-                    testimonial_url = (settings.whatsapp_video_testimonios or "").strip() if hasattr(settings, "whatsapp_video_testimonios") else ""
+                    testimonial_url = ((_camp or {}).get("video_testimonials") or "").strip() or ((settings.whatsapp_video_testimonios or "").strip() if hasattr(settings, "whatsapp_video_testimonios") else "")
                     if testimonial_url and testimonial_url.startswith("https://"):
                         try:
                             await send_whatsapp(wa, "🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera 👇", media_urls=[testimonial_url], **_wa_kw)

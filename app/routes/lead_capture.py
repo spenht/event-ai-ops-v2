@@ -404,12 +404,7 @@ async def capture_lead(request: Request, body: CaptureRequest):
                 lead_id=lead_id,
                 event_id=campaign.get("event_id") or "",
                 option=option,
-                stripe_secret_key=campaign.get("stripe_secret_key", ""),
-                stripe_price_ids=campaign.get("stripe_price_ids") or {},
-                stripe_success_url=campaign.get("stripe_success_url", ""),
-                stripe_cancel_url=campaign.get("stripe_cancel_url", ""),
-                campaign_id=body.campaign_id,
-                whatsapp_from=campaign.get("twilio_whatsapp_from", ""),
+                campaign=campaign,
             )
         except Exception as exc:
             logger.error("capture_checkout_failed lead=%s err=%s", lead_id, str(exc)[:200])

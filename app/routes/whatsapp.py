@@ -59,7 +59,7 @@ def _extract_price_label(val: object, default: str = "") -> str:
     return default
 
 
-def _build_vip_pitch(event_name_upper: str, vip_price: str, campaign: dict | None = None) -> str:
+def _build_vip_pitch(event_name_upper: str, vip_price: str, campaign: dict | None = None, facts: dict | None = None) -> str:
     price_ids = (campaign or {}).get("stripe_price_ids") or {}
     p1_raw = price_ids.get("vip_1") or price_ids.get("1")
     p2_raw = price_ids.get("vip_2") or price_ids.get("2")
@@ -71,15 +71,18 @@ def _build_vip_pitch(event_name_upper: str, vip_price: str, campaign: dict | Non
         pricing_block += "\u00bfTe aparto 1 VIP o prefieres aprovechar la promo de 2?"
     else:
         pricing_block += f"\n\u00bfTe aparto tu lugar VIP?"
+    speakers_line = "- Foto con los speakers principales\n"
+    _speakers = ((facts or {}).get("event_speakers") or "").strip()
+    if _speakers:
+        speakers_line = f"- Foto con {_speakers}\n"
     return (
         f"VIP es la forma mas cercana, estrategica y transformadora de vivir *{event_name_upper}*.\n\n"
         "\U0001f525 *Por que ser VIP:*\n"
         "- Asientos preferenciales\n"
         "- Mastermind intimo\n"
         "- Libro firmado\n"
-        "- Foto con Spencer Hoffmann y algunos speakers\n"
+        + speakers_line +
         "- Sorpresas especiales\n\n"
-        "(Por aqui te dejo un mensaje de Spencer sobre el VIP \U0001f447)\n\n"
         "Puedes elegir:\n"
         + pricing_block
     ).strip()
@@ -1214,7 +1217,7 @@ async def _handle_existing_lead(
             if user_wants_vip_info:
                 event_name_upper = (facts.get("event_name") or "BEYOND WEALTH").upper()
                 vip_price = facts.get("vip_price") or "VIP"
-                vip_pitch_text = _build_vip_pitch(event_name_upper, vip_price, _campaign)
+                vip_pitch_text = _build_vip_pitch(event_name_upper, vip_price, _campaign, facts=facts)
 
                 # Log inbound
                 try:
@@ -1410,7 +1413,7 @@ async def _handle_existing_lead(
         ):
             event_name_upper = (facts.get("event_name") or "BEYOND WEALTH").upper()
             vip_price = facts.get("vip_price") or "VIP"
-            vip_pitch_text = _build_vip_pitch(event_name_upper, vip_price, _campaign)
+            vip_pitch_text = _build_vip_pitch(event_name_upper, vip_price, _campaign, facts=facts)
 
             # MESSAGE 1: Send VIP pitch text FIRST (no media)
             try:

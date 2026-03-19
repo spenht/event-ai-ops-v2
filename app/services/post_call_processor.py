@@ -275,10 +275,7 @@ async def handle_vip_follow_up(
             lead_id=lead_id,
             event_id=event_id,
             option=vip_option,
-            stripe_secret_key=campaign.get("stripe_secret_key", ""),
-            stripe_price_ids=campaign.get("stripe_price_ids", ""),
-            success_url=campaign.get("stripe_success_url", ""),
-            cancel_url=campaign.get("stripe_cancel_url", ""),
+            campaign=campaign,
         )
 
         if not checkout_url:

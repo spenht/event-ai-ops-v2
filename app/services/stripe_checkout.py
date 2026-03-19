@@ -82,7 +82,7 @@ async def create_vip_checkout_link(
     option=2  ->  2 VIPs promo (97 USD)
     """
     ensure_config(option=option, campaign=campaign)
-    stripe.api_key = _resolve_stripe_key(campaign)
+    _key = _resolve_stripe_key(campaign)
     price_id = _resolve_price_id(option, campaign)
 
     lead_res = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1).execute()
@@ -108,6 +108,7 @@ async def create_vip_checkout_link(
                 "label": label,
                 "whatsapp": lead.get("whatsapp") or "",
             },
+            api_key=_key,
         )
     except Exception as e:
         logger.exception("stripe_create_session_failed %s", str(e)[:200])
@@ -130,6 +131,6 @@ async def create_vip_checkout_link(
             }
         ).execute()
     except Exception:
-        pass
+        logger.exception("touchpoint_insert_failed lead=%s", lead_id)
 
     return session.url

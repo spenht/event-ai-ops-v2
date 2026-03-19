@@ -370,10 +370,7 @@ async def media_stream(websocket: WebSocket, call_control_id: str):
                     lead_id=lead_id,
                     event_id=event_id_val,
                     option=1,
-                    stripe_secret_key=campaign.get("stripe_secret_key", ""),
-                    stripe_price_ids=campaign.get("stripe_price_ids", ""),
-                    success_url=campaign.get("stripe_success_url", ""),
-                    cancel_url=campaign.get("stripe_cancel_url", ""),
+                    campaign=campaign,
                 )
                 lead_name_wa = lead.get("name", "")
                 if checkout_url:
@@ -503,12 +500,7 @@ async def media_stream(websocket: WebSocket, call_control_id: str):
                     lead_id=lead_id,
                     event_id=event_id_val,
                     option=option,
-                    stripe_secret_key=campaign.get("stripe_secret_key", ""),
-                    stripe_price_ids=campaign.get("stripe_price_ids", ""),
-                    success_url=campaign.get("stripe_success_url", ""),
-                    cancel_url=campaign.get("stripe_cancel_url", ""),
-                    campaign_id=campaign_id,
-                    whatsapp_from=campaign.get("twilio_whatsapp_from", ""),
+                    campaign=campaign,
                 )
                 if checkout_url:
                     lead_name_wa = lead.get("name", "")

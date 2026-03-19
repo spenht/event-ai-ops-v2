@@ -450,7 +450,7 @@ async def list_records(
             .eq("campaign_id", campaign_id)
         )
         if user_id:
-            q = q.eq("user_id", user_id)
+            q = q.eq("caller_id", user_id)
         r = (
             q.order("created_at", desc=True)
             .range(offset, offset + limit - 1)

@@ -38,7 +38,7 @@ def _scanner_html(key: str) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Check-in — Beyond Wealth</title>
+<title>Check-in — {settings.event_name}</title>
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <style>
 * {{ margin:0; padding:0; box-sizing:border-box; }}
@@ -127,7 +127,7 @@ body {{
 </head>
 <body>
 <div class="topbar">
-  <h1>BEYOND WEALTH</h1>
+  <h1>{settings.event_name}</h1>
   <div class="sub">Check-in</div>
   <div id="counter">Cargando...</div>
 </div>

@@ -310,10 +310,10 @@ def build_voice_system_prompt(
         if use_elevenlabs:
             # When using the organizer's cloned voice
             ai_identity = (
-                f"Eres la inteligencia artificial de Spencer Hoffmann. "
-                "Hablas con la voz de Spencer. Cuando te presentes di: "
-                "'Soy la inteligencia artificial de Spencer Hoffmann del equipo de Beyond Wealth'. "
-                "Si te preguntan quién eres, repite que eres la IA de Spencer."
+                f"Eres la inteligencia artificial de {character_name}. "
+                f"Hablas con la voz de {character_name}. Cuando te presentes di: "
+                f"'Soy la inteligencia artificial de {character_name} del equipo de {event_name}'. "
+                f"Si te preguntan quién eres, repite que eres la IA de {character_name}."
             )
         else:
             ai_identity = (
@@ -344,8 +344,8 @@ def build_voice_system_prompt(
         "═══ PRONUNCIACIÓN DE TÉRMINOS CLAVE ═══",
         "Estas palabras son en inglés. Pronúncialas CORRECTAMENTE:",
         "- VIP → pronúncialo 'vi-ai-pi' (tres sílabas separadas, NO 'bip' ni 'biaip')",
-        "- Spencer Hoffmann → 'Spencer Jofman'",
-        "- Beyond Wealth → 'Biond Welz'",
+        f"- {character_name} → pronúncialo correctamente",
+        f"- {event_name} → pronúncialo correctamente",
         "- networking → 'net-working'",
         "- QR → 'quiu-ar'",
         "- check-in → 'chek-in'",

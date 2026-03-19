@@ -224,7 +224,7 @@ button:disabled {{
 <body>
 <div class="card">
   <div class="header">
-    <h1>BEYOND WEALTH</h1>
+    <h1>{settings.event_name}</h1>
     <h2>Confirmacion VIP</h2>
   </div>
   <div class="sep"></div>
@@ -300,6 +300,25 @@ async def spartans_confirm(request: Request, key: str = ""):
     lead_id = lead.get("lead_id", "")
     lead_name = (lead.get("name") or "").strip() or "Sin nombre"
 
+    # 4b. Campaign credentials for WhatsApp
+    campaign_id = lead.get("campaign_id") or ""
+    _wa_kw: dict[str, str] = {}
+    if campaign_id:
+        try:
+            cr = sb.table("campaigns").select(
+                "twilio_account_sid,twilio_auth_token,twilio_whatsapp_from,video_testimonials,event_name"
+            ).eq("id", campaign_id).limit(1).execute()
+            _camp = (cr.data or [None])[0]
+            if _camp:
+                if _camp.get("twilio_account_sid"):
+                    _wa_kw["account_sid"] = _camp["twilio_account_sid"]
+                if _camp.get("twilio_auth_token"):
+                    _wa_kw["auth_token"] = _camp["twilio_auth_token"]
+                if _camp.get("twilio_whatsapp_from"):
+                    _wa_kw["whatsapp_from"] = _camp["twilio_whatsapp_from"]
+        except Exception:
+            pass
+
     # 5. Already VIP?
     current_status = (lead.get("status") or "").strip().upper()
     if current_status == "VIP_PAID":
@@ -359,7 +378,7 @@ async def spartans_confirm(request: Request, key: str = ""):
             "(Nota: falta PUBLIC_BASE_URL para mandar el QR automatico.)"
         )
         try:
-            await send_whatsapp(wa, msg)
+            await send_whatsapp(wa, msg, **_wa_kw)
         except Exception:
             pass
     else:
@@ -367,10 +386,10 @@ async def spartans_confirm(request: Request, key: str = ""):
         msg = (
             "✅ ¡Listo! Pago confirmado.\n"
             "Aqui esta tu boleto VIP con tu QR (guardalo).\n\n"
-            "Te voy a compartir un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth."
+            f"Te voy a compartir un video con algunos testimonios para que veas la transformacion que te espera en {facts.get('event_name') or settings.event_name}."
         )
         try:
-            await send_whatsapp(wa, msg, media_urls=[media])
+            await send_whatsapp(wa, msg, media_urls=[media], **_wa_kw)
         except Exception as e:
             logger.error("spartans_send_ticket_failed %s", str(e)[:300])
 
@@ -389,13 +408,14 @@ async def spartans_confirm(request: Request, key: str = ""):
         await asyncio.sleep(5)
 
         # Testimonials video
-        testimonial_url = (settings.whatsapp_video_testimonios or "").strip() if hasattr(settings, "whatsapp_video_testimonios") else ""
+        testimonial_url = ((_camp or {}).get("video_testimonials") or "").strip() or ((settings.whatsapp_video_testimonios or "").strip() if hasattr(settings, "whatsapp_video_testimonios") else "")
         if testimonial_url and testimonial_url.startswith("https://"):
             try:
                 await send_whatsapp(
                     wa,
-                    "🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth 👇",
+                    f"🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en {facts.get('event_name') or settings.event_name} 👇",
                     media_urls=[testimonial_url],
+                    **_wa_kw,
                 )
                 sb.table("touchpoints").insert({
                     "lead_id": lead_id,
@@ -408,13 +428,13 @@ async def spartans_confirm(request: Request, key: str = ""):
 
             # Closing message
             try:
-                event_name = facts.get("event_name") or "Beyond Wealth"
+                event_name = facts.get("event_name") or settings.event_name or "el evento"
                 closing = (
                     f"Estoy muy emocionada de que vayas a ser parte del grupo VIP de *{event_name}*, "
                     "un evento que va a marcar un antes y un despues en tu vida.\n\n"
                     "Cualquier pregunta que tengas, aqui estoy para servirte."
                 ).strip()
-                await send_whatsapp(wa, closing)
+                await send_whatsapp(wa, closing, **_wa_kw)
             except Exception:
                 pass
 
@@ -422,7 +442,7 @@ async def spartans_confirm(request: Request, key: str = ""):
             try:
                 webhook_summary = (
                     msg + "\n\n"
-                    "🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth 👇\n\n"
+                    f"🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en {facts.get('event_name') or settings.event_name} 👇\n\n"
                     + closing
                 )
                 sb.table("touchpoints").insert({
@@ -436,7 +456,7 @@ async def spartans_confirm(request: Request, key: str = ""):
 
             # Schedule calendar reminder (~10 min later)
             try:
-                e_name = facts.get("event_name") or "Beyond Wealth"
+                e_name = facts.get("event_name") or settings.event_name or "el evento"
                 e_place = facts.get("event_place") or ""
                 e_speakers = facts.get("event_speakers") or ""
                 details = f"{e_name}\nSpeakers: {e_speakers}\nLugar: {e_place}"
