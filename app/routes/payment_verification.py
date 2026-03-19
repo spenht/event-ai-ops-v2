@@ -232,10 +232,10 @@ async def all_payments(request: Request, campaign_id: str):
         # Get all PAID leads
         paid_leads = (
             sb.table("leads")
-            .select("lead_id, name, phone, email, payment_status, tier_interest, created_at, updated_at")
+            .select("lead_id, name, phone, email, payment_status, tier_interest, whatsapp, last_contact_at")
             .eq("campaign_id", campaign_id)
             .eq("payment_status", "PAID")
-            .order("updated_at", desc=True)
+            .order("last_contact_at", desc=True)
             .execute()
         )
 
