@@ -308,7 +308,10 @@ def get_next_call(campaign_id: str) -> Optional[dict[str, Any]]:
 # ─── Queue stats ─────────────────────────────────────────────────────────────
 
 def get_queue_stats(campaign_id: str) -> dict[str, int]:
-    """Return counts per status for a campaign's call queue."""
+    """Return counts per status for a campaign's call queue.
+
+    Uses Supabase count='exact' to avoid the 1000-row pagination limit.
+    """
     stats: dict[str, int] = {
         "pending": 0,
         "assigned": 0,
@@ -316,18 +319,16 @@ def get_queue_stats(campaign_id: str) -> dict[str, int]:
         "total": 0,
     }
     try:
-        r = (
-            sb.table("call_queue")
-            .select("status")
-            .eq("campaign_id", campaign_id)
-            .execute()
-        )
-        rows = r.data or []
-        stats["total"] = len(rows)
-        for row in rows:
-            s = row.get("status", "pending")
-            if s in stats:
-                stats[s] += 1
+        for status_key in ("pending", "assigned", "completed"):
+            r = (
+                sb.table("call_queue")
+                .select("id", count="exact")
+                .eq("campaign_id", campaign_id)
+                .eq("status", status_key)
+                .execute()
+            )
+            stats[status_key] = r.count or 0
+        stats["total"] = stats["pending"] + stats["assigned"] + stats["completed"]
     except Exception as exc:
         logger.error(
             "queue_stats_failed campaign=%s err=%s",
