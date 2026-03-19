@@ -740,6 +740,14 @@ async def import_selected_numbers(
 
     telnyx_numbers: list of {phone_number, telnyx_id} dicts to import.
     """
+    # Resolve org_id from campaign if not provided
+    if not org_id and campaign_id:
+        try:
+            cr = sb.table("campaigns").select("org_id").eq("id", campaign_id).limit(1).execute()
+            org_id = (cr.data or [{}])[0].get("org_id") or ""
+        except Exception:
+            pass
+
     imported = []
     for tn in telnyx_numbers:
         phone = tn.get("phone_number", "")
@@ -765,9 +773,8 @@ async def import_selected_numbers(
 
         country = detect_lead_country(phone)
         try:
-            row = {
+            row: dict[str, object] = {
                 "campaign_id": campaign_id,
-                "org_id": org_id,
                 "number": phone,
                 "country": country,
                 "provider": "telnyx",
@@ -777,6 +784,8 @@ async def import_selected_numbers(
                 "status": "active",
                 "max_calls_per_day": 50,
             }
+            if org_id:
+                row["org_id"] = org_id
             ir = sb.table("phone_numbers").insert(row).execute()
             if ir.data:
                 imported.append(ir.data[0])
