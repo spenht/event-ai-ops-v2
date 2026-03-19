@@ -20,6 +20,8 @@ from .routes.telnyx_webhooks import router as telnyx_webhooks_router
 from .routes.call_media_ws import router as call_media_ws_router
 from .routes.ticket_issue import router as ticket_issue_router
 from .routes.lead_capture import router as lead_capture_router
+from .routes.traffic_sources import router as traffic_sources_router
+from .routes.stripe_connect import router as stripe_connect_router
 
 logging.basicConfig(level=logging.INFO)
 
@@ -48,6 +50,8 @@ app.include_router(telnyx_webhooks_router)
 app.include_router(call_media_ws_router)
 app.include_router(ticket_issue_router)
 app.include_router(lead_capture_router)
+app.include_router(traffic_sources_router)
+app.include_router(stripe_connect_router)
 
 
 @app.get("/health")

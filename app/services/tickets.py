@@ -25,33 +25,51 @@ LEFT_MARGIN = 90
 CENTER_X = WIDTH // 2
 
 # ---------------------------------------------------------------------------
-# Font helpers — works on both macOS (HelveticaNeue) and Linux (DejaVu)
+# Font helpers — Inter (preferred) → HelveticaNeue (macOS) → DejaVu (fallback)
 # ---------------------------------------------------------------------------
-_FONT_PATHS = {
-    "bold": [
-        "/System/Library/Fonts/HelveticaNeue.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ],
-    "regular": [
-        "/System/Library/Fonts/HelveticaNeue.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ],
+# Inter.ttc indices: 0=Thin, 1=ExtraLight, 2=Light, 3=Regular, 4=Medium,
+#                    5=SemiBold, 6=Bold, 7=ExtraBold, 8=Black
+# (then 9-17 are italic variants in the same order)
+_INTER_INDEX = {
+    "thin": 0, "ultralight": 1, "light": 2, "regular": 3,
+    "medium": 4, "semibold": 5, "bold": 6, "condensed_bold": 6,
+    "extrabold": 7, "black": 8,
 }
 
 # HelveticaNeue.ttc indices: 0=Regular, 1=Bold, 7=Light, 10=Medium
 _HN_INDEX = {"bold": 1, "medium": 10, "light": 7, "regular": 0}
 
+_FONT_PATHS_PRIORITY = [
+    "/usr/share/fonts/truetype/inter/Inter.ttc",       # Docker / Linux (Inter)
+    "/System/Library/Fonts/HelveticaNeue.ttc",          # macOS
+]
+
+_DEJAVU_FALLBACK = {
+    "bold": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "regular": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+}
+
 
 def _font(size: int, weight: str = "regular") -> ImageFont.FreeTypeFont:
     """Load a font at the desired weight with cross-platform fallbacks."""
-    family = "bold" if weight in ("bold", "condensed_bold") else "regular"
-    for path in _FONT_PATHS[family]:
+    for path in _FONT_PATHS_PRIORITY:
         try:
-            if path.endswith(".ttc"):
-                return ImageFont.truetype(path, size, index=_HN_INDEX.get(weight, 0))
-            return ImageFont.truetype(path, size)
+            if "inter" in path.lower():
+                idx = _INTER_INDEX.get(weight, 3)
+                return ImageFont.truetype(path, size, index=idx)
+            elif "helvetica" in path.lower():
+                idx = _HN_INDEX.get(weight, 0)
+                return ImageFont.truetype(path, size, index=idx)
         except Exception:
             continue
+
+    # DejaVu fallback (bold vs regular only)
+    family = "bold" if weight in ("bold", "condensed_bold", "semibold", "extrabold", "black") else "regular"
+    try:
+        return ImageFont.truetype(_DEJAVU_FALLBACK[family], size)
+    except Exception:
+        pass
+
     return ImageFont.load_default()
 
 
@@ -283,6 +301,14 @@ def generate_ticket_png(*, lead: dict[str, Any], tier: str, event: dict[str, Any
     date = _friendly_date(event.get("event_date") or "")
     place = _safe_text(event.get("event_place") or "", max_len=120)
 
+    # Dynamic ticket branding (from ticket_config or fallback defaults)
+    tc = event.get("ticket_config") or {}
+    ticket_title = _safe_text(tc.get("title") or event_name.upper(), max_len=40)
+    ticket_subtitle = _safe_text(tc.get("subtitle") or "", max_len=40)
+    ticket_footer = _safe_text(tc.get("footer") or f"Present this ticket at the door", max_len=80)
+    ticket_brand = _safe_text(tc.get("brand") or "", max_len=40)
+    ticket_website = _safe_text(tc.get("website") or "", max_len=40)
+
     # Stable code for scanning
     raw = f"{lead.get('lead_id')}|{tid}|{tier}|{email}".encode("utf-8")
     code = hashlib.sha256(raw).hexdigest()[:10].upper()
@@ -346,13 +372,16 @@ def generate_ticket_png(*, lead: dict[str, Any], tier: str, event: dict[str, Any
 
     y = 100
 
-    # 1. HEADER
-    th = _draw_centered_text(draw, y, "BEYOND WEALTH", f_title, white)
+    # 1. HEADER (dynamic title)
+    th = _draw_centered_text(draw, y, ticket_title, f_title, white)
     y += th + 20
 
-    # 2. SUBTITLE
-    th = _draw_centered_text(draw, y, "MIAMI 2026", f_subtitle, subtitle_color)
-    y += th + 60
+    # 2. SUBTITLE (dynamic, skip if empty)
+    if ticket_subtitle:
+        th = _draw_centered_text(draw, y, ticket_subtitle, f_subtitle, subtitle_color)
+        y += th + 60
+    else:
+        y += 40
 
     # 3. Separator
     sep_margin = 160
@@ -465,17 +494,21 @@ def generate_ticket_png(*, lead: dict[str, Any], tier: str, event: dict[str, Any
 
     y = container_y + container_dim + 40
 
-    # 10. FOOTER
+    # 10. FOOTER (dynamic)
     footer_draw = ImageDraw.Draw(img)
 
-    footer_text = "Present this ticket at the door  \u2022  beyondwealth.miami"
+    footer_parts = [ticket_footer]
+    if ticket_website:
+        footer_parts.append(ticket_website)
+    footer_text = "  \u2022  ".join(footer_parts)
     ft_x = _center_x(footer_draw, footer_text, f_footer)
     footer_draw.text((ft_x, y), footer_text, fill=(*muted[:3], 150), font=f_footer)
     y += 44
 
-    brand_text = "BEYOND WEALTH EXPERIENCES"
-    bx = _center_x(footer_draw, brand_text, f_brand)
-    footer_draw.text((bx, y), brand_text, fill=(*accent[:3], 80), font=f_brand)
+    if ticket_brand:
+        brand_text = ticket_brand.upper()
+        bx = _center_x(footer_draw, brand_text, f_brand)
+        footer_draw.text((bx, y), brand_text, fill=(*accent[:3], 80), font=f_brand)
 
     # SAVE
     final = img.convert("RGB")
