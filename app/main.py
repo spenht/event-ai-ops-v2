@@ -22,6 +22,9 @@ from .routes.ticket_issue import router as ticket_issue_router
 from .routes.lead_capture import router as lead_capture_router
 from .routes.traffic_sources import router as traffic_sources_router
 from .routes.stripe_connect import router as stripe_connect_router
+from .routes.commissions import router as commissions_router
+from .routes.spartan_dashboard import router as spartan_dashboard_router
+from .routes.payment_verification import router as payment_verification_router
 
 logging.basicConfig(level=logging.INFO)
 
@@ -52,11 +55,19 @@ app.include_router(ticket_issue_router)
 app.include_router(lead_capture_router)
 app.include_router(traffic_sources_router)
 app.include_router(stripe_connect_router)
+app.include_router(commissions_router)
+app.include_router(spartan_dashboard_router)
+app.include_router(payment_verification_router)
 
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+
+# Migration 024: Tables created via Supabase SQL Editor
+# commission_configs, commissions, payment_verifications
 
 
 # ---------------------------------------------------------------------------
