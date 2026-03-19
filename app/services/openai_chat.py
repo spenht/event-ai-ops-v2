@@ -43,12 +43,30 @@ def _read_prompt() -> str:
 
 
 def strip_tokens(text: str) -> tuple[str, set[str]]:
+    """Extract action tokens from AI response, supporting multiple formats.
+
+    The AI sometimes uses {{TOKEN}} or {TOKEN} instead of [[TOKEN]].
+    We normalize all variants to the canonical [[TOKEN]] form.
+    """
     found: set[str] = set()
     out = (text or "").strip()
-    for t in TOKENS.values():
-        if t in out:
-            found.add(t)
-            out = out.replace(t, "")
+
+    for name, canonical in TOKENS.items():
+        # Check canonical format [[TOKEN]]
+        if canonical in out:
+            found.add(canonical)
+            out = out.replace(canonical, "")
+        # Check {{TOKEN}} variant (common AI hallucination)
+        curly = "{{" + name + "}}"
+        if curly in out:
+            found.add(canonical)
+            out = out.replace(curly, "")
+        # Check {TOKEN} single-curly variant
+        single_curly = "{" + name + "}"
+        if single_curly in out:
+            found.add(canonical)
+            out = out.replace(single_curly, "")
+
     out = "\n".join([ln.rstrip() for ln in out.splitlines() if ln.strip()])
     return out.strip(), found
 

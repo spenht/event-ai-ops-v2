@@ -1539,6 +1539,8 @@ async def _handle_existing_lead(
             "[link" in clean_low
             or "link]" in clean_low
             or "[link]." in clean_low
+            or "{{send_vip_link}}" in clean_low
+            or "{send_vip_link}" in clean_low
             or "te dejo aquí el link" in clean_low
             or "te dejo aqui el link" in clean_low
             or "te dejo el link" in clean_low
@@ -1585,6 +1587,8 @@ async def _handle_existing_lead(
                     clean = re.sub(r"https?://(?:www\.)?example\.com\S*", "", clean, flags=re.I).strip()
                     clean = re.sub(r"https?://stripe-link-para-pago\S*", "", clean, flags=re.I).strip()
                     clean = re.sub(r"\[\s*link\s*\]", "", clean, flags=re.I).strip()
+                    clean = re.sub(r"\{\{SEND_VIP_LINK\}\}", "", clean, flags=re.I).strip()
+                    clean = re.sub(r"\{SEND_VIP_LINK\}", "", clean, flags=re.I).strip()
                     checkout_lead_id = lead_id
 
                     # companion payment logic (keep existing)
