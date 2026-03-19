@@ -287,7 +287,7 @@ def _draw_centered_text(draw, y, text, font, fill):
 # Main ticket generator
 # ---------------------------------------------------------------------------
 
-def generate_ticket_png(*, lead: dict[str, Any], tier: str, event: dict[str, Any]) -> dict[str, str]:
+def generate_ticket_png(*, lead: dict[str, Any], tier: str, event: dict[str, Any], ticket_config: dict[str, Any] | None = None) -> dict[str, str]:
     """Generate a premium ticket image and store a mapping in touchpoints.
 
     Returns {ticket_id, token, file_path}
@@ -301,13 +301,16 @@ def generate_ticket_png(*, lead: dict[str, Any], tier: str, event: dict[str, Any
     date = _friendly_date(event.get("event_date") or "")
     place = _safe_text(event.get("event_place") or "", max_len=120)
 
-    # Dynamic ticket branding (from ticket_config or fallback defaults)
-    tc = event.get("ticket_config") or {}
-    ticket_title = _safe_text(tc.get("title") or event_name.upper(), max_len=40)
-    ticket_subtitle = _safe_text(tc.get("subtitle") or "", max_len=40)
-    ticket_footer = _safe_text(tc.get("footer") or f"Present this ticket at the door", max_len=80)
-    ticket_brand = _safe_text(tc.get("brand") or "", max_len=40)
-    ticket_website = _safe_text(tc.get("website") or "", max_len=40)
+    # Dynamic ticket branding: explicit ticket_config > event.ticket_config > defaults
+    tc = ticket_config or event.get("ticket_config") or {}
+    # Per-tier overrides (e.g. VIP has different title/subtitle than General)
+    tier_key = tier.lower()
+    tier_ov = (tc.get("tiers") or {}).get(tier_key, {})
+    ticket_title = _safe_text(tier_ov.get("title") or tc.get("title") or event_name.upper(), max_len=40)
+    ticket_subtitle = _safe_text(tier_ov.get("subtitle") or tc.get("subtitle") or "", max_len=40)
+    ticket_footer = _safe_text(tier_ov.get("footer") or tc.get("footer") or "Presenta este boleto en la entrada", max_len=80)
+    ticket_brand = _safe_text(tier_ov.get("brand") or tc.get("brand") or "", max_len=40)
+    ticket_website = _safe_text(tier_ov.get("website") or tc.get("website") or "", max_len=40)
 
     # Stable code for scanning
     raw = f"{lead.get('lead_id')}|{tid}|{tier}|{email}".encode("utf-8")
