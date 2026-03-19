@@ -58,12 +58,17 @@ async def generate_reply(
     lead: dict[str, Any],
     event_facts: dict[str, Any],
     conversation: list[dict[str, str]],
+    campaign_system_prompt: str = "",
+    campaign_openai_key: str = "",
+    campaign_openai_model: str = "",
 ) -> Optional[str]:
-    if not settings.openai_api_key:
+    api_key = campaign_openai_key.strip() or settings.openai_api_key
+    model = campaign_openai_model.strip() or settings.openai_model
+    system_prompt = campaign_system_prompt.strip() or _read_prompt()
+
+    if not api_key:
         logger.error("Missing OPENAI_API_KEY")
         return None
-
-    system_prompt = _read_prompt()
 
     facts_block = {
         "lead": {
@@ -82,7 +87,7 @@ async def generate_reply(
     }
 
     payload = {
-        "model": settings.openai_model,
+        "model": model,
         "input": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": "DATOS (fuente de verdad): " + json.dumps(facts_block, ensure_ascii=False)},
@@ -96,7 +101,7 @@ async def generate_reply(
             resp = await client.post(
                 "https://api.openai.com/v1/responses",
                 headers={
-                    "Authorization": f"Bearer {settings.openai_api_key}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
                 json=payload,

@@ -46,6 +46,30 @@ def _wa_creds(campaign: dict[str, Any] | None) -> dict[str, str]:
     return creds
 
 
+def _build_vip_pitch(event_name_upper: str, vip_price: str, campaign: dict | None = None) -> str:
+    price_ids = (campaign or {}).get("stripe_price_ids") or {}
+    p1_label = price_ids.get("vip_1_label") or f"1 VIP individual x {vip_price}"
+    p2_label = price_ids.get("vip_2_label") or ""
+    pricing_block = f"1\ufe0f\u20e3 {p1_label}\n"
+    if p2_label:
+        pricing_block += f"2\ufe0f\u20e3 La opcion mas popular: {p2_label} (promo especial)\n\n"
+        pricing_block += "\u00bfTe aparto 1 VIP o prefieres aprovechar la promo de 2?"
+    else:
+        pricing_block += f"\n\u00bfTe aparto tu lugar VIP?"
+    return (
+        f"VIP es la forma mas cercana, estrategica y transformadora de vivir *{event_name_upper}*.\n\n"
+        "\U0001f525 *Por que ser VIP:*\n"
+        "- Asientos preferenciales\n"
+        "- Mastermind intimo\n"
+        "- Libro firmado\n"
+        "- Foto con Spencer Hoffmann y algunos speakers\n"
+        "- Sorpresas especiales\n\n"
+        "(Por aqui te dejo un mensaje de Spencer sobre el VIP \U0001f447)\n\n"
+        "Puedes elegir:\n"
+        + pricing_block
+    ).strip()
+
+
 def _maybe_schedule_auto_call(
     lead_id: str,
     campaign_id: str,
@@ -563,6 +587,11 @@ def _event_facts(event_id: Optional[str], campaign_data: dict | None = None) -> 
             or settings.vip_price
             or ""
         ).strip(),
+        "event_end_date": (
+            str(c.get("event_end_date") or "")
+            or str(event.get("ends_at") or "")
+            or ""
+        ).strip(),
         "ticket_config": ticket_config,
     }
 
@@ -597,6 +626,7 @@ def _resolve_campaign_from_to_number(to_number: str) -> tuple[str, dict]:
                 .select("*")
                 .eq("twilio_whatsapp_from", candidate)
                 .eq("status", "active")
+                .order("created_at", desc=True)
                 .limit(1)
                 .execute()
             )
@@ -613,6 +643,7 @@ def _resolve_campaign_from_to_number(to_number: str) -> tuple[str, dict]:
             .select("*")
             .ilike("twilio_whatsapp_from", f"%{clean.lstrip('+')}")
             .eq("status", "active")
+            .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
@@ -836,8 +867,10 @@ async def whatsapp_inbound(request: Request):
             return _twiml_empty()
 
         # Friendly first touch for new leads (need name+email to confirm)
+        _ev = (campaign or {}).get("event_name") or "el evento"
+        _ai_name = (campaign or {}).get("ai_character_name") or "Ana"
         return _twiml_message(
-            "¡Hola! 😊 Soy Ana del equipo de Beyond Wealth.\n\n"
+            f"¡Hola! 😊 Soy {_ai_name} del equipo de *{_ev}*.\n\n"
             "Ya te aparte un lugar en *GENERAL* (gratis).\n\n"
             "Para confirmarlo: ¿me compartes tu *nombre* y tu *correo* (en un solo mensaje)?"
         )
@@ -1165,20 +1198,8 @@ async def _handle_existing_lead(
             ])
             if user_wants_vip_info:
                 event_name_upper = (facts.get("event_name") or "BEYOND WEALTH").upper()
-                vip_pitch_text = (
-                    f"VIP es la forma mas cercana, estrategica y transformadora de vivir *{event_name_upper}*.\n\n"
-                    "🔥 *Por que ser VIP:*\n"
-                    "- Asientos preferenciales\n"
-                    "- Mastermind intimo\n"
-                    "- Libro firmado\n"
-                    "- Foto con Spencer Hoffmann y algunos speakers\n"
-                    "- Sorpresas especiales\n\n"
-                    "(Por aqui te dejo un mensaje de Spencer sobre el VIP 👇)\n\n"
-                    "Puedes elegir:\n"
-                    "1️⃣ 1 VIP individual x 79 USD\n"
-                    "2️⃣ La opcion mas popular: 2 VIPs x 97 USD (promo especial)\n\n"
-                    "¿Te aparto 1 VIP o prefieres aprovechar la promo de 2?"
-                ).strip()
+                vip_price = facts.get("vip_price") or "VIP"
+                vip_pitch_text = _build_vip_pitch(event_name_upper, vip_price, _campaign)
 
                 # Log inbound
                 try:
@@ -1233,7 +1254,14 @@ async def _handle_existing_lead(
             convo.append({"role": "user", "content": body})
 
         # Generate AI reply
-        ai = await generate_reply(lead=lead, event_facts=facts, conversation=convo)
+        ai = await generate_reply(
+            lead=lead,
+            event_facts=facts,
+            conversation=convo,
+            campaign_system_prompt=(_campaign or {}).get("system_prompt") or "",
+            campaign_openai_key=(_campaign or {}).get("openai_api_key") or "",
+            campaign_openai_model=(_campaign or {}).get("openai_model") or "",
+        )
 
         if not ai:
             # Hard fallback
@@ -1366,20 +1394,8 @@ async def _handle_existing_lead(
             and not vip_pitch_already_sent
         ):
             event_name_upper = (facts.get("event_name") or "BEYOND WEALTH").upper()
-            vip_pitch_text = (
-                f"VIP es la forma mas cercana, estrategica y transformadora de vivir *{event_name_upper}*.\n\n"
-                "🔥 *Por que ser VIP:*\n"
-                "- Asientos preferenciales\n"
-                "- Mastermind intimo\n"
-                "- Libro firmado\n"
-                "- Foto con Spencer Hoffmann y algunos speakers\n"
-                "- Sorpresas especiales\n\n"
-                "(Por aqui te dejo un mensaje de Spencer sobre el VIP 👇)\n\n"
-                "Puedes elegir:\n"
-                "1️⃣ 1 VIP individual x 79 USD\n"
-                "2️⃣ La opcion mas popular: 2 VIPs x 97 USD (promo especial)\n\n"
-                "¿Te aparto 1 VIP o prefieres aprovechar la promo de 2?"
-            ).strip()
+            vip_price = facts.get("vip_price") or "VIP"
+            vip_pitch_text = _build_vip_pitch(event_name_upper, vip_price, _campaign)
 
             # MESSAGE 1: Send VIP pitch text FIRST (no media)
             try:
@@ -1599,13 +1615,18 @@ async def _handle_existing_lead(
                         or bool(re.search(r'\b1\b', low))
                     )
 
+                    _price_ids = (_campaign or {}).get("stripe_price_ids") or {}
+                    _p1_label = _price_ids.get("vip_1_label") or f"1 VIP individual x {facts.get('vip_price') or 'VIP'}"
+                    _p2_label = _price_ids.get("vip_2_label") or ""
+
                     if wants_option_2 and not wants_option_1:
                         # User explicitly wants option 2
-                        url = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=2)
+                        url = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=2, campaign=_campaign)
                         if url:
                             url = await create_short_url(url.strip(), lead_id=lead_id, url_type="stripe_checkout", prefix="vip_")
+                            opt2_desc = _p2_label or "2 VIPs (promo especial)"
                             clean = (
-                                "🔥 ¡Excelente eleccion! 2 VIPs x 97 USD (la promo mas popular).\n\n"
+                                f"🔥 ¡Excelente eleccion! {opt2_desc} (la promo mas popular).\n\n"
                                 "Link de pago:\n" + url + "\n\n"
                                 "En cuanto se confirme tu pago, te mando tu boleto VIP con QR 🎟️"
                             ).strip()
@@ -1613,27 +1634,28 @@ async def _handle_existing_lead(
                             clean = (clean.rstrip() + "\n\nAhorita no pude generar el link 😅 ¿Me pones *VIP* otra vez en 30 segundos?").strip()
                     elif wants_option_1:
                         # User explicitly wants option 1
-                        url = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=1)
+                        url = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=1, campaign=_campaign)
                         if url:
                             url = await create_short_url(url.strip(), lead_id=lead_id, url_type="stripe_checkout", prefix="vip_")
                             clean = (
-                                "🔥 ¡Perfecto! 1 VIP individual x 79 USD.\n\n"
+                                f"🔥 ¡Perfecto! {_p1_label}.\n\n"
                                 "Link de pago:\n" + url + "\n\n"
                                 "En cuanto se confirme tu pago, te mando tu boleto VIP con QR 🎟️"
                             ).strip()
                         else:
                             clean = (clean.rstrip() + "\n\nAhorita no pude generar el link 😅 ¿Me pones *VIP* otra vez en 30 segundos?").strip()
                     else:
-                        # Send BOTH options — replace AI response with clean message
-                        url1 = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=1)
-                        url2 = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=2)
+                        # Send BOTH options (or only option 1 if no option 2 configured)
+                        url1 = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=1, campaign=_campaign)
                         links_text = ""
                         if url1:
                             url1 = await create_short_url(url1.strip(), lead_id=lead_id, url_type="stripe_checkout", prefix="vip_")
-                            links_text += f"1️⃣ 1 VIP individual x 79 USD:\n{url1}\n\n"
-                        if url2:
-                            url2 = await create_short_url(url2.strip(), lead_id=lead_id, url_type="stripe_checkout", prefix="vip_")
-                            links_text += f"2️⃣ 2 VIPs x 97 USD (promo especial):\n{url2}\n\n"
+                            links_text += f"1️⃣ {_p1_label}:\n{url1}\n\n"
+                        if _p2_label:
+                            url2 = await create_vip_checkout_link(lead_id=checkout_lead_id, event_id=event_id, option=2, campaign=_campaign)
+                            if url2:
+                                url2 = await create_short_url(url2.strip(), lead_id=lead_id, url_type="stripe_checkout", prefix="vip_")
+                                links_text += f"2️⃣ {_p2_label} (promo especial):\n{url2}\n\n"
                         if links_text:
                             clean = (
                                 "¡Perfecto! 😊 Aqui tienes los links de pago:\n\n"
@@ -1837,7 +1859,7 @@ async def _handle_existing_lead(
                 try:
                     await send_whatsapp(
                         to_e164=wa_e164,
-                        body="🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth 👇",
+                        body=f"🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en {facts.get('event_name') or 'el evento'} 👇",
                         media_urls=[testimonial_url],
                         **_wa_creds(campaign),
                     )
@@ -1854,7 +1876,7 @@ async def _handle_existing_lead(
 
                 # Closing message (no re-introduction)
                 try:
-                    event_name = facts.get("event_name") or "Beyond Wealth"
+                    event_name = facts.get("event_name") or "el evento"
                     is_vip = lead_paid == "PAID"
                     if is_vip:
                         closing = (
