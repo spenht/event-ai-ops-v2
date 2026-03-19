@@ -11,24 +11,36 @@ from ..settings import settings
 logger = logging.getLogger("stripe_checkout")
 
 
+def _extract_price_id(val: object) -> str:
+    """Extract a Stripe price ID from a value that may be a string or a dict.
+
+    Supports both formats:
+      - Plain string: "price_xxx"
+      - Dict: {"price_id": "price_xxx", "label": "...", "display_price": "..."}
+    """
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, dict):
+        return (val.get("price_id") or "").strip()
+    return ""
+
+
 def _resolve_price_id(option: int = 1, campaign: dict | None = None) -> str:
     """Return the Stripe price ID for the given VIP option.
 
-    option=1  ->  1 VIP individual (79 USD)
-    option=2  ->  2 VIPs promo (97 USD)
-
     Checks campaign.stripe_price_ids first, then falls back to global settings.
     Campaign keys can be "vip_1"/"vip_2" or just "1"/"2".
+    Values can be plain strings or dicts with a "price_id" key.
     """
     price_ids = (campaign or {}).get("stripe_price_ids") or {}
     if option == 2:
-        cid = price_ids.get("vip_2") or price_ids.get("2") or ""
+        cid = _extract_price_id(price_ids.get("vip_2") or price_ids.get("2"))
         if cid:
             return cid
         if settings.stripe_vip_price_id_2:
             return settings.stripe_vip_price_id_2
     if option == 1:
-        cid = price_ids.get("vip_1") or price_ids.get("1") or ""
+        cid = _extract_price_id(price_ids.get("vip_1") or price_ids.get("1"))
         if cid:
             return cid
         if settings.stripe_vip_price_id_1:

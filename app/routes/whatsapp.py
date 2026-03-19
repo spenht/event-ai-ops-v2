@@ -46,10 +46,25 @@ def _wa_creds(campaign: dict[str, Any] | None) -> dict[str, str]:
     return creds
 
 
+def _extract_price_label(val: object, default: str = "") -> str:
+    """Extract display label from price config (string or dict with label+display_price)."""
+    if isinstance(val, dict):
+        label = val.get("label") or ""
+        price = val.get("display_price") or ""
+        if label and price:
+            return f"{label} x {price}"
+        return label or price or default
+    if isinstance(val, str):
+        return val.strip() or default
+    return default
+
+
 def _build_vip_pitch(event_name_upper: str, vip_price: str, campaign: dict | None = None) -> str:
     price_ids = (campaign or {}).get("stripe_price_ids") or {}
-    p1_label = price_ids.get("vip_1_label") or f"1 VIP individual x {vip_price}"
-    p2_label = price_ids.get("vip_2_label") or ""
+    p1_raw = price_ids.get("vip_1") or price_ids.get("1")
+    p2_raw = price_ids.get("vip_2") or price_ids.get("2")
+    p1_label = _extract_price_label(p1_raw, f"1 VIP individual x {vip_price}")
+    p2_label = _extract_price_label(p2_raw)
     pricing_block = f"1\ufe0f\u20e3 {p1_label}\n"
     if p2_label:
         pricing_block += f"2\ufe0f\u20e3 La opcion mas popular: {p2_label} (promo especial)\n\n"
@@ -1616,8 +1631,10 @@ async def _handle_existing_lead(
                     )
 
                     _price_ids = (_campaign or {}).get("stripe_price_ids") or {}
-                    _p1_label = _price_ids.get("vip_1_label") or f"1 VIP individual x {facts.get('vip_price') or 'VIP'}"
-                    _p2_label = _price_ids.get("vip_2_label") or ""
+                    _p1_raw = _price_ids.get("vip_1") or _price_ids.get("1")
+                    _p2_raw = _price_ids.get("vip_2") or _price_ids.get("2")
+                    _p1_label = _extract_price_label(_p1_raw, f"1 VIP individual x {facts.get('vip_price') or 'VIP'}")
+                    _p2_label = _extract_price_label(_p2_raw)
 
                     if wants_option_2 and not wants_option_1:
                         # User explicitly wants option 2
