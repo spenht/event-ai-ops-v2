@@ -79,9 +79,31 @@ async def attribute_sale(lead_id: str, campaign_id: str) -> dict | None:
             commission_pct = 0
             sale_amount = 0
         else:
-            sale_amount = float(cfg.get("commission_value", 0)) if cfg["commission_type"] == "fixed" else 0
-            commission_pct = float(cfg["commission_value"]) if cfg["commission_type"] == "percentage" else 0
-            commission_amount = float(cfg["commission_value"])  # For fixed, this IS the commission
+            # Check for volume-based escalation tiers
+            agent_sales_count = 0
+            try:
+                sc = sb.table("commissions").select("id", count="exact").eq("campaign_id", campaign_id).eq("agent_id", agent_id).eq("tier", tier).limit(0).execute()
+                agent_sales_count = sc.count or 0
+            except Exception:
+                pass
+
+            # Look for escalation tier
+            escalated_type = cfg.get("commission_type", "fixed")
+            escalated_value = float(cfg.get("commission_value", 0))
+            try:
+                tiers_r = sb.table("commission_tiers").select("*").eq("config_id", cfg["id"]).order("min_sales", desc=True).execute()
+                for t in (tiers_r.data or []):
+                    if agent_sales_count >= t.get("min_sales", 0):
+                        escalated_type = t.get("commission_type", escalated_type)
+                        escalated_value = float(t.get("commission_value", escalated_value))
+                        break
+            except Exception:
+                pass  # Fall back to base config
+
+            # Use escalated values for commission calculation
+            sale_amount = escalated_value if escalated_type == "fixed" else 0
+            commission_pct = escalated_value if escalated_type == "percentage" else 0
+            commission_amount = escalated_value  # For fixed, this IS the commission
 
         # 5. Insert commission
         record = {

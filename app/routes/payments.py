@@ -218,6 +218,15 @@ async def stripe_webhook(request: Request):
             except Exception:
                 logger.exception("webhook_lead_status_update_failed lead=%s", lead_id)
 
+            # Auto-create commission
+            try:
+                from ..services.commission_engine import attribute_sale
+                campaign_id = (meta.get("campaign_id") or "").strip()
+                if campaign_id:
+                    await attribute_sale(lead_id, campaign_id)
+            except Exception:
+                logger.exception("commission_attribution_failed lead=%s", lead_id)
+
             # Generate ticket + send
             lead_res = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1).execute()
             lead = (lead_res.data or [None])[0] or {}

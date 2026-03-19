@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -254,3 +254,144 @@ async def mark_paid(request: Request, commission_id: str, campaign_id: str):
     except Exception as exc:
         logger.error("mark_paid_failed id=%s err=%s", commission_id, str(exc)[:300])
         raise HTTPException(status_code=500, detail=str(exc)[:200])
+
+
+# ── Commission Tiers (volume escalation) ──────────────────────────
+
+
+@router.get("/config/{config_id}/tiers")
+async def list_commission_tiers(config_id: str, request: Request):
+    """List escalation tiers for a commission config."""
+    _validate_auth(request)
+    r = sb.table("commission_tiers").select("*").eq("config_id", config_id).order("min_sales").execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/config/{config_id}/tiers")
+async def upsert_commission_tier(config_id: str, request: Request):
+    """Create or update an escalation tier."""
+    _validate_auth(request)
+    body = await request.json()
+    row = {
+        "config_id": config_id,
+        "min_sales": body.get("min_sales", 0),
+        "commission_type": body.get("commission_type", "percentage"),
+        "commission_value": body.get("commission_value", 0),
+    }
+    tier_id = body.get("id")
+    if tier_id:
+        sb.table("commission_tiers").update(row).eq("id", tier_id).execute()
+    else:
+        sb.table("commission_tiers").insert(row).execute()
+    return {"ok": True}
+
+
+@router.delete("/tiers/{tier_id}")
+async def delete_commission_tier(tier_id: str, request: Request):
+    """Delete an escalation tier."""
+    _validate_auth(request)
+    sb.table("commission_tiers").delete().eq("id", tier_id).execute()
+    return {"ok": True}
+
+
+# ── Agents list + Bulk approve/pay ────────────────────────────────
+
+
+@router.get("/agents")
+async def list_agents_with_commissions(request: Request, campaign_id: str = Query(...)):
+    """List all agents with their commission summary for a campaign."""
+    _validate_auth(request, campaign_id)
+    # Get all commissions grouped by agent
+    r = sb.table("commissions").select("agent_id, tier, sale_amount, commission_amount, status").eq("campaign_id", campaign_id).execute()
+
+    # Aggregate per agent
+    agents: dict[str, dict] = {}
+    for c in (r.data or []):
+        aid = c["agent_id"]
+        if aid not in agents:
+            agents[aid] = {"agent_id": aid, "total_sales": 0, "total_earned": 0, "pending": 0, "approved": 0, "paid": 0, "sale_count": 0}
+        agents[aid]["sale_count"] += 1
+        agents[aid]["total_earned"] += float(c.get("commission_amount", 0))
+        agents[aid][c.get("status", "pending")] += float(c.get("commission_amount", 0))
+
+    # Get agent names from org_members
+    agent_ids = list(agents.keys())
+    if agent_ids:
+        try:
+            mr = sb.table("org_members").select("user_id, display_name, email").in_("user_id", agent_ids).execute()
+            for m in (mr.data or []):
+                uid = m["user_id"]
+                if uid in agents:
+                    agents[uid]["display_name"] = m.get("display_name") or m.get("email", "Agent")
+        except Exception:
+            pass
+
+    # Get online status from spartan_sessions
+    try:
+        sr = sb.table("spartan_sessions").select("user_id, status").eq("campaign_id", campaign_id).in_("user_id", agent_ids).neq("status", "offline").execute()
+        online_ids = {s["user_id"] for s in (sr.data or [])}
+        for aid in agents:
+            agents[aid]["online"] = aid in online_ids
+    except Exception:
+        pass
+
+    return {"ok": True, "data": sorted(agents.values(), key=lambda x: x["total_earned"], reverse=True)}
+
+
+@router.post("/bulk-approve")
+async def bulk_approve_commissions(request: Request):
+    """Approve multiple pending commissions at once."""
+    _validate_auth(request)
+    body = await request.json()
+    commission_ids = body.get("commission_ids", [])
+    approved_by = body.get("approved_by")
+
+    if not commission_ids:
+        # Approve ALL pending for a campaign
+        campaign_id = body.get("campaign_id")
+        agent_id = body.get("agent_id")  # optional filter
+        if not campaign_id:
+            raise HTTPException(status_code=400, detail="campaign_id or commission_ids required")
+        q = sb.table("commissions").update({"status": "approved", "approved_at": "now()", "approved_by": approved_by}).eq("campaign_id", campaign_id).eq("status", "pending")
+        if agent_id:
+            q = q.eq("agent_id", agent_id)
+        r = q.execute()
+        return {"ok": True, "updated": len(r.data or [])}
+
+    count = 0
+    for cid in commission_ids:
+        try:
+            sb.table("commissions").update({"status": "approved", "approved_at": "now()", "approved_by": approved_by}).eq("id", cid).eq("status", "pending").execute()
+            count += 1
+        except Exception:
+            pass
+    return {"ok": True, "updated": count}
+
+
+@router.post("/bulk-pay")
+async def bulk_pay_commissions(request: Request):
+    """Mark multiple approved commissions as paid."""
+    _validate_auth(request)
+    body = await request.json()
+    commission_ids = body.get("commission_ids", [])
+    payout_ref = body.get("payout_ref", "")
+
+    if not commission_ids:
+        campaign_id = body.get("campaign_id")
+        agent_id = body.get("agent_id")
+        if not campaign_id:
+            raise HTTPException(status_code=400, detail="campaign_id or commission_ids required")
+        q = sb.table("commissions").update({"status": "paid", "paid_at": "now()", "payout_ref": payout_ref}).eq("campaign_id", campaign_id).eq("status", "approved")
+        if agent_id:
+            q = q.eq("agent_id", agent_id)
+        r = q.execute()
+        return {"ok": True, "updated": len(r.data or [])}
+
+    count = 0
+    for cid in commission_ids:
+        try:
+            sb.table("commissions").update({"status": "paid", "paid_at": "now()", "payout_ref": payout_ref}).eq("id", cid).eq("status", "approved").execute()
+            count += 1
+        except Exception:
+            pass
+    return {"ok": True, "updated": count}
