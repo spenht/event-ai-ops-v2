@@ -29,6 +29,7 @@ from ..deps import sb
 from ..settings import settings
 from ..services.twilio_whatsapp import send_whatsapp
 from ..routes.broadcasts import execute_campaign
+from ..services.delayed_call_scheduler import schedule_delayed_call
 
 logger = logging.getLogger("automation")
 
@@ -276,6 +277,30 @@ async def run_followups(request: Request):
         logger.exception("followup_query_failed")
         raise HTTPException(status_code=500, detail=f"query failed: {str(e)[:200]}")
 
+    # Pre-load campaign Twilio credentials for per-campaign sending
+    campaign_creds_cache: dict[str, dict[str, str]] = {}
+
+    def _get_campaign_creds(campaign_id: str) -> dict[str, str]:
+        if campaign_id in campaign_creds_cache:
+            return campaign_creds_cache[campaign_id]
+        creds: dict[str, str] = {}
+        if campaign_id:
+            try:
+                cr = sb.table("campaigns").select(
+                    "twilio_account_sid,twilio_auth_token,twilio_whatsapp_from"
+                ).eq("id", campaign_id).single().execute()
+                c = cr.data or {}
+                if c.get("twilio_account_sid"):
+                    creds["account_sid"] = c["twilio_account_sid"]
+                if c.get("twilio_auth_token"):
+                    creds["auth_token"] = c["twilio_auth_token"]
+                if c.get("twilio_whatsapp_from"):
+                    creds["whatsapp_from"] = c["twilio_whatsapp_from"]
+            except Exception:
+                pass
+        campaign_creds_cache[campaign_id] = creds
+        return creds
+
     processed = 0
     sent = 0
     errors = 0
@@ -296,9 +321,10 @@ async def run_followups(request: Request):
             continue
 
         msg = _pick_message(followup_type, status, name)
+        wa_kwargs = _get_campaign_creds(lead.get("campaign_id") or "")
 
         try:
-            sid = await send_whatsapp(to_e164=wa, body=msg)
+            sid = await send_whatsapp(to_e164=wa, body=msg, **wa_kwargs)
             logger.info(
                 "followup_sent type=%s lead=%s status=%s sid=%s",
                 followup_type, lead_id, status, sid,
@@ -360,8 +386,15 @@ async def run_followups(request: Request):
             body = (payload.get("body") or "").strip()
             if not wa or not body:
                 continue
+            # Resolve per-campaign Twilio creds from lead
+            sched_wa_kwargs: dict[str, str] = {}
             try:
-                await send_whatsapp(to_e164=wa, body=body)
+                lr = sb.table("leads").select("campaign_id").eq("lead_id", tp["lead_id"]).single().execute()
+                sched_wa_kwargs = _get_campaign_creds((lr.data or {}).get("campaign_id") or "")
+            except Exception:
+                pass
+            try:
+                await send_whatsapp(to_e164=wa, body=body, **sched_wa_kwargs)
                 payload["status"] = "sent"
                 sb.table("touchpoints").update({"payload": payload}).eq("id", tp["id"]).execute()
                 sched_sent += 1
@@ -403,6 +436,128 @@ async def run_followups(request: Request):
         logger.exception("broadcast_campaign_query_failed")
 
     # ------------------------------------------------------------------
+    # AI Auto-Call recovery — catch leads that missed their delayed call
+    # (e.g. due to server restart losing asyncio tasks)
+    # ------------------------------------------------------------------
+    auto_calls_scheduled = 0
+    try:
+        # Find campaigns with AI calls enabled
+        ai_campaigns_r = (
+            sb.table("campaigns")
+            .select("id, ai_calls_enabled, ai_call_delay_minutes")
+            .eq("ai_calls_enabled", True)
+            .execute()
+        )
+        ai_campaigns = ai_campaigns_r.data or []
+
+        for camp in ai_campaigns:
+            camp_id = camp["id"]
+            delay_min = camp.get("ai_call_delay_minutes") or 10
+
+            # Find NEW leads older than delay_minutes that haven't been called
+            # Two queries: one for NULL last_contact_at (imported leads), one for stale contacts
+            cutoff = (now - timedelta(minutes=int(delay_min))).isoformat()
+            uncalled_leads = []
+            try:
+                # Query 1: Leads never contacted (imported) — use created_at as fallback
+                null_r = (
+                    sb.table("leads")
+                    .select("lead_id, status, phone, whatsapp")
+                    .eq("campaign_id", camp_id)
+                    .eq("status", "NEW")
+                    .neq("do_not_contact", True)
+                    .is_("last_contact_at", "null")
+                    .limit(20)
+                    .execute()
+                )
+                uncalled_leads.extend(null_r.data or [])
+            except Exception:
+                pass
+            try:
+                # Query 2: Leads contacted but past delay threshold
+                stale_r = (
+                    sb.table("leads")
+                    .select("lead_id, status, phone, whatsapp")
+                    .eq("campaign_id", camp_id)
+                    .eq("status", "NEW")
+                    .neq("do_not_contact", True)
+                    .lte("last_contact_at", cutoff)
+                    .limit(20)
+                    .execute()
+                )
+                uncalled_leads.extend(stale_r.data or [])
+            except Exception:
+                pass
+            # Dedup by lead_id and cap at 20
+            seen_ids: set[str] = set()
+            deduped: list[dict] = []
+            for ul in uncalled_leads:
+                if ul["lead_id"] not in seen_ids:
+                    seen_ids.add(ul["lead_id"])
+                    deduped.append(ul)
+                if len(deduped) >= 20:
+                    break
+            uncalled_leads = deduped
+
+            for ul in uncalled_leads:
+                ul_id = ul["lead_id"]
+                phone = (ul.get("phone") or ul.get("whatsapp") or "").strip()
+                if not phone:
+                    continue
+
+                # Check if there's already a pending/assigned call in queue
+                try:
+                    existing_r = (
+                        sb.table("call_queue")
+                        .select("id")
+                        .eq("campaign_id", camp_id)
+                        .eq("lead_id", ul_id)
+                        .in_("status", ["pending", "assigned"])
+                        .limit(1)
+                        .execute()
+                    )
+                    if existing_r.data:
+                        continue  # Already in queue
+                except Exception:
+                    continue
+
+                # Check if AI already called in last 24h
+                try:
+                    recent_call_r = (
+                        sb.table("call_records")
+                        .select("id")
+                        .eq("campaign_id", camp_id)
+                        .eq("lead_id", ul_id)
+                        .gte("created_at", (now - timedelta(hours=24)).isoformat())
+                        .limit(1)
+                        .execute()
+                    )
+                    if recent_call_r.data:
+                        continue  # Already called recently
+                except Exception:
+                    continue
+
+                # Schedule immediate call (0 delay — they already waited)
+                try:
+                    await schedule_delayed_call(
+                        lead_id=ul_id,
+                        campaign_id=camp_id,
+                        delay_seconds=0,
+                        expected_status="NEW",
+                        purpose="confirm_attendance",
+                        priority=1,
+                    )
+                    auto_calls_scheduled += 1
+                    logger.info("auto_call_recovery lead=%s campaign=%s", ul_id, camp_id)
+                except Exception as exc:
+                    logger.warning("auto_call_recovery_failed lead=%s err=%s", ul_id, str(exc)[:200])
+
+        if auto_calls_scheduled:
+            logger.info("auto_call_recovery_total=%d", auto_calls_scheduled)
+    except Exception:
+        logger.exception("auto_call_recovery_query_failed")
+
+    # ------------------------------------------------------------------
     # Sync sales leads to Google Sheets (Spartans list)
     # ------------------------------------------------------------------
     gsheet_synced = 0
@@ -416,8 +571,8 @@ async def run_followups(request: Request):
         logger.exception("gsheet_sales_sync_failed")
 
     logger.info(
-        "followup_run processed=%d sent=%d errors=%d scheduled=%d broadcasts=%d gsheet=%d",
-        processed, sent, errors, sched_sent, broadcasts_executed, gsheet_synced,
+        "followup_run processed=%d sent=%d errors=%d scheduled=%d broadcasts=%d gsheet=%d auto_calls=%d",
+        processed, sent, errors, sched_sent, broadcasts_executed, gsheet_synced, auto_calls_scheduled,
     )
     return {
         "processed": processed,
@@ -426,4 +581,5 @@ async def run_followups(request: Request):
         "scheduled_sent": sched_sent,
         "broadcasts_executed": broadcasts_executed,
         "gsheet_sales_synced": gsheet_synced,
+        "auto_calls_scheduled": auto_calls_scheduled,
     }

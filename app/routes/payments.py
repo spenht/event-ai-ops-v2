@@ -170,12 +170,42 @@ async def stripe_webhook(request: Request):
             wa = (lead.get("whatsapp") or meta.get("whatsapp") or "").strip()
             if wa:
                 facts = _event_facts(event_id or lead.get("event_id"))
-                ticket = generate_ticket_png(lead=lead, tier=tier, event=facts)
+                # Fetch ticket_config from campaign
+                _ticket_cfg = None
+                _cid = lead.get("campaign_id")
+                _wa_kw: dict[str, str] = {}  # per-campaign Twilio creds
+                if _cid:
+                    try:
+                        _cr = sb.table("campaigns").select(
+                            "ticket_config, event_name, event_date, event_location, "
+                            "twilio_account_sid, twilio_auth_token, twilio_whatsapp_from"
+                        ).eq("id", _cid).limit(1).execute()
+                        _camp = (_cr.data or [None])[0]
+                        if _camp:
+                            if isinstance(_camp.get("ticket_config"), dict):
+                                _ticket_cfg = _camp["ticket_config"]
+                            # Enrich facts from campaign if missing
+                            if not facts.get("event_name") and _camp.get("event_name"):
+                                facts["event_name"] = _camp["event_name"]
+                            if not facts.get("event_date") and _camp.get("event_date"):
+                                facts["event_date"] = _camp["event_date"]
+                            if not facts.get("event_place") and _camp.get("event_location"):
+                                facts["event_place"] = _camp["event_location"]
+                            # Per-campaign Twilio credentials
+                            if _camp.get("twilio_account_sid"):
+                                _wa_kw["account_sid"] = _camp["twilio_account_sid"]
+                            if _camp.get("twilio_auth_token"):
+                                _wa_kw["auth_token"] = _camp["twilio_auth_token"]
+                            if _camp.get("twilio_whatsapp_from"):
+                                _wa_kw["whatsapp_from"] = _camp["twilio_whatsapp_from"]
+                    except Exception:
+                        pass
+                ticket = generate_ticket_png(lead=lead, tier=tier, event=facts, ticket_config=_ticket_cfg)
                 if not settings.public_base_url:
                     # Best effort; still send without media
                     msg = "✅ Pago recibido. Ya quedaste como VIP.\n\n(Nota: falta PUBLIC_BASE_URL para mandar el QR automático.)"
                     try:
-                        await send_whatsapp(wa, msg)
+                        await send_whatsapp(wa, msg, **_wa_kw)
                     except Exception:
                         pass
                 else:
@@ -186,7 +216,7 @@ async def stripe_webhook(request: Request):
                         "Te voy a compartir un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth."
                     )
                     try:
-                        await send_whatsapp(wa, msg, media_urls=[media])
+                        await send_whatsapp(wa, msg, media_urls=[media], **_wa_kw)
                     except Exception as e:
                         logger.error("send_ticket_failed %s", str(e)[:300])
 
@@ -211,7 +241,7 @@ async def stripe_webhook(request: Request):
                     testimonial_url = (settings.whatsapp_video_testimonios or "").strip() if hasattr(settings, "whatsapp_video_testimonios") else ""
                     if testimonial_url and testimonial_url.startswith("https://"):
                         try:
-                            await send_whatsapp(wa, "🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth 👇", media_urls=[testimonial_url])
+                            await send_whatsapp(wa, "🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth 👇", media_urls=[testimonial_url], **_wa_kw)
                             sb.table("touchpoints").insert(
                                 {
                                     "lead_id": lead_id,
@@ -231,7 +261,7 @@ async def stripe_webhook(request: Request):
                                 "un evento que va a marcar un antes y un despues en tu vida.\n\n"
                                 "Cualquier pregunta que tengas, aqui estoy para servirte."
                             ).strip()
-                            await send_whatsapp(wa, closing)
+                            await send_whatsapp(wa, closing, **_wa_kw)
                         except Exception:
                             pass
 
@@ -254,20 +284,9 @@ async def stripe_webhook(request: Request):
 
                         # Schedule calendar reminder for ~10 min later
                         try:
-                            from urllib.parse import quote_plus
+                            from ..routes.whatsapp import _build_calendar_url
                             lead_name = (lead.get("name") or "").strip()
-                            e_name = facts.get("event_name") or "Beyond Wealth"
-                            e_place = facts.get("event_place") or ""
-                            e_speakers = facts.get("event_speakers") or ""
-                            details = f"{e_name}\nSpeakers: {e_speakers}\nLugar: {e_place}"
-                            cal_url = (
-                                "https://calendar.google.com/calendar/render?"
-                                f"action=TEMPLATE"
-                                f"&text={quote_plus(e_name)}"
-                                f"&details={quote_plus(details)}"
-                                f"&dates=20260327T150000Z/20260330T013000Z"
-                                f"&location={quote_plus(e_place)}"
-                            )
+                            cal_url = _build_calendar_url(facts)
                             cal_url = await create_short_url(cal_url, lead_id=lead_id, url_type="calendar", prefix="cal_")
                             send_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
                             cal_msg = (

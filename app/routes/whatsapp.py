@@ -27,6 +27,25 @@ from ..services.delayed_call_scheduler import schedule_delayed_call
 logger = logging.getLogger("whatsapp")
 
 
+def _wa_creds(campaign: dict[str, Any] | None) -> dict[str, str]:
+    """Extract per-campaign Twilio credentials for send_whatsapp() calls.
+
+    Returns a dict of keyword arguments (account_sid, auth_token, whatsapp_from)
+    that can be unpacked into send_whatsapp(**_wa_creds(campaign)).
+    Falls back to global settings when campaign has no credentials.
+    """
+    if not campaign:
+        return {}
+    creds: dict[str, str] = {}
+    if campaign.get("twilio_account_sid"):
+        creds["account_sid"] = campaign["twilio_account_sid"]
+    if campaign.get("twilio_auth_token"):
+        creds["auth_token"] = campaign["twilio_auth_token"]
+    if campaign.get("twilio_whatsapp_from"):
+        creds["whatsapp_from"] = campaign["twilio_whatsapp_from"]
+    return creds
+
+
 def _maybe_schedule_auto_call(
     lead_id: str,
     campaign_id: str,
@@ -1040,6 +1059,7 @@ async def _handle_existing_lead(
             except Exception:
                 _campaign = None
         facts = _event_facts(event_id, _campaign)
+        _ticket_cfg = _campaign.get("ticket_config") if isinstance((_campaign or {}).get("ticket_config"), dict) else None
 
         # ---------------------------------------------------------------
         # AUTO-CONFIRM GENERAL when user provides name + email
@@ -1062,7 +1082,7 @@ async def _handle_existing_lead(
                 pass
 
             if settings.public_base_url:
-                ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts)
+                ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts, ticket_config=_ticket_cfg)
                 ticket_url = f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                 cal_url = _google_calendar_url(facts)
                 cal_url = await create_short_url(cal_url, lead_id=lead_id, url_type="calendar", prefix="cal_")
@@ -1100,7 +1120,7 @@ async def _handle_existing_lead(
                     pass
 
                 # Send ticket + message
-                await send_whatsapp(to_e164=wa_e164, body=ticket_msg, media_urls=[ticket_url])
+                await send_whatsapp(to_e164=wa_e164, body=ticket_msg, media_urls=[ticket_url], **_wa_creds(campaign))
             else:
                 fallback_msg = "✅ Listo. Tu lugar en *GENERAL* esta confirmado."
                 try:
@@ -1114,7 +1134,7 @@ async def _handle_existing_lead(
                     ).execute()
                 except Exception:
                     pass
-                await send_whatsapp(to_e164=wa_e164, body=fallback_msg)
+                await send_whatsapp(to_e164=wa_e164, body=fallback_msg, **_wa_creds(campaign))
 
             return  # Done — ticket sent, don't continue to AI reply
 
@@ -1175,7 +1195,7 @@ async def _handle_existing_lead(
                     ).execute()
                 except Exception:
                     pass
-                await send_whatsapp(to_e164=wa_e164, body=vip_pitch_text)
+                await send_whatsapp(to_e164=wa_e164, body=vip_pitch_text, **_wa_creds(campaign))
 
                 # MESSAGE 2: VIP video
                 if settings.whatsapp_video_vip_pitch.strip():
@@ -1183,7 +1203,7 @@ async def _handle_existing_lead(
                     if u.startswith("https://"):
                         video_intro = "🎥 Aqui tienes un video corto de Spencer explicando el VIP:"
                         try:
-                            await send_whatsapp(to_e164=wa_e164, body=video_intro, media_urls=[u])
+                            await send_whatsapp(to_e164=wa_e164, body=video_intro, media_urls=[u], **_wa_creds(campaign))
                             # Only mark as sent AFTER successful send
                             try:
                                 sb.table("touchpoints").insert(
@@ -1371,7 +1391,7 @@ async def _handle_existing_lead(
                 ).execute()
             except Exception:
                 pass
-            await send_whatsapp(to_e164=wa_e164, body=vip_pitch_text)
+            await send_whatsapp(to_e164=wa_e164, body=vip_pitch_text, **_wa_creds(campaign))
 
             # MESSAGE 2: Send VIP video separately (with short intro text)
             if settings.whatsapp_video_vip_pitch.strip():
@@ -1379,7 +1399,7 @@ async def _handle_existing_lead(
                 if u.startswith("https://"):
                     video_intro = "🎥 Aqui tienes un video corto de Spencer explicando el VIP:"
                     try:
-                        await send_whatsapp(to_e164=wa_e164, body=video_intro, media_urls=[u])
+                        await send_whatsapp(to_e164=wa_e164, body=video_intro, media_urls=[u], **_wa_creds(campaign))
                         # Only mark as sent AFTER successful send
                         try:
                             sb.table("touchpoints").insert(
@@ -1640,7 +1660,7 @@ async def _handle_existing_lead(
             if not settings.public_base_url:
                 clean = (clean + "\n\n(Nota: falta PUBLIC_BASE_URL para mandar tu QR automático.)").strip()
             else:
-                ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts)
+                ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts, ticket_config=_ticket_cfg)
                 media_urls.append(
                     f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                 )
@@ -1677,7 +1697,7 @@ async def _handle_existing_lead(
         vip_ticket_auto_sent = False
         if str((lead.get("payment_status") or "")).upper() == "PAID":
             if settings.public_base_url and not _already_sent_ticket(lead_id, "VIP"):
-                ticket = generate_ticket_png(lead=lead, tier="VIP", event=facts)
+                ticket = generate_ticket_png(lead=lead, tier="VIP", event=facts, ticket_config=_ticket_cfg)
                 media_urls.append(
                     f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                 )
@@ -1710,7 +1730,7 @@ async def _handle_existing_lead(
             and asks_qr
             and settings.public_base_url
         ):
-            ticket = generate_ticket_png(lead=lead, tier="VIP", event=facts)
+            ticket = generate_ticket_png(lead=lead, tier="VIP", event=facts, ticket_config=_ticket_cfg)
             media_urls.append(
                 f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
             )
@@ -1736,7 +1756,7 @@ async def _handle_existing_lead(
             _sync_to_sheets(lead)
 
             if settings.public_base_url:
-                ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts)
+                ticket = generate_ticket_png(lead=lead, tier="GENERAL", event=facts, ticket_config=_ticket_cfg)
                 media_urls.append(
                     f"{settings.public_base_url.rstrip('/')}/v1/tickets/{ticket['ticket_id']}.png?t={ticket['token']}"
                 )
@@ -1795,7 +1815,7 @@ async def _handle_existing_lead(
             media_urls = list(dict.fromkeys([u for u in media_urls if u]))
 
         # Send reply via Twilio REST API (background; TwiML already returned empty).
-        await send_whatsapp(to_e164=wa_e164, body=clean, media_urls=media_urls or None)
+        await send_whatsapp(to_e164=wa_e164, body=clean, media_urls=media_urls or None, **_wa_creds(campaign))
 
         # --- Post-reply: send testimonial video + closing message (once per lead) ---
         lead_status = str((lead.get("status") or "")).upper()
@@ -1817,6 +1837,7 @@ async def _handle_existing_lead(
                         to_e164=wa_e164,
                         body="🎬 Te comparto un video con algunos testimonios para que veas la transformacion que te espera en Beyond Wealth 👇",
                         media_urls=[testimonial_url],
+                        **_wa_creds(campaign),
                     )
                     sb.table("touchpoints").insert(
                         {
@@ -1845,7 +1866,7 @@ async def _handle_existing_lead(
                             "un evento que va a marcar un antes y un despues en tu vida.\n\n"
                             "Cualquier pregunta que tengas, aqui estoy para servirte."
                         ).strip()
-                    await send_whatsapp(to_e164=wa_e164, body=closing)
+                    await send_whatsapp(to_e164=wa_e164, body=closing, **_wa_creds(campaign))
                 except Exception:
                     pass
 
@@ -1881,6 +1902,6 @@ async def _handle_existing_lead(
     except Exception:
         logger.exception("bg_reply_failed lead=%s", lead_id)
         try:
-            await send_whatsapp(to_e164=wa_e164, body="Tuve un problema técnico 😅 ¿Me escribes de nuevo?")
+            await send_whatsapp(to_e164=wa_e164, body="Tuve un problema técnico 😅 ¿Me escribes de nuevo?", **_wa_creds(campaign))
         except Exception:
             logger.exception("bg_fallback_also_failed lead=%s", lead_id)
