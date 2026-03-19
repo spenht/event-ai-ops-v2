@@ -270,7 +270,7 @@ async def run_followups(request: Request):
             .in_("status", ELIGIBLE_STATUSES)
             .neq("payment_status", "PAID")
             .eq("do_not_contact", False)
-            .limit(500)
+            .limit(5000)
             .execute()
         )
         leads = r.data or []
