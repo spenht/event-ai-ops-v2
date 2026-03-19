@@ -1940,8 +1940,9 @@ async def _handle_existing_lead(
                 except Exception:
                     pass
 
-    except Exception:
-        logger.exception("bg_reply_failed lead=%s", lead_id)
+    except Exception as _exc:
+        import traceback
+        logger.error("bg_reply_failed lead=%s err=%s\n%s", lead_id, str(_exc)[:500], traceback.format_exc()[-1000:])
         try:
             await send_whatsapp(to_e164=wa_e164, body="Tuve un problema técnico 😅 ¿Me escribes de nuevo?", **_wa_creds(campaign))
         except Exception:
