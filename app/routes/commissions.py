@@ -79,7 +79,6 @@ class CommissionConfigBody(BaseModel):
     tier: str = "VIP"
     commission_type: str = "fixed"  # "fixed" or "percentage"
     commission_value: float = 0
-    description: str = ""
 
 
 # ─── Endpoints ───────────────────────────────────────────────────────────────
@@ -122,8 +121,6 @@ async def upsert_commission_config(request: Request, body: CommissionConfigBody)
             "tier": body.tier,
             "commission_type": body.commission_type,
             "commission_value": body.commission_value,
-            "description": body.description,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         if existing.data:
             r = (
