@@ -174,11 +174,11 @@ async def enqueue(request: Request, body: EnqueueRequest):
 
 
 @router.post("/queue/next")
-async def next_call(request: Request, campaign_id: str):
+async def next_call(request: Request, campaign_id: str, user_id: str = ""):
     """Get the next call to dial for a campaign."""
     _validate_auth(request, campaign_id)
 
-    call = get_next_call(campaign_id)
+    call = get_next_call(campaign_id, agent_id=user_id or None)
     if not call:
         return {"data": None, "message": "no pending calls"}
     return {"data": call}
@@ -252,6 +252,7 @@ class BulkRequeueRequest(BaseModel):
     call_type: str = "followup"
     priority: int = 0
     filters: dict = {}  # e.g. {"no_answer": true, "not_confirmed": true, "no_vip": true}
+    assignment_mode: str = "random"  # "random" | "prefer_original" | "force_original"
 
 
 @router.post("/queue/bulk-requeue")
@@ -371,12 +372,35 @@ async def bulk_requeue(request: Request, body: BulkRequeueRequest):
                 "message": "No new leads to enqueue — all matching leads are already in queue",
             }
 
+        # 6b. Build lead → last spartan agent mapping for smart assignment
+        lead_agent_map: dict[str, str] = {}
+        if body.assignment_mode != "random" and to_enqueue:
+            try:
+                all_records = (
+                    sb.table("call_records")
+                    .select("lead_id, caller_id, created_at")
+                    .eq("campaign_id", body.campaign_id)
+                    .eq("caller_type", "spartan")
+                    .in_("lead_id", list(to_enqueue)[:500])
+                    .order("created_at", desc=True)
+                    .execute()
+                )
+                seen: set[str] = set()
+                for rec in (all_records.data or []):
+                    lid = rec["lead_id"]
+                    if lid not in seen and rec.get("caller_id"):
+                        lead_agent_map[lid] = rec["caller_id"]
+                        seen.add(lid)
+            except Exception:
+                logger.warning("failed to build lead_agent_map, falling back to random")
+
         # 7. Bulk insert into call_queue
         from uuid import uuid4
 
         now = datetime.now(timezone.utc).isoformat()
-        rows = [
-            {
+        rows = []
+        for lid in to_enqueue:
+            row = {
                 "id": str(uuid4()),
                 "campaign_id": body.campaign_id,
                 "lead_id": lid,
@@ -389,8 +413,10 @@ async def bulk_requeue(request: Request, body: BulkRequeueRequest):
                 "max_cycles": 7,
                 "created_at": now,
             }
-            for lid in to_enqueue
-        ]
+            agent = lead_agent_map.get(lid)
+            if agent:
+                row["preferred_agent"] = agent
+            rows.append(row)
 
         # Insert in batches of 200
         total_inserted = 0

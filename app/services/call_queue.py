@@ -52,6 +52,7 @@ def enqueue_call(
     call_type: str = "initial_contact",
     priority: int = 0,
     scheduled_for: Optional[str] = None,
+    preferred_agent: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Insert a new entry into call_queue. Returns the created row or None."""
     cfg = _get_campaign_retry_config(campaign_id)
@@ -71,6 +72,8 @@ def enqueue_call(
     }
     if scheduled_for:
         row["scheduled_for"] = scheduled_for
+    if preferred_agent:
+        row["preferred_agent"] = preferred_agent
 
     try:
         r = sb.table("call_queue").insert(row).execute()
@@ -249,52 +252,91 @@ def requeue_for_next_cycle(
 
 # ─── Get next call from queue ────────────────────────────────────────────────
 
-def get_next_call(campaign_id: str) -> Optional[dict[str, Any]]:
+def _fetch_pending_candidates(
+    campaign_id: str, now: str, extra_filters: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Run the two standard pending-call queries (unscheduled + scheduled-due)
+    with optional extra column filters applied to both."""
+
+    def _apply_extras(q):
+        if extra_filters:
+            for col, val in extra_filters.items():
+                if val is None:
+                    q = q.is_(col, "null")
+                else:
+                    q = q.eq(col, val)
+        return q
+
+    # First: unscheduled pending calls
+    q1 = (
+        sb.table("call_queue")
+        .select("*")
+        .eq("campaign_id", campaign_id)
+        .eq("status", "pending")
+        .is_("scheduled_for", "null")
+    )
+    q1 = _apply_extras(q1)
+    r1 = q1.order("priority", desc=True).order("created_at", desc=False).limit(1).execute()
+
+    # Second: scheduled calls that are due
+    q2 = (
+        sb.table("call_queue")
+        .select("*")
+        .eq("campaign_id", campaign_id)
+        .eq("status", "pending")
+        .lte("scheduled_for", now)
+    )
+    q2 = _apply_extras(q2)
+    r2 = q2.order("priority", desc=True).order("created_at", desc=False).limit(1).execute()
+
+    return (r1.data or []) + (r2.data or [])
+
+
+def _pick_best(candidates: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda c: (-c.get("priority", 0), c.get("created_at", ""))
+    )
+    return candidates[0]
+
+
+def get_next_call(
+    campaign_id: str, *, agent_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
     """
     Get the highest-priority pending call that is ready to be dialed.
 
     Ready means: status=pending AND (scheduled_for IS NULL OR scheduled_for <= now).
     Ordered by priority DESC, created_at ASC.
+
+    If agent_id is provided, prioritizes calls assigned to that agent, then
+    unassigned calls, then falls back to any pending call.
     """
     now = datetime.now(timezone.utc).isoformat()
 
     try:
-        # Supabase doesn't support OR with IS NULL easily, so we do two queries
-        # First: unscheduled pending calls
-        r1 = (
-            sb.table("call_queue")
-            .select("*")
-            .eq("campaign_id", campaign_id)
-            .eq("status", "pending")
-            .is_("scheduled_for", "null")
-            .order("priority", desc=True)
-            .order("created_at", desc=False)
-            .limit(1)
-            .execute()
-        )
+        if agent_id:
+            # 1. Calls preferred for this agent
+            preferred = _fetch_pending_candidates(
+                campaign_id, now, extra_filters={"preferred_agent": agent_id}
+            )
+            best = _pick_best(preferred)
+            if best:
+                return best
 
-        # Second: scheduled calls that are due
-        r2 = (
-            sb.table("call_queue")
-            .select("*")
-            .eq("campaign_id", campaign_id)
-            .eq("status", "pending")
-            .lte("scheduled_for", now)
-            .order("priority", desc=True)
-            .order("created_at", desc=False)
-            .limit(1)
-            .execute()
-        )
+            # 2. Unassigned calls (preferred_agent IS NULL)
+            unassigned = _fetch_pending_candidates(
+                campaign_id, now, extra_filters={"preferred_agent": None}
+            )
+            best = _pick_best(unassigned)
+            if best:
+                return best
 
-        candidates = (r1.data or []) + (r2.data or [])
-        if not candidates:
-            return None
+            # 3. Fall back to any pending call (original behavior)
 
-        # Pick highest priority, then earliest created
-        candidates.sort(
-            key=lambda c: (-c.get("priority", 0), c.get("created_at", ""))
-        )
-        return candidates[0]
+        candidates = _fetch_pending_candidates(campaign_id, now)
+        return _pick_best(candidates)
 
     except Exception as exc:
         logger.error(
