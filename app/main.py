@@ -26,6 +26,7 @@ from .routes.commissions import router as commissions_router
 from .routes.spartan_dashboard import router as spartan_dashboard_router
 from .routes.payment_verification import router as payment_verification_router
 from .routes.media import router as media_router
+from .routes.landing_pages import router as landing_pages_router
 
 logging.basicConfig(level=logging.INFO)
 
@@ -60,6 +61,7 @@ app.include_router(commissions_router)
 app.include_router(spartan_dashboard_router)
 app.include_router(payment_verification_router)
 app.include_router(media_router)
+app.include_router(landing_pages_router)
 
 
 @app.get("/health")
