@@ -97,10 +97,11 @@ async def create_landing_page(campaign_id: str, request: Request):
     body = await request.json()
     sb = _sb()
 
-    # Get campaign for org_id
-    camp = sb.table("campaigns").select("org_id, event_name").eq("id", campaign_id).limit(1).execute()
-    org_id = (camp.data or [{}])[0].get("org_id", "")
-    event_name = (camp.data or [{}])[0].get("event_name", "Mi Evento")
+    # Get campaign for org_id and tracking pixels
+    camp = sb.table("campaigns").select("org_id, event_name, meta_pixel_id, google_tag_id, tiktok_pixel_id").eq("id", campaign_id).limit(1).execute()
+    camp_data = (camp.data or [{}])[0]
+    org_id = camp_data.get("org_id", "")
+    event_name = camp_data.get("event_name", "Mi Evento")
 
     template_id = body.get("template_id", "evento_presencial")
     template = TEMPLATES.get(template_id, TEMPLATES["evento_presencial"])
@@ -123,9 +124,9 @@ async def create_landing_page(campaign_id: str, request: Request):
         "template_id": template_id,
         "sections": sections,
         "theme": template["theme"],
-        "meta_pixel_id": body.get("meta_pixel_id", ""),
-        "google_tag_id": body.get("google_tag_id", ""),
-        "tiktok_pixel_id": body.get("tiktok_pixel_id", ""),
+        "meta_pixel_id": body.get("meta_pixel_id") or camp_data.get("meta_pixel_id", ""),
+        "google_tag_id": body.get("google_tag_id") or camp_data.get("google_tag_id", ""),
+        "tiktok_pixel_id": body.get("tiktok_pixel_id") or camp_data.get("tiktok_pixel_id", ""),
         "og_title": body.get("og_title", event_name),
         "og_description": body.get("og_description", ""),
         "og_image": body.get("og_image", ""),
