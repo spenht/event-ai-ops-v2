@@ -182,8 +182,10 @@ async def delete_landing_page(page_id: str, request: Request):
 # ─── Public Render Endpoint ─────────────────────────────────────────────────
 
 @router.get("/landing-pages/render/{slug}")
-async def render_landing_page(slug: str):
-    """Public endpoint — returns landing page data for the Next.js renderer."""
+async def render_landing_page(slug: str, preview: Optional[str] = Query(None)):
+    """Public endpoint — returns landing page data for the Next.js renderer.
+    ?preview=true allows viewing draft pages (used by the visual editor iframe).
+    """
     sb = _sb()
     r = sb.table("landing_pages").select(
         "id, campaign_id, title, slug, sections, theme, "
@@ -192,7 +194,9 @@ async def render_landing_page(slug: str):
     ).eq("slug", slug).limit(1).execute()
 
     page = (r.data or [None])[0]
-    if not page or page.get("status") not in ("published", "draft"):
+    is_preview = preview == "true"
+    allowed_statuses = ("published", "draft") if is_preview else ("published",)
+    if not page or page.get("status") not in allowed_statuses:
         raise HTTPException(status_code=404, detail="Page not found")
 
     # Get campaign info for the form
