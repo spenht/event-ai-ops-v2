@@ -304,25 +304,33 @@ custom:
   content: {{html}}
   style: {{background, text_color}}
 
-REGLAS CRÍTICAS:
-1. SIGUE AL PIE DE LA LETRA las instrucciones del usuario. Si dice "cambia el headline a X", usa EXACTAMENTE el texto X, no lo parafrasees ni lo mejores.
-2. Si el usuario dice un color específico (ej "dorado", "rojo"), usa ese color exacto.
-3. Si el usuario pide agregar/quitar/mover una sección específica, hazlo EXACTAMENTE como pide.
-4. Si el usuario proporciona URLs de imágenes o videos, úsalas EXACTAMENTE en los campos correspondientes (image_url, video_url, background_image).
-5. Cuando modificas secciones existentes, PRESERVA todo el contenido que el usuario NO pidió cambiar. No borres ni cambies cosas que no se pidieron.
-6. Mantén TODOS los campos de cada sección, incluso los vacíos. No omitas campos del schema.
-7. El order de las secciones debe ser secuencial empezando en 1.
-8. Cada sección DEBE tener un campo "id" como string único (usa tipo-orden, ej "hero-1", "benefits-3").
+REGLA #1 — LA MÁS IMPORTANTE:
+Tu ÚNICA prioridad es hacer EXACTAMENTE lo que el usuario pide. NO "mejores" ni "optimices" nada que el usuario no haya pedido. Si el usuario dice "quiero una franja arriba con el título", crea exactamente eso. NO agregues ni quites cosas que el usuario no mencionó.
 
-Responde SOLO con JSON válido. El formato debe ser:
+REGLAS ADICIONALES:
+2. Si el usuario dice "cambia el headline a X", usa EXACTAMENTE el texto X. No parafrasees.
+3. Si el usuario dice un color específico (ej "dorado", "rojo"), usa ese color exacto.
+4. Si el usuario pide agregar/quitar/mover una sección específica, hazlo EXACTAMENTE.
+5. Si el usuario proporciona URLs de imágenes o videos, úsalas en los campos correspondientes.
+6. PRESERVA todo el contenido que el usuario NO pidió cambiar. No borres ni modifiques cosas que no se pidieron expresamente.
+7. Mantén TODOS los campos de cada sección, incluso los vacíos.
+8. El order debe ser secuencial empezando en 1.
+9. Cada sección DEBE tener un campo "id" como string único (ej "hero-1", "custom-1").
+
+USO DE SECCIÓN "custom":
+Cuando el usuario pide algo que no encaja en los tipos predefinidos (barras, franjas, banners, divisores, secciones con layout específico, texto con tipografía especial), usa type "custom" con HTML inline en content.html. El HTML puede usar estilos inline y Tailwind CSS. Ejemplo de franja/banner:
+{{
+  "type": "custom",
+  "content": {{
+    "html": "<div style='background: #1a1a2e; padding: 16px; text-align: center;'><h1 style='font-size: 2.5rem; font-weight: 900; letter-spacing: -0.02em; margin: 0;'>BEYOND WEALTH</h1><p style='font-size: 0.875rem; opacity: 0.7; margin-top: 4px;'>Miami · 26 de Abril 2026</p></div>"
+  }},
+  "style": {{"background": "#1a1a2e", "text_color": "#ffffff"}}
+}}
+
+Responde SOLO con JSON válido:
 {{"sections": [...], "theme": {{"primary_color": "...", "secondary_color": "...", "background_color": "...", "text_color": "...", "font_heading": "Montserrat", "font_body": "Inter"}}}}
 
-Optimiza para:
-- Móvil primero (la mayoría del tráfico es mobile en LATAM)
-- Urgencia y escasez en el copy
-- CTAs claros y llamativos
-- Colores que generen confianza y emoción
-- Textos en español latinoamericano"""
+Contexto general: landing pages para el mercado LATAM, mobile-first, textos en español latinoamericano."""
 
     user_msg = prompt
     if current_sections:
