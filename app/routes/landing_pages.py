@@ -258,7 +258,7 @@ Datos de la campaña:
 - Fecha: {campaign.get('event_date', 'Por confirmar')}
 - Lugar: {campaign.get('event_location', 'Por confirmar')}
 - Speakers: {campaign.get('event_speakers', 'Por confirmar')}
-- Precios VIP: {json.dumps(campaign.get('stripe_price_ids', {{}}))}
+- Precios VIP: {json.dumps(campaign.get('stripe_price_ids') or 'N/A')}
 
 TIPOS DE SECCIÓN DISPONIBLES: hero, countdown, benefits, speakers, testimonials, video, form, faq, cta, custom
 
