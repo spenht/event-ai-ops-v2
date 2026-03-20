@@ -136,6 +136,18 @@ async def create_landing_page(campaign_id: str, request: Request):
     return {"ok": True, "data": (r.data or [{}])[0]}
 
 
+@router.get("/landing-pages/{page_id}")
+async def get_landing_page(page_id: str, request: Request):
+    """Get a single landing page by ID."""
+    sb = _sb()
+    r = sb.table("landing_pages").select("*").eq("id", page_id).limit(1).execute()
+    page = (r.data or [None])[0]
+    if not page:
+        raise HTTPException(status_code=404, detail="Landing page not found")
+    _validate_auth(request, page.get("campaign_id", ""))
+    return {"ok": True, "data": page}
+
+
 @router.patch("/landing-pages/{page_id}")
 async def update_landing_page(page_id: str, request: Request):
     body = await request.json()
