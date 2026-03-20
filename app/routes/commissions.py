@@ -259,18 +259,29 @@ async def mark_paid(request: Request, commission_id: str, campaign_id: str):
 # ── Commission Tiers (volume escalation) ──────────────────────────
 
 
+def _campaign_id_from_config(config_id: str) -> str | None:
+    """Resolve campaign_id from a commission_config row."""
+    try:
+        r = sb.table("commission_configs").select("campaign_id").eq("id", config_id).limit(1).execute()
+        return (r.data or [{}])[0].get("campaign_id")
+    except Exception:
+        return None
+
+
 @router.get("/config/{config_id}/tiers")
-async def list_commission_tiers(config_id: str, request: Request):
+async def list_commission_tiers(config_id: str, request: Request, campaign_id: str = ""):
     """List escalation tiers for a commission config."""
-    _validate_auth(request)
+    cid = campaign_id or _campaign_id_from_config(config_id)
+    _validate_auth(request, cid)
     r = sb.table("commission_tiers").select("*").eq("config_id", config_id).order("min_sales").execute()
     return {"ok": True, "data": r.data or []}
 
 
 @router.post("/config/{config_id}/tiers")
-async def upsert_commission_tier(config_id: str, request: Request):
+async def upsert_commission_tier(config_id: str, request: Request, campaign_id: str = ""):
     """Create or update an escalation tier."""
-    _validate_auth(request)
+    cid = campaign_id or _campaign_id_from_config(config_id)
+    _validate_auth(request, cid)
     body = await request.json()
     row = {
         "config_id": config_id,
@@ -287,9 +298,9 @@ async def upsert_commission_tier(config_id: str, request: Request):
 
 
 @router.delete("/tiers/{tier_id}")
-async def delete_commission_tier(tier_id: str, request: Request):
+async def delete_commission_tier(tier_id: str, request: Request, campaign_id: str = ""):
     """Delete an escalation tier."""
-    _validate_auth(request)
+    _validate_auth(request, campaign_id if campaign_id else None)
     sb.table("commission_tiers").delete().eq("id", tier_id).execute()
     return {"ok": True}
 
