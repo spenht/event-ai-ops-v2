@@ -257,18 +257,61 @@ Datos de la campaña:
 - Fecha: {campaign.get('event_date', 'Por confirmar')}
 - Lugar: {campaign.get('event_location', 'Por confirmar')}
 - Speakers: {campaign.get('event_speakers', 'Por confirmar')}
-- Precios VIP: {json.dumps(campaign.get('stripe_price_ids', {}))}
+- Precios VIP: {json.dumps(campaign.get('stripe_price_ids', {{}}))}
 
 TIPOS DE SECCIÓN DISPONIBLES: hero, countdown, benefits, speakers, testimonials, video, form, faq, cta, custom
 
-SCHEMA de cada sección:
-{{
-  "type": "hero|countdown|benefits|speakers|testimonials|video|form|faq|cta|custom",
-  "order": 1,
-  "visible": true,
-  "content": {{...campos específicos del tipo...}},
-  "style": {{"background": "...", "text_color": "...", "cta_color": "..."}}
-}}
+SCHEMA DETALLADO DE CADA TIPO DE SECCIÓN:
+
+hero:
+  content: {{headline, subheadline, cta_text, cta_url, video_url, background_image}}
+  style: {{background, text_color, cta_color}}
+
+countdown:
+  content: {{headline, target_date}}  (target_date en ISO formato)
+  style: {{background, text_color}}
+
+benefits:
+  content: {{headline, items: [{{icon, title, description}}]}}
+  style: {{background, text_color}}
+
+speakers:
+  content: {{headline, speakers: [{{name, title, image_url, bio}}]}}
+  style: {{background, text_color}}
+
+testimonials:
+  content: {{headline, items: [{{name, text, image_url}}]}}
+  style: {{background, text_color}}
+
+video:
+  content: {{headline, video_url, description}}
+  style: {{background, text_color}}
+
+form:
+  content: {{headline, subheadline, fields: ["name","email","whatsapp"], cta_text, success_message}}
+  style: {{background, text_color, cta_color}}
+
+faq:
+  content: {{headline, items: [{{question, answer}}]}}
+  style: {{background, text_color}}
+
+cta:
+  content: {{headline, subheadline, cta_text, cta_url}}
+  style: {{background, text_color, cta_color}}
+
+custom:
+  content: {{html}}
+  style: {{background, text_color}}
+
+REGLAS CRÍTICAS:
+1. SIGUE AL PIE DE LA LETRA las instrucciones del usuario. Si dice "cambia el headline a X", usa EXACTAMENTE el texto X, no lo parafrasees ni lo mejores.
+2. Si el usuario dice un color específico (ej "dorado", "rojo"), usa ese color exacto.
+3. Si el usuario pide agregar/quitar/mover una sección específica, hazlo EXACTAMENTE como pide.
+4. Si el usuario proporciona URLs de imágenes o videos, úsalas EXACTAMENTE en los campos correspondientes (image_url, video_url, background_image).
+5. Cuando modificas secciones existentes, PRESERVA todo el contenido que el usuario NO pidió cambiar. No borres ni cambies cosas que no se pidieron.
+6. Mantén TODOS los campos de cada sección, incluso los vacíos. No omitas campos del schema.
+7. El order de las secciones debe ser secuencial empezando en 1.
+8. Cada sección DEBE tener un campo "id" como string único (usa tipo-orden, ej "hero-1", "benefits-3").
 
 Responde SOLO con JSON válido. El formato debe ser:
 {{"sections": [...], "theme": {{"primary_color": "...", "secondary_color": "...", "background_color": "...", "text_color": "...", "font_heading": "Montserrat", "font_body": "Inter"}}}}
@@ -292,13 +335,13 @@ Optimiza para:
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
                 json={
-                    "model": "gpt-4o-mini",
+                    "model": "gpt-4o",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_msg}
                     ],
                     "response_format": {"type": "json_object"},
-                    "temperature": 0.7,
+                    "temperature": 0.4,
                 }
             )
             data = r.json()
