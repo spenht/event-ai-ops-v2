@@ -532,8 +532,8 @@ async def get_job_status(job_id: str):
 
 # ─── AI Generation (async job pattern) ────────────────────────────────────
 
-async def _run_generate_job(job_id: str, campaign_id: str, prompt: str, current_sections):
-    """Background task: call OpenAI and store result in _JOBS."""
+async def _run_generate_job(job_id: str, campaign_id: str, prompt: str, current_sections, chat_history: list = None):
+    """Background task: call AI and store result in _JOBS."""
     logger.info(f"Generate job {job_id} started, campaign={campaign_id}")
     try:
         sb = _sb()
@@ -542,7 +542,7 @@ async def _run_generate_job(job_id: str, campaign_id: str, prompt: str, current_
             r = sb.table("campaigns").select("*").eq("id", campaign_id).limit(1).execute()
             campaign = (r.data or [{}])[0]
 
-        result = await _call_openai_generate(campaign, prompt, current_sections)
+        result = await _call_openai_generate(campaign, prompt, current_sections, chat_history or [])
         logger.info(f"Generate job {job_id}: DONE, {len(result.get('sections', []))} sections")
         _JOBS[job_id] = {**_JOBS[job_id], "status": "done", "data": result}
     except Exception as exc:
@@ -550,8 +550,8 @@ async def _run_generate_job(job_id: str, campaign_id: str, prompt: str, current_
         _JOBS[job_id] = {**_JOBS[job_id], "status": "error", "error": str(exc)[:300]}
 
 
-async def _call_openai_generate(campaign: dict, prompt: str, current_sections) -> dict:
-    """Actual OpenAI call for generation."""
+async def _call_openai_generate(campaign: dict, prompt: str, current_sections, chat_history: list = None) -> dict:
+    """Actual AI call for generation."""
     event_name = campaign.get('event_name', 'Mi Evento')
     event_date = campaign.get('event_date', 'Por confirmar')
     event_location = campaign.get('event_location', 'Por confirmar')
@@ -585,7 +585,24 @@ REMINDER: Return ALL {len(current_sections)} sections. Only modify what the user
         user_msg = prompt
 
     import httpx
-    logger.info(f"AI generate: system={len(system_prompt)} chars, user={len(user_msg)} chars")
+    logger.info(f"AI generate: system={len(system_prompt)} chars, user={len(user_msg)} chars, history={len(chat_history or [])}")
+
+    # Build conversation messages with history
+    # Keep last 10 exchanges max to avoid context bloat
+    history = (chat_history or [])[-20:]  # 20 messages = ~10 exchanges
+    messages = []
+    for msg in history:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role in ("user", "assistant") and content:
+            # Truncate old assistant messages (they contain huge JSON) to save tokens
+            if role == "assistant" and len(content) > 200:
+                content = content[:200] + "... [previous response truncated]"
+            messages.append({"role": role, "content": content})
+    # Add the current user message
+    messages.append({"role": "user", "content": user_msg})
+    # Assistant prefill forces Claude to start with JSON immediately
+    messages.append({"role": "assistant", "content": "{"})
 
     # Use Claude (Anthropic) if API key available, otherwise fall back to OpenAI
     if settings.anthropic_api_key:
@@ -602,11 +619,7 @@ REMINDER: Return ALL {len(current_sections)} sections. Only modify what the user
                     "max_tokens": 16384,
                     "temperature": 0.2,
                     "system": system_prompt,
-                    "messages": [
-                        {"role": "user", "content": user_msg},
-                        # Assistant prefill forces Claude to start with JSON immediately
-                        {"role": "assistant", "content": "{"},
-                    ],
+                    "messages": messages,
                 }
             )
             if r.status_code != 200:
@@ -620,17 +633,23 @@ REMINDER: Return ALL {len(current_sections)} sections. Only modify what the user
             if stop_reason == "max_tokens":
                 logger.warning("Claude response was TRUNCATED (stop_reason=max_tokens)")
     else:
-        # Fallback to OpenAI
+        # Fallback to OpenAI — build messages with history
+        oai_messages = [{"role": "system", "content": system_prompt}]
+        for msg in history:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role in ("user", "assistant") and content:
+                if role == "assistant" and len(content) > 200:
+                    content = content[:200] + "... [previous response truncated]"
+                oai_messages.append({"role": role, "content": content})
+        oai_messages.append({"role": "user", "content": user_msg})
         async with httpx.AsyncClient(timeout=120.0) as client:
             r = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
                 json={
                     "model": "gpt-4o",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_msg}
-                    ],
+                    "messages": oai_messages,
                     "response_format": {"type": "json_object"},
                     "temperature": 0.15,
                     "max_tokens": 16384,
@@ -668,6 +687,7 @@ async def generate_landing_page(request: Request):
     campaign_id = body.get("campaign_id", "")
     prompt = body.get("prompt", "")
     current_sections = body.get("current_sections")
+    chat_history = body.get("chat_history", [])  # [{role: "user"|"assistant", content: "..."}]
 
     if campaign_id:
         _validate_auth(request, campaign_id)
@@ -681,7 +701,7 @@ async def generate_landing_page(request: Request):
 
     # Fire and forget — the background task updates _JOBS when done
     logger.info(f"Starting generate job {job_id} for campaign {campaign_id}")
-    asyncio.ensure_future(_run_generate_job(job_id, campaign_id, prompt, current_sections))
+    asyncio.ensure_future(_run_generate_job(job_id, campaign_id, prompt, current_sections, chat_history))
 
     return {"ok": True, "job_id": job_id, "status": "processing"}
 
