@@ -595,6 +595,20 @@ REMINDER: Return ALL {len(current_sections)} sections. Only modify what the user
         role = msg.get("role", "user")
         content = msg.get("content", "")
         if role in ("user", "assistant") and content:
+            # If content is a list of content blocks (text + images), extract text only
+            # This avoids sending empty/broken base64 images to the API
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                        # Skip image blocks — they bloat context and can have empty base64
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                content = "\n".join(text_parts).strip()
+                if not content:
+                    continue
             # Truncate old assistant messages (they contain huge JSON) to save tokens
             if role == "assistant" and len(content) > 200:
                 content = content[:200] + "... [previous response truncated]"
@@ -639,6 +653,17 @@ REMINDER: Return ALL {len(current_sections)} sections. Only modify what the user
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if role in ("user", "assistant") and content:
+                # Strip image blocks from content arrays (same as Claude path)
+                if isinstance(content, list):
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                        elif isinstance(block, str):
+                            text_parts.append(block)
+                    content = "\n".join(text_parts).strip()
+                    if not content:
+                        continue
                 if role == "assistant" and len(content) > 200:
                     content = content[:200] + "... [previous response truncated]"
                 oai_messages.append({"role": role, "content": content})
