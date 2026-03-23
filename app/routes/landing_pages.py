@@ -418,6 +418,21 @@ async def create_landing_page(campaign_id: str, request: Request):
     return {"ok": True, "data": (r.data or [{}])[0]}
 
 
+# ─── Templates List (MUST be before {page_id} route) ──────────────────────
+
+@router.get("/landing-pages/templates")
+async def list_templates():
+    """List available landing page templates."""
+    return {
+        "ok": True,
+        "data": [
+            {"id": k, "name": v["name"], "description": v["description"],
+             "category": v.get("category", "general"), "section_count": len(v["sections"])}
+            for k, v in TEMPLATES.items()
+        ]
+    }
+
+
 @router.get("/landing-pages/{page_id}")
 async def get_landing_page(page_id: str, request: Request):
     """Get a single landing page by ID."""
@@ -495,18 +510,7 @@ async def render_landing_page(slug: str, preview: Optional[str] = Query(None)):
     }
 
 
-# ─── Templates List ─────────────────────────────────────────────────────────
-
-@router.get("/landing-pages/templates")
-async def list_templates():
-    """List available landing page templates."""
-    return {
-        "ok": True,
-        "data": [
-            {"id": k, "name": v["name"], "description": v["description"], "section_count": len(v["sections"])}
-            for k, v in TEMPLATES.items()
-        ]
-    }
+# Templates list endpoint moved above {page_id} route to avoid conflict
 
 
 # ─── Job polling endpoint ──────────────────────────────────────────────────
