@@ -30,11 +30,17 @@ router = APIRouter(prefix="/v1/calls/webrtc", tags=["webrtc"])
 
 
 def _normalize_phone_for_voice(phone: str) -> str:
-    """Normalize phone number for Telnyx voice calls.
+    """Normalize phone number for Telnyx voice calls (must be +E.164).
 
-    Mexican WhatsApp numbers use +521XXXXXXXXXX but Telnyx voice
-    requires +52XXXXXXXXXX (without the extra 1 after country code).
+    - Adds + prefix if missing
+    - Mexican WhatsApp numbers: +521XXXXXXXXXX → +52XXXXXXXXXX
+    - Strips whitespace and hyphens
     """
+    phone = phone.strip().replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
+    if phone.startswith("whatsapp:"):
+        phone = phone[len("whatsapp:"):]
+    if not phone.startswith("+") and len(phone) >= 10:
+        phone = "+" + phone
     if phone.startswith("+521") and len(phone) == 14:
         return "+52" + phone[4:]
     return phone
