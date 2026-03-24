@@ -144,6 +144,36 @@ async def delete_profile(profile_id: str):
     return {"ok": True}
 
 
+@router.get("/team/{campaign_id}")
+async def campaign_team(campaign_id: str):
+    """Get all team members (campaign_members) for a campaign with their user info."""
+    sb = _sb()
+    r = sb.table("campaign_members").select("user_id").eq("campaign_id", campaign_id).execute()
+    members = r.data or []
+
+    # Get user info from auth.users via org_members
+    result = []
+    for m in members:
+        uid = m["user_id"]
+        # Try to get user email from org_members or auth
+        try:
+            ur = sb.table("org_members").select("*").eq("user_id", uid).limit(1).execute()
+            user_info = (ur.data or [{}])[0]
+            # Also try spartan_sessions for name
+            sr = sb.table("spartan_sessions").select("*").eq("user_id", uid).order("started_at", desc=True).limit(1).execute()
+            session = (sr.data or [{}])[0]
+            result.append({
+                "user_id": uid,
+                "role": user_info.get("role", "agent"),
+                "email": session.get("user_email", ""),
+                "name": session.get("user_name", ""),
+            })
+        except Exception:
+            result.append({"user_id": uid, "role": "agent", "email": "", "name": ""})
+
+    return {"ok": True, "data": result}
+
+
 @router.get("/types")
 async def list_profile_types():
     """Return available profile types with descriptions."""
