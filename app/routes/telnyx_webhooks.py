@@ -287,14 +287,16 @@ async def _handle_call_answered(
                 str(exc)[:300],
             )
 
-    # For AI calls: start media streaming and recording
-    if caller_type == "ai":
-        # Resolve API key from campaign
-        campaign = _resolve_campaign_by_id(campaign_id) if campaign_id else None
-        telnyx_creds = _campaign_telnyx(campaign)
-        api_key = telnyx_creds.get("telnyx_api_key", "")
+    # Resolve API key from campaign (needed for recording and streaming)
+    campaign = _resolve_campaign_by_id(campaign_id) if campaign_id else None
+    telnyx_creds = _campaign_telnyx(campaign)
+    api_key = telnyx_creds.get("telnyx_api_key", "")
 
-        # Build WebSocket URL for media streaming
+    # Start recording for ALL call types (spartan + AI)
+    asyncio.create_task(start_recording(call_control_id, telnyx_api_key=api_key))
+
+    # For AI calls: also start media streaming (for real-time AI interaction)
+    if caller_type == "ai":
         base_url = (settings.public_base_url or "").rstrip("/")
         if base_url:
             ws_url = base_url.replace("https://", "wss://").replace("http://", "ws://")
@@ -302,9 +304,6 @@ async def _handle_call_answered(
             asyncio.create_task(
                 start_media_streaming(call_control_id, telnyx_api_key=api_key, stream_url=stream_url)
             )
-
-        # Start recording
-        asyncio.create_task(start_recording(call_control_id, telnyx_api_key=api_key))
 
     # Log touchpoint
     if lead_id:
