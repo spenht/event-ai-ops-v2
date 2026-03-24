@@ -630,39 +630,28 @@ async def media_stream(websocket: WebSocket, call_control_id: str):
             }
             sent = False
 
-            # ALWAYS send SMS as primary delivery (works for ALL leads, no 24h window needed)
+            # 1. Try WhatsApp template (APPROVED — works outside 24h window, cheap)
             try:
-                import httpx as _httpx
-                _telnyx_key = (campaign.get("telnyx_api_key") or "").strip()
-                _sms_from = "+16186770164"  # Messaging-enabled number
-                if _telnyx_key:
-                    _sms_text = (
-                        f"Hola {lead.get('name', '')}! Tu boleto GRATIS para "
-                        f"{(campaign.get('event_name') or 'el evento')} esta listo.\n\n"
-                        f"Descargalo aqui: {media_url}\n\n"
-                        f"Guardalo y presentalo en la entrada. Te esperamos!"
-                    )
-                    async with _httpx.AsyncClient(timeout=10.0) as _client:
-                        _sms_resp = await _client.post(
-                            "https://api.telnyx.com/v2/messages",
-                            headers={"Authorization": f"Bearer {_telnyx_key}", "Content-Type": "application/json"},
-                            json={"from": _sms_from, "to": wa_number, "text": _sms_text, "type": "SMS"},
-                        )
-                        if _sms_resp.status_code < 300:
-                            sent = True
-                            logger.info("send_ticket_sms_ok lead=%s tier=%s", lead_id, tier)
-                        else:
-                            logger.error("send_ticket_sms_status=%s body=%s", _sms_resp.status_code, _sms_resp.text[:200])
-            except Exception as exc_sms:
-                logger.error("send_ticket_sms_failed err=%s", str(exc_sms)[:200])
-
-            # ALSO try WhatsApp (may work if within 24h window — lead gets it both ways)
-            try:
-                if _wa_creds.get("account_sid"):
+                from ..services.twilio_whatsapp import send_whatsapp_template
+                event_name = (campaign.get("event_name") or "Evento").strip()
+                event_date = (str(campaign.get("event_date") or "")).strip()[:10]
+                await send_whatsapp_template(
+                    to=wa_number,
+                    content_sid="HX5b3eab4955f93d3d4699478a07c51351",
+                    variables={"1": lead.get("name", ""), "2": event_name, "3": event_date, "4": media_url},
+                    **_wa_creds,
+                )
+                sent = True
+                logger.info("send_ticket_wa_template_ok lead=%s tier=%s", lead_id, tier)
+            except Exception as exc_wa:
+                logger.warning("send_ticket_wa_template_failed err=%s — trying direct WA", str(exc_wa)[:200])
+                # 2. Fallback: direct WhatsApp (works if within 24h window)
+                try:
                     await send_whatsapp(wa_number, msg, media_urls=[media_url], **_wa_creds)
-                    logger.info("send_ticket_wa_also_ok lead=%s tier=%s", lead_id, tier)
-            except Exception:
-                pass  # SMS already sent, WhatsApp is bonus
+                    sent = True
+                    logger.info("send_ticket_wa_direct_ok lead=%s tier=%s", lead_id, tier)
+                except Exception:
+                    logger.warning("send_ticket_wa_direct_also_failed lead=%s", lead_id)
 
             if sent:
                 try:
