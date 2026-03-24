@@ -427,8 +427,18 @@ def build_voice_system_prompt(
     # VIP section — multi-tier pricing from campaign config
     lines.append("")
     lines.append("═══ EXPERIENCIA VI-AI-PI ═══")
-    from ..services.stripe_checkout import get_vip_tiers  # lazy import to avoid circular
-    _vip_tiers = get_vip_tiers(campaign)
+    # Extract VIP tiers from campaign stripe_price_ids
+    _vip_tiers = []
+    _spi = campaign.get("stripe_price_ids")
+    if isinstance(_spi, dict):
+        for k, v in sorted(_spi.items()):
+            if isinstance(v, dict):
+                _vip_tiers.append({
+                    "option": k,
+                    "label": v.get("label", f"VIP opción {k}"),
+                    "display_price": v.get("display_price", ""),
+                    "price_id": v.get("price_id", ""),
+                })
     if _vip_tiers and any(t.get("display_price") for t in _vip_tiers):
         if len(_vip_tiers) == 1:
             _t = _vip_tiers[0]
