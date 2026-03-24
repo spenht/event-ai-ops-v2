@@ -1,0 +1,408 @@
+"""Financial dashboard endpoints — Super Admin only."""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import httpx
+from fastapi import APIRouter, HTTPException, Query, Request
+
+from ..deps import sb
+from ..settings import settings
+
+logger = logging.getLogger("finance")
+router = APIRouter(prefix="/v1/finance", tags=["finance"])
+
+# ─── Stripe account map ────────────────────────────────────────────────────
+
+STRIPE_ACCOUNTS = {
+    "uvul": {"name": "Una Vida Un Legado (MX)", "currency": "MXN"},
+    "lba": {"name": "Legacy Business Academy", "currency": "USD"},
+    "oll": {"name": "One Life Legacy", "currency": "USD"},
+    "2clicks": {"name": "2clicks.com", "currency": "USD"},
+}
+
+MERCURY_ACCOUNTS = {
+    "oll": {"name": "One Life Legacy"},
+    "2clicks": {"name": "2clicks.com"},
+    "lba": {"name": "Legacy Business Academy"},
+}
+
+
+def _get_stripe_key(account: str) -> str:
+    key_map = {
+        "uvul": getattr(settings, "stripe_key_uvul", ""),
+        "lba": getattr(settings, "stripe_key_lba", ""),
+        "oll": getattr(settings, "stripe_key_oll", ""),
+        "2clicks": getattr(settings, "stripe_key_2clicks", ""),
+    }
+    return key_map.get(account, "")
+
+
+def _get_mercury_key(account: str) -> str:
+    key_map = {
+        "oll": getattr(settings, "mercury_key_oll", ""),
+        "2clicks": getattr(settings, "mercury_key_2clicks", ""),
+        "lba": getattr(settings, "mercury_key_lba", ""),
+    }
+    return key_map.get(account, "")
+
+
+def _require_super_admin(request: Request):
+    """Only super admin (Spencer) can access global finance data."""
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "").strip()
+    spartans_key = (request.headers.get("x-spartans-key") or "").strip()
+    cron_token = (request.headers.get("x-cron-token") or "").strip()
+    if settings.cron_token and cron_token == settings.cron_token:
+        return
+    if spartans_key and settings.spartans_key and spartans_key == settings.spartans_key:
+        return
+    # Check if user is org owner
+    if token:
+        try:
+            from supabase import create_client
+            sb_client = create_client(settings.supabase_url, settings.supabase_service_role_key)
+            user = sb_client.auth.get_user(token)
+            if user and user.user:
+                uid = user.user.id
+                org = sb_client.table("orgs").select("owner_id").eq("owner_id", uid).limit(1).execute()
+                if org.data:
+                    return
+        except Exception:
+            pass
+    if not settings.cron_token:
+        return  # dev mode
+    raise HTTPException(status_code=403, detail="Super admin access required")
+
+
+# ─── Projects CRUD ──────────────────────────────────────────────────────────
+
+
+@router.get("/projects")
+async def list_projects(request: Request):
+    _require_super_admin(request)
+    r = sb.table("projects").select("*").order("created_at", desc=True).execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/projects")
+async def create_project(request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    name = body.get("name", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    r = sb.table("projects").insert({
+        "name": name,
+        "description": body.get("description", ""),
+        "stripe_account": body.get("stripe_account", ""),
+        "mercury_account": body.get("mercury_account", ""),
+        "config": body.get("config", {}),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.patch("/projects/{project_id}")
+async def update_project(project_id: str, request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    allowed = {"name", "description", "stripe_account", "mercury_account", "status", "config"}
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if updates:
+        updates["updated_at"] = "now()"
+        r = sb.table("projects").update(updates).eq("id", project_id).execute()
+        return {"ok": True, "data": (r.data or [{}])[0]}
+    return {"ok": True}
+
+
+# ─── Global Financial Overview ──────────────────────────────────────────────
+
+
+@router.get("/overview")
+async def financial_overview(request: Request):
+    """Global financial overview — all Stripe + Mercury + Whop balances."""
+    _require_super_admin(request)
+
+    result = {"stripe": {}, "mercury": {}, "whop": None, "totals": {}}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Stripe balances
+        for acct_id, info in STRIPE_ACCOUNTS.items():
+            key = _get_stripe_key(acct_id)
+            if not key:
+                continue
+            try:
+                r = await client.get("https://api.stripe.com/v1/balance", auth=(key, ""))
+                if r.status_code == 200:
+                    d = r.json()
+                    available = sum(b["amount"] for b in d.get("available", [])) / 100
+                    pending = sum(b["amount"] for b in d.get("pending", [])) / 100
+                    currency = d["available"][0]["currency"].upper() if d.get("available") else info["currency"]
+                    result["stripe"][acct_id] = {
+                        "name": info["name"],
+                        "available": available,
+                        "pending": pending,
+                        "currency": currency,
+                    }
+            except Exception as e:
+                logger.warning("stripe_balance_error acct=%s err=%s", acct_id, str(e)[:80])
+
+        # Mercury balances
+        for acct_id, info in MERCURY_ACCOUNTS.items():
+            key = _get_mercury_key(acct_id)
+            if not key:
+                continue
+            try:
+                r = await client.get("https://api.mercury.com/api/v1/accounts",
+                                     headers={"Authorization": f"Bearer {key}"})
+                if r.status_code == 200:
+                    accounts = r.json().get("accounts", r.json()) if isinstance(r.json(), dict) else r.json()
+                    total = sum(a.get("currentBalance", 0) for a in accounts if isinstance(a, dict))
+                    result["mercury"][acct_id] = {
+                        "name": info["name"],
+                        "balance": total,
+                        "currency": "USD",
+                        "accounts": [{"name": a.get("name", ""), "balance": a.get("currentBalance", 0)}
+                                     for a in accounts if isinstance(a, dict)],
+                    }
+            except Exception as e:
+                logger.warning("mercury_balance_error acct=%s err=%s", acct_id, str(e)[:80])
+
+        # Whop
+        whop_key = getattr(settings, "whop_api_key", "")
+        if whop_key:
+            try:
+                r = await client.get("https://api.whop.com/api/v5/company",
+                                     headers={"Authorization": f"Bearer {whop_key}"})
+                if r.status_code == 200:
+                    result["whop"] = {"name": r.json().get("title", "Whop"), "connected": True}
+            except Exception:
+                pass
+
+    # Calculate totals
+    total_usd = 0
+    total_mxn = 0
+    for acct in result["stripe"].values():
+        if acct["currency"] == "USD":
+            total_usd += acct["available"] + acct["pending"]
+        elif acct["currency"] == "MXN":
+            total_mxn += acct["available"] + acct["pending"]
+    for acct in result["mercury"].values():
+        total_usd += acct["balance"]
+    result["totals"] = {"usd": total_usd, "mxn": total_mxn}
+
+    return {"ok": True, "data": result}
+
+
+# ─── Revenue by period ──────────────────────────────────────────────────────
+
+
+@router.get("/revenue")
+async def revenue_by_period(
+    request: Request,
+    period: str = Query("day", description="day|week|month"),
+    days: int = Query(30, description="lookback days"),
+    project_id: Optional[str] = None,
+):
+    """Revenue from Stripe charges, grouped by period."""
+    _require_super_admin(request)
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since_ts = int(since.timestamp())
+
+    revenue = []
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for acct_id, info in STRIPE_ACCOUNTS.items():
+            key = _get_stripe_key(acct_id)
+            if not key:
+                continue
+            try:
+                # Get charges from Stripe
+                params = {"created[gte]": since_ts, "limit": 100, "expand[]": "data.metadata"}
+                r = await client.get("https://api.stripe.com/v1/charges",
+                                     params=params, auth=(key, ""))
+                if r.status_code == 200:
+                    for charge in r.json().get("data", []):
+                        if charge.get("status") != "succeeded":
+                            continue
+                        meta = charge.get("metadata") or {}
+                        revenue.append({
+                            "source": f"stripe_{acct_id}",
+                            "source_name": info["name"],
+                            "amount": charge["amount"] / 100,
+                            "currency": charge["currency"].upper(),
+                            "date": datetime.fromtimestamp(charge["created"], tz=timezone.utc).isoformat(),
+                            "campaign_id": meta.get("campaign_id", ""),
+                            "lead_id": meta.get("lead_id", ""),
+                            "description": charge.get("description", ""),
+                        })
+            except Exception as e:
+                logger.warning("stripe_revenue_error acct=%s err=%s", acct_id, str(e)[:80])
+
+    # Group by period
+    grouped = {}
+    for item in revenue:
+        dt = datetime.fromisoformat(item["date"])
+        if period == "day":
+            key = dt.strftime("%Y-%m-%d")
+        elif period == "week":
+            key = f"{dt.year}-W{dt.isocalendar()[1]:02d}"
+        else:
+            key = dt.strftime("%Y-%m")
+
+        if key not in grouped:
+            grouped[key] = {"period": key, "total_usd": 0, "total_mxn": 0, "count": 0, "by_source": {}}
+        if item["currency"] == "USD":
+            grouped[key]["total_usd"] += item["amount"]
+        elif item["currency"] == "MXN":
+            grouped[key]["total_mxn"] += item["amount"]
+        grouped[key]["count"] += 1
+
+        src = item["source"]
+        if src not in grouped[key]["by_source"]:
+            grouped[key]["by_source"][src] = {"name": item["source_name"], "amount": 0, "currency": item["currency"]}
+        grouped[key]["by_source"][src]["amount"] += item["amount"]
+
+    periods = sorted(grouped.values(), key=lambda x: x["period"], reverse=True)
+    return {"ok": True, "data": {"periods": periods, "transactions": revenue}}
+
+
+# ─── Mercury transactions ──────────────────────────────────────────────────
+
+
+@router.get("/expenses")
+async def expenses(
+    request: Request,
+    days: int = Query(30),
+    account: Optional[str] = None,
+):
+    """Mercury transactions (expenses/income) for cost tracking."""
+    _require_super_admin(request)
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    transactions = []
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for acct_id, info in MERCURY_ACCOUNTS.items():
+            if account and acct_id != account:
+                continue
+            key = _get_mercury_key(acct_id)
+            if not key:
+                continue
+            try:
+                # Get Mercury accounts first
+                r = await client.get("https://api.mercury.com/api/v1/accounts",
+                                     headers={"Authorization": f"Bearer {key}"})
+                if r.status_code != 200:
+                    continue
+                merc_accounts = r.json().get("accounts", r.json()) if isinstance(r.json(), dict) else r.json()
+
+                for ma in merc_accounts:
+                    if not isinstance(ma, dict):
+                        continue
+                    ma_id = ma.get("id", "")
+                    if not ma_id:
+                        continue
+                    # Get transactions
+                    tr = await client.get(
+                        f"https://api.mercury.com/api/v1/account/{ma_id}/transactions",
+                        params={"start": since, "limit": 500},
+                        headers={"Authorization": f"Bearer {key}"},
+                    )
+                    if tr.status_code == 200:
+                        txns = tr.json().get("transactions", tr.json()) if isinstance(tr.json(), dict) else tr.json()
+                        for t in (txns if isinstance(txns, list) else []):
+                            transactions.append({
+                                "source": f"mercury_{acct_id}",
+                                "source_name": info["name"],
+                                "account_name": ma.get("name", ""),
+                                "amount": t.get("amount", 0),
+                                "date": t.get("postedDate", t.get("createdAt", "")),
+                                "description": t.get("bankDescription", t.get("note", "")),
+                                "counterparty": t.get("counterpartyName", ""),
+                                "type": "income" if t.get("amount", 0) > 0 else "expense",
+                                "category": t.get("details", {}).get("category", ""),
+                            })
+            except Exception as e:
+                logger.warning("mercury_txn_error acct=%s err=%s", acct_id, str(e)[:80])
+
+    # Sort by date
+    transactions.sort(key=lambda x: x.get("date", ""), reverse=True)
+
+    # Summary
+    total_income = sum(t["amount"] for t in transactions if t["amount"] > 0)
+    total_expense = sum(abs(t["amount"]) for t in transactions if t["amount"] < 0)
+
+    return {
+        "ok": True,
+        "data": {
+            "transactions": transactions,
+            "summary": {
+                "total_income": total_income,
+                "total_expense": total_expense,
+                "net": total_income - total_expense,
+            },
+        },
+    }
+
+
+# ─── Commission config per profile ─────────────────────────────────────────
+
+
+@router.get("/commission-rules")
+async def get_commission_rules(request: Request, campaign_id: str = Query(...)):
+    """Get all commission rules for a campaign, grouped by profile."""
+    _require_super_admin(request)
+    configs = sb.table("commission_configs").select("*").eq("campaign_id", campaign_id).execute()
+    tiers_by_config = {}
+    for cfg in (configs.data or []):
+        t = sb.table("commission_tiers").select("*").eq("config_id", cfg["id"]).order("min_sales").execute()
+        tiers_by_config[cfg["id"]] = t.data or []
+    result = []
+    for cfg in (configs.data or []):
+        result.append({**cfg, "tiers": tiers_by_config.get(cfg["id"], [])})
+    return {"ok": True, "data": result}
+
+
+@router.post("/commission-rules")
+async def upsert_commission_rule(request: Request):
+    """Create or update a commission rule for a campaign + profile + tier."""
+    _require_super_admin(request)
+    body = await request.json()
+    campaign_id = body.get("campaign_id", "")
+    profile_type = body.get("profile_type", "confirmador")
+    tier = body.get("tier", "VIP")
+    commission_type = body.get("commission_type", "percentage")
+    commission_value = body.get("commission_value", 0)
+
+    if not campaign_id:
+        raise HTTPException(status_code=400, detail="campaign_id required")
+
+    # Check if exists
+    existing = (
+        sb.table("commission_configs")
+        .select("id")
+        .eq("campaign_id", campaign_id)
+        .eq("profile_type", profile_type)
+        .eq("tier", tier)
+        .limit(1)
+        .execute()
+    )
+
+    if existing.data:
+        r = sb.table("commission_configs").update({
+            "commission_type": commission_type,
+            "commission_value": commission_value,
+            "updated_at": "now()",
+        }).eq("id", existing.data[0]["id"]).execute()
+    else:
+        r = sb.table("commission_configs").insert({
+            "campaign_id": campaign_id,
+            "profile_type": profile_type,
+            "tier": tier,
+            "commission_type": commission_type,
+            "commission_value": commission_value,
+        }).execute()
+
+    return {"ok": True, "data": (r.data or [{}])[0]}
