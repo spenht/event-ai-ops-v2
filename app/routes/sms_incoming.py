@@ -144,7 +144,7 @@ async def _handle_positive_reply(phone: str, body: str):
                             "From": twilio_from,
                             "To": wa_to,
                             "ContentSid": "HX5b3eab4955f93d3d4699478a07c51351",
-                            "ContentVariables": f'{{"1":"{name or \"Invitado\"}","2":"Beyond Wealth Miami","3":"27-29 Marzo 2026","4":"{ticket_url}"}}',
+                            "ContentVariables": '{{"1":"{}","2":"Beyond Wealth Miami","3":"27-29 Marzo 2026","4":"{}"}}'.format(name or "Invitado", ticket_url),
                         },
                     )
                     if resp.status_code == 201:
