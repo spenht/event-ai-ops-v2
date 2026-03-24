@@ -608,6 +608,9 @@ def regenerate_ticket_png(ticket_id: str) -> Optional[str]:
         }
         ticket_config = campaign.get("ticket_config") if isinstance(campaign.get("ticket_config"), dict) else None
 
+        # Ensure tickets dir exists
+        TICKETS_DIR.mkdir(parents=True, exist_ok=True)
+
         # Generate a fresh ticket (creates new ticket_id, but we rename the file)
         result = generate_ticket_png(
             lead=lead, tier=tier, event=event_facts,
