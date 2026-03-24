@@ -616,7 +616,7 @@ def regenerate_ticket_png(ticket_id: str) -> Optional[str]:
             lead=lead, tier=tier, event=event_facts,
             ticket_config=ticket_config,
         )
-        new_fp = Path(result.get("file") or "")
+        new_fp = Path(result.get("file_path") or result.get("file") or "")
 
         # Rename to the original ticket_id path
         target_fp = TICKETS_DIR / f"{ticket_id}.png"
