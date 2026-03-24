@@ -557,3 +557,118 @@ def lookup_ticket(ticket_id: str) -> Optional[dict[str, str]]:
         }
     except Exception:
         return None
+
+
+def regenerate_ticket_png(ticket_id: str) -> Optional[str]:
+    """Regenerate a ticket PNG from DB data when the file was lost (deploy/restart).
+
+    Re-creates the image file at the original path using stored lead/campaign data.
+    """
+    import logging
+    _log = logging.getLogger("tickets")
+    try:
+        # Get the ticket_created touchpoint with full payload
+        r = (
+            sb.table("touchpoints")
+            .select("payload, lead_id, campaign_id")
+            .eq("event_type", "ticket_created")
+            .contains("payload", {"ticket_id": ticket_id})
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        row = (r.data or [None])[0]
+        if not row:
+            return None
+
+        payload = row.get("payload") or {}
+        lead_id = row.get("lead_id") or ""
+        campaign_id = row.get("campaign_id") or ""
+        tier = payload.get("tier", "GENERAL")
+        code = payload.get("code", "UNKNOWN")
+
+        # Get lead data
+        lead = {"name": "Participante", "email": ""}
+        if lead_id:
+            lr = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1).execute()
+            lead = (lr.data or [lead])[0] or lead
+
+        # Get campaign data
+        campaign = {}
+        if campaign_id:
+            cr = sb.table("campaigns").select("*").eq("id", campaign_id).limit(1).execute()
+            campaign = (cr.data or [{}])[0]
+
+        # Build event facts
+        event_name = (campaign.get("event_name") or "Evento").strip()
+        event_date = (str(campaign.get("event_date") or "")).strip()
+        event_place = (campaign.get("event_location") or "").strip()
+
+        # Render the ticket image
+        name = _safe_text(lead.get("name") or "Participante")
+        date = _friendly_date(event_date)
+        place = _safe_text(event_place, max_len=120)
+
+        tc = campaign.get("ticket_config") if isinstance(campaign.get("ticket_config"), dict) else {}
+        tc = tc or {}
+        tier_key = tier.lower()
+        tier_ov = (tc.get("tiers") or {}).get(tier_key, {})
+        ticket_title = _safe_text(tier_ov.get("title") or tc.get("title") or event_name.upper(), max_len=40)
+        ticket_subtitle = _safe_text(tier_ov.get("subtitle") or tc.get("subtitle") or "", max_len=40)
+        ticket_footer = _safe_text(tier_ov.get("footer") or tc.get("footer") or "Presenta este boleto en la entrada", max_len=80)
+
+        qr_payload = str({"code": code, "ticket_id": ticket_id, "tier": tier})
+
+        # Generate QR
+        qr_img = qrcode.make(qr_payload, box_size=8, border=2).convert("RGBA")
+
+        # Render ticket (simplified — uses same rendering as generate_ticket_png)
+        W, H = 1200, 630
+        img = Image.new("RGBA", (W, H), (15, 15, 30, 255))
+        draw = ImageDraw.Draw(img)
+
+        # Simple gradient background
+        for y in range(H):
+            r_val = int(15 + (25 - 15) * y / H)
+            g_val = int(15 + (20 - 15) * y / H)
+            b_val = int(30 + (60 - 30) * y / H)
+            draw.line([(0, y), (W, y)], fill=(r_val, g_val, b_val))
+
+        # Tier badge
+        badge_color = (218, 165, 32) if tier.upper() == "VIP" else (55, 202, 55)
+        draw.rounded_rectangle([40, 30, 200, 70], radius=8, fill=badge_color)
+        try:
+            font_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+            font_lg = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+            font_md = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+        except Exception:
+            font_sm = ImageFont.load_default()
+            font_lg = font_sm
+            font_md = font_sm
+
+        draw.text((55, 33), tier.upper(), fill=(0, 0, 0), font=font_sm)
+        draw.text((40, 90), ticket_title, fill=(255, 255, 255), font=font_lg)
+        if ticket_subtitle:
+            draw.text((40, 140), ticket_subtitle, fill=(180, 180, 200), font=font_md)
+        draw.text((40, 200), f"👤 {name}", fill=(255, 255, 255), font=font_md)
+        draw.text((40, 240), f"📅 {date}", fill=(200, 200, 220), font=font_md)
+        if place:
+            draw.text((40, 280), f"📍 {place[:50]}", fill=(200, 200, 220), font=font_md)
+        draw.text((40, 340), f"🔑 {code}", fill=(150, 150, 170), font=font_sm)
+        draw.text((40, H - 50), ticket_footer, fill=(120, 120, 140), font=font_sm)
+
+        # QR code
+        qr_size = 220
+        qr_img = qr_img.resize((qr_size, qr_size))
+        img.paste(qr_img, (W - qr_size - 50, (H - qr_size) // 2))
+
+        # Save
+        TICKETS_DIR.mkdir(parents=True, exist_ok=True)
+        fp = TICKETS_DIR / f"{ticket_id}.png"
+        img.save(str(fp), "PNG")
+        _log.info("ticket_regenerated ticket=%s path=%s", ticket_id, fp)
+        return str(fp)
+
+    except Exception as exc:
+        _log.error("regenerate_ticket_failed ticket=%s err=%s", ticket_id, str(exc)[:200])
+        return None
