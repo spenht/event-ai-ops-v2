@@ -270,10 +270,19 @@ def build_voice_system_prompt(
     Uses campaign.ai_voice_system_prompt if available (and purpose is custom),
     otherwise generates a purpose-specific prompt from templates.
     """
-    # Custom prompt: use campaign's own system prompt verbatim
+    # Custom prompt: use campaign's own system prompt with variable substitution
     if purpose == "custom":
         custom = (campaign.get("ai_voice_system_prompt") or "").strip()
         if custom:
+            lead_name = lead.get("name", "") or "amigo"
+            event_name = event_facts.get("event_name", "el evento")
+            event_date = event_facts.get("event_date", "")
+            event_place = event_facts.get("event_place", "")
+            # Replace template variables
+            custom = custom.replace("{name}", lead_name)
+            custom = custom.replace("{event_name}", event_name)
+            custom = custom.replace("{event_date}", event_date)
+            custom = custom.replace("{event_place}", event_place)
             return custom
 
     character_name = (campaign.get("ai_character_name") or "").strip() or "Ana"
@@ -351,7 +360,7 @@ def build_voice_system_prompt(
         "- check-in → 'chek-in'",
         "- Zoom → 'zum'",
         "- Diamond → 'daimond'",
-        "IMPORTANTE: Cada vez que vayas a decir VIP, recuerda: son tres letras separadas vi-ai-pi.",
+        "IMPORTANTE: Pronuncia VIP como una sola palabra 'vip' (rima con 'chip'). NO deletrees las letras.",
         "",
         "═══ PERSONALIZACIÓN ═══",
         f"- Usa el nombre '{lead_name}' durante la conversación (al menos 3 veces).",
