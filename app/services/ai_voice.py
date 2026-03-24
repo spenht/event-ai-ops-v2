@@ -623,9 +623,9 @@ class AIVoiceSession:
                 "input_audio_transcription": {"model": "whisper-1"},
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.65,
-                    "prefix_padding_ms": 400,
-                    "silence_duration_ms": 1200,
+                    "threshold": 0.75,
+                    "prefix_padding_ms": 500,
+                    "silence_duration_ms": 1800,
                 },
                 "tools": [
                     {
@@ -894,11 +894,16 @@ class AIVoiceSession:
             except Exception:
                 pass
 
-        try:
-            await self._connect_elevenlabs()
-            logger.info("elevenlabs_reconnected")
-        except Exception as exc:
-            logger.error("elevenlabs_reconnect_failed err=%s", str(exc)[:200])
+        # Retry reconnection up to 3 times with small delay
+        for attempt in range(3):
+            try:
+                await asyncio.sleep(0.3 * (attempt + 1))  # 0.3s, 0.6s, 0.9s
+                await self._connect_elevenlabs()
+                logger.info("elevenlabs_reconnected attempt=%d", attempt + 1)
+                return
+            except Exception as exc:
+                logger.warning("elevenlabs_reconnect_attempt=%d err=%s", attempt + 1, str(exc)[:200])
+        logger.error("elevenlabs_reconnect_failed after 3 attempts")
 
     async def _send_text_to_elevenlabs(self, text: str) -> None:
         """Stream a text chunk to ElevenLabs for TTS conversion."""
