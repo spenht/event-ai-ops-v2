@@ -395,6 +395,8 @@ def create_call_record(
     from_number: str = "",
     to_number: str = "",
     status: str = "initiated",
+    notes: str = "",
+    purpose: str = "",
 ) -> Optional[dict[str, Any]]:
     """Create a new call record entry."""
     row: dict[str, Any] = {
@@ -409,6 +411,10 @@ def create_call_record(
         row["queue_id"] = queue_id
     if caller_id:
         row["caller_id"] = caller_id
+    if notes:
+        row["notes"] = notes
+    if purpose:
+        row["notes"] = f"purpose:{purpose}" + (f"|{notes}" if notes else "")
 
     try:
         r = sb.table("call_records").insert(row).execute()
