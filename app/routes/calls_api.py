@@ -90,6 +90,7 @@ class EnqueueRequest(BaseModel):
     call_type: str = "initial_contact"
     priority: int = 0
     scheduled_for: Optional[str] = None
+    target_profile: str = "confirmador"
 
 
 class ClaimRequest(BaseModel):
@@ -107,6 +108,7 @@ class CompleteRequest(BaseModel):
 class SessionStartRequest(BaseModel):
     campaign_id: str
     user_id: str
+    profile_type: str = "confirmador"
 
 
 class CallRecordUpdate(BaseModel):
@@ -167,6 +169,7 @@ async def enqueue(request: Request, body: EnqueueRequest):
         call_type=body.call_type,
         priority=body.priority,
         scheduled_for=body.scheduled_for,
+        target_profile=body.target_profile,
     )
     if not result:
         raise HTTPException(status_code=500, detail="failed to enqueue call")
@@ -174,11 +177,11 @@ async def enqueue(request: Request, body: EnqueueRequest):
 
 
 @router.post("/queue/next")
-async def next_call(request: Request, campaign_id: str, user_id: Optional[str] = None):
+async def next_call(request: Request, campaign_id: str, user_id: Optional[str] = None, profile_type: str = ""):
     """Get the next call to dial for a campaign."""
     _validate_auth(request, campaign_id)
 
-    call = get_next_call(campaign_id, agent_id=user_id)
+    call = get_next_call(campaign_id, agent_id=user_id, profile_type=profile_type)
     if not call:
         return {"data": None, "message": "no pending calls"}
     return {"data": call}
@@ -253,6 +256,7 @@ class BulkRequeueRequest(BaseModel):
     priority: int = 0
     filters: dict = {}  # e.g. {"no_answer": true, "not_confirmed": true, "no_vip": true}
     assignment_mode: str = "random"  # "random" | "prefer_original" | "force_original"
+    target_profile: str = "confirmador"
 
 
 @router.post("/queue/bulk-requeue")
@@ -467,6 +471,7 @@ async def bulk_requeue(request: Request, body: BulkRequeueRequest):
                 "cycle_count": 0,
                 "max_cycles": 7,
                 "created_at": now,
+                "target_profile": body.target_profile,
             }
             agent = lead_agent_map.get(lid)
             if agent and body.assignment_mode in ("prefer_original", "force_original"):
@@ -685,7 +690,7 @@ async def session_start(request: Request, body: SessionStartRequest):
     """Start a new spartan calling session."""
     _validate_auth(request, body.campaign_id)
 
-    result = start_session(body.campaign_id, body.user_id)
+    result = start_session(body.campaign_id, body.user_id, profile_type=body.profile_type)
     if not result:
         raise HTTPException(
             status_code=500, detail="failed to start session"
