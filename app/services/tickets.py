@@ -611,7 +611,7 @@ def regenerate_ticket_png(ticket_id: str) -> Optional[str]:
         # Generate a fresh ticket (creates new ticket_id, but we rename the file)
         result = generate_ticket_png(
             lead=lead, tier=tier, event=event_facts,
-            ticket_config=ticket_config, campaign_id=campaign_id,
+            ticket_config=ticket_config,
         )
         new_fp = Path(result.get("file") or "")
 
