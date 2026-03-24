@@ -278,6 +278,14 @@ async def platform_webhook(request: Request):
             except Exception:
                 logger.exception("failed to mark lead %s as paid", lead_id)
 
+            # Attribute commission to the agent who called this lead
+            try:
+                from ..services.commission_engine import attribute_sale
+                await attribute_sale(lead_id, campaign_id)
+                logger.info("connect_commission_attributed lead=%s campaign=%s", lead_id, campaign_id)
+            except Exception:
+                logger.exception("connect_commission_failed lead=%s", lead_id)
+
             try:
                 sb.table("touchpoints").insert({
                     "lead_id": lead_id,
