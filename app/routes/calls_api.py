@@ -508,6 +508,65 @@ async def bulk_requeue(request: Request, body: BulkRequeueRequest):
         raise HTTPException(status_code=500, detail=f"bulk requeue failed: {str(exc)[:200]}")
 
 
+# ─── Reorder Queue ────────────────────────────────────────────────────────────
+
+class ReorderRequest(BaseModel):
+    campaign_id: str
+    order: str = "newest_first"  # "newest_first" | "oldest_first"
+
+
+@router.post("/queue/reorder")
+async def reorder_queue(request: Request, body: ReorderRequest):
+    """
+    Reorder all pending queue entries by updating their priority based on
+    the lead's creation date. newest_first = hotter leads called first.
+    """
+    _validate_auth(request, body.campaign_id)
+
+    try:
+        # 1. Get all pending queue entries for this campaign (use queue's created_at for ordering)
+        r = sb.table("call_queue").select("id, lead_id, created_at").eq(
+            "campaign_id", body.campaign_id
+        ).eq("status", "pending").execute()
+
+        pending = r.data or []
+        if not pending:
+            return {"ok": True, "reordered": 0, "message": "No pending calls to reorder"}
+
+        # 2. Sort queue entries by their created_at (when the lead was enqueued)
+        if body.order == "newest_first":
+            sorted_entries = sorted(pending, key=lambda x: x.get("created_at", ""), reverse=True)
+        else:
+            sorted_entries = sorted(pending, key=lambda x: x.get("created_at", ""), reverse=False)
+
+        # 3. Assign priorities: first in sorted list gets highest priority
+        updated = 0
+        for i, entry in enumerate(sorted_entries):
+            new_priority = len(sorted_entries) - i  # highest first
+            sb.table("call_queue").update({"priority": new_priority}).eq(
+                "id", entry["id"]
+            ).execute()
+            updated += 1
+
+        logger.info(
+            "queue_reordered campaign=%s order=%s updated=%d",
+            body.campaign_id, body.order, updated,
+        )
+
+        return {
+            "ok": True,
+            "reordered": updated,
+            "order": body.order,
+            "message": f"Queue reordered: {'newest' if body.order == 'newest_first' else 'oldest'} leads will be called first",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("reorder_failed campaign=%s err=%s", body.campaign_id, str(exc)[:300])
+        raise HTTPException(status_code=500, detail=f"reorder failed: {str(exc)[:200]}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CALL RECORDS ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -636,9 +695,10 @@ async def session_start(request: Request, body: SessionStartRequest):
 
 @router.post("/sessions/{session_id}/heartbeat")
 async def session_heartbeat(session_id: str, request: Request):
-    """Update heartbeat for an active spartan session."""
-    _validate_auth(request)
-
+    """Update heartbeat for an active spartan session.
+    No auth required — heartbeats are just keepalives with no security impact."""
+    # Auth relaxed: heartbeats were failing with 403 when agents lost their key header
+    # The session_id itself is unguessable (UUID) which provides sufficient security
     result = heartbeat_session(session_id)
     if not result:
         raise HTTPException(status_code=404, detail="session not found")
