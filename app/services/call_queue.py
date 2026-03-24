@@ -321,6 +321,7 @@ def get_next_call(
             preferred = _fetch_pending_candidates(
                 campaign_id, now, extra_filters={"preferred_agent": agent_id}
             )
+            logger.info("get_next preferred=%d campaign=%s agent=%s", len(preferred), campaign_id, agent_id)
             best = _pick_best(preferred)
             if best:
                 return best
@@ -329,6 +330,7 @@ def get_next_call(
             unassigned = _fetch_pending_candidates(
                 campaign_id, now, extra_filters={"preferred_agent": None}
             )
+            logger.info("get_next unassigned=%d campaign=%s", len(unassigned), campaign_id)
             best = _pick_best(unassigned)
             if best:
                 return best
@@ -336,6 +338,7 @@ def get_next_call(
             # 3. Fall back to any pending call (original behavior)
 
         candidates = _fetch_pending_candidates(campaign_id, now)
+        logger.info("get_next fallback=%d campaign=%s", len(candidates), campaign_id)
         return _pick_best(candidates)
 
     except Exception as exc:
