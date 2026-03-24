@@ -166,7 +166,7 @@ async def _handle_positive_reply(phone: str, body: str):
                         data={
                             "From": "+18885564279",
                             "To": phone,
-                            "Body": f"🎟️ {name or 'Hola'}! Tu boleto GRATIS para Beyond Wealth Miami esta listo.\n\n📅 27-29 Marzo | EB Hotel Miami\n\n👉 {ticket_url}\n\nGuardalo y presentalo en la entrada. Te esperamos!",
+                            "Body": "🎟️ " + (name or "Hola") + "! Tu boleto GRATIS para Beyond Wealth Miami esta listo.\n\n📅 27-29 Marzo | EB Hotel Miami\n\n👉 " + ticket_url + "\n\nGuardalo y presentalo en la entrada. Te esperamos!",
                         },
                     )
                     if resp.status_code == 201:

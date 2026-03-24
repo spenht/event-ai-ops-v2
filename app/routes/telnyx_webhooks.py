@@ -287,16 +287,14 @@ async def _handle_call_answered(
                 str(exc)[:300],
             )
 
-    # Resolve API key from campaign (needed for recording and streaming)
-    campaign = _resolve_campaign_by_id(campaign_id) if campaign_id else None
-    telnyx_creds = _campaign_telnyx(campaign)
-    api_key = telnyx_creds.get("telnyx_api_key", "")
-
-    # Start recording for ALL call types (spartan + AI)
-    asyncio.create_task(start_recording(call_control_id, telnyx_api_key=api_key))
-
-    # For AI calls: also start media streaming (for real-time AI interaction)
+    # For AI calls: start media streaming and recording
     if caller_type == "ai":
+        # Resolve API key from campaign
+        campaign = _resolve_campaign_by_id(campaign_id) if campaign_id else None
+        telnyx_creds = _campaign_telnyx(campaign)
+        api_key = telnyx_creds.get("telnyx_api_key", "")
+
+        # Build WebSocket URL for media streaming
         base_url = (settings.public_base_url or "").rstrip("/")
         if base_url:
             ws_url = base_url.replace("https://", "wss://").replace("http://", "ws://")
@@ -304,6 +302,19 @@ async def _handle_call_answered(
             asyncio.create_task(
                 start_media_streaming(call_control_id, telnyx_api_key=api_key, stream_url=stream_url)
             )
+
+        # Start recording
+        asyncio.create_task(start_recording(call_control_id, telnyx_api_key=api_key))
+
+    # For spartan calls: start recording only (no streaming)
+    elif caller_type == "spartan":
+        try:
+            campaign = _resolve_campaign_by_id(campaign_id) if campaign_id else None
+            telnyx_creds = _campaign_telnyx(campaign)
+            api_key = telnyx_creds.get("telnyx_api_key", "")
+            asyncio.create_task(start_recording(call_control_id, telnyx_api_key=api_key))
+        except Exception as exc:
+            logger.warning("spartan_recording_start_failed call=%s err=%s", call_control_id, str(exc)[:200])
 
     # Log touchpoint
     if lead_id:

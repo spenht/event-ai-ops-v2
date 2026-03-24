@@ -61,14 +61,14 @@ async def upload_media(
         from supabase import create_client
         sb = create_client(settings.supabase_url, settings.supabase_service_role_key)
 
-        result = sb.storage.from_("whatsapp").upload(
+        result = sb.storage.from_("media").upload(
             storage_path,
             data,
-            file_options={"content-type": content_type, "upsert": "true"},
+            file_options={"content-type": content_type, "cache-control": "3600"},
         )
 
         # Build public URL
-        public_url = f"{settings.supabase_url}/storage/v1/object/public/whatsapp/{storage_path}"
+        public_url = sb.storage.from_("media").get_public_url(storage_path)
 
         logger.info("media_uploaded campaign=%s path=%s size=%d", campaign_id, storage_path, len(data))
 
