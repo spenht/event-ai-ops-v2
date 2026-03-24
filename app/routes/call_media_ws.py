@@ -623,13 +623,53 @@ async def media_stream(websocket: WebSocket, call_control_id: str):
                 f"Guardalo y presentalo en la entrada."
             )
 
+            _wa_creds = {
+                "account_sid": campaign.get("twilio_account_sid", ""),
+                "auth_token": campaign.get("twilio_auth_token", ""),
+                "whatsapp_from": campaign.get("twilio_whatsapp_from", ""),
+            }
+            sent = False
+
+            # Try direct message first (works within 24h window)
             try:
-                await send_whatsapp(
-                    wa_number, msg, media_urls=[media_url],
-                    account_sid=campaign.get("twilio_account_sid", ""),
-                    auth_token=campaign.get("twilio_auth_token", ""),
-                    whatsapp_from=campaign.get("twilio_whatsapp_from", ""),
-                )
+                await send_whatsapp(wa_number, msg, media_urls=[media_url], **_wa_creds)
+                sent = True
+                logger.info("send_ticket_direct_ok lead=%s tier=%s", lead_id, tier)
+            except Exception as exc1:
+                logger.warning("send_ticket_direct_failed err=%s — trying template", str(exc1)[:200])
+                # Fall back to template message (works outside 24h window)
+                try:
+                    event_name = (campaign.get("event_name") or "Evento").strip()
+                    event_date = (str(campaign.get("event_date") or "")).strip()[:10]
+                    from ..services.twilio_whatsapp import send_whatsapp_template
+                    await send_whatsapp_template(
+                        to=wa_number,
+                        content_sid="HX5b3eab4955f93d3d4699478a07c51351",
+                        variables={"1": lead.get("name", ""), "2": event_name, "3": event_date, "4": media_url},
+                        **_wa_creds,
+                    )
+                    sent = True
+                    logger.info("send_ticket_template_ok lead=%s tier=%s", lead_id, tier)
+                except Exception as exc2:
+                    logger.error("send_ticket_template_failed err=%s", str(exc2)[:200])
+                    # Last resort: try SMS via Telnyx
+                    try:
+                        import httpx as _httpx
+                        _telnyx_key = (campaign.get("telnyx_api_key") or "").strip()
+                        _from_num = (campaign.get("telnyx_from_number") or "").strip()
+                        if _telnyx_key and _from_num:
+                            async with _httpx.AsyncClient(timeout=10.0) as _client:
+                                await _client.post(
+                                    "https://api.telnyx.com/v2/messages",
+                                    headers={"Authorization": f"Bearer {_telnyx_key}", "Content-Type": "application/json"},
+                                    json={"from": _from_num, "to": wa_number, "text": f"{msg}\n\n{media_url}", "type": "SMS"},
+                                )
+                            sent = True
+                            logger.info("send_ticket_sms_ok lead=%s tier=%s", lead_id, tier)
+                    except Exception as exc3:
+                        logger.error("send_ticket_sms_failed err=%s", str(exc3)[:200])
+
+            if sent:
                 try:
                     sb.table("touchpoints").insert({
                         "lead_id": lead_id,
@@ -640,10 +680,9 @@ async def media_stream(websocket: WebSocket, call_control_id: str):
                     }).execute()
                 except Exception:
                     pass
-                return {"status": "sent", "message": f"Boleto {tier.upper()} enviado por WhatsApp"}
-            except Exception as exc:
-                logger.error("send_ticket_wa_failed err=%s", str(exc)[:200])
-                return {"status": "error", "message": "Error al enviar boleto por WhatsApp"}
+                return {"status": "sent", "message": f"Boleto {tier.upper()} enviado exitosamente"}
+            else:
+                return {"status": "error", "message": "No se pudo enviar el boleto. Revisa tu WhatsApp o contáctanos."}
 
         session.on_send_ticket = _on_send_ticket
 
