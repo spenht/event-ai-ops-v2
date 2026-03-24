@@ -9,3 +9,5 @@ pillow==10.4.0
 python-multipart==0.0.9
 gspread>=6.0
 google-auth>=2.0
+beautifulsoup4>=4.12
+lxml>=5.0

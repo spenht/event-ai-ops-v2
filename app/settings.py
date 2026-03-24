@@ -32,6 +32,7 @@ class Settings:
 
     # OpenAI
     openai_api_key: str = _env("OPENAI_API_KEY", "")
+    anthropic_api_key: str = _env("ANTHROPIC_API_KEY", "")
     openai_model: str = _env("OPENAI_MODEL", "gpt-4o-mini")
     whatsapp_system_prompt_path: str = _env(
         "WHATSAPP_SYSTEM_PROMPT_PATH", "app/prompts/whatsapp_system_prompt.txt"
