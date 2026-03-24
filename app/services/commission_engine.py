@@ -46,6 +46,21 @@ async def attribute_sale(lead_id: str, campaign_id: str, profile_type: str = "co
         agent_id = call.data[0]["caller_id"]
         call_record_id = call.data[0]["id"]
 
+        # 2b. Auto-detect agent's profile_type from agent_profiles table
+        if profile_type == "confirmador":
+            agent_profile = (
+                sb.table("agent_profiles")
+                .select("profile_type")
+                .eq("campaign_id", campaign_id)
+                .eq("user_id", agent_id)
+                .eq("is_active", True)
+                .limit(1)
+                .execute()
+            )
+            if agent_profile.data:
+                profile_type = agent_profile.data[0]["profile_type"]
+                logger.info("auto_detected_profile agent=%s profile=%s", agent_id, profile_type)
+
         # 3. Get commission config for this campaign (prefer profile-specific)
         config = (
             sb.table("commission_configs")
