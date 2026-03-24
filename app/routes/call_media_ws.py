@@ -664,6 +664,18 @@ async def media_stream(websocket: WebSocket, call_control_id: str):
                     }).execute()
                 except Exception:
                     pass
+                # Enqueue lead to spartan queue for VIP upsell follow-up
+                try:
+                    from ..services.call_queue import enqueue_call
+                    enqueue_call(
+                        campaign_id=campaign_id,
+                        lead_id=lead_id,
+                        call_type="spartan",
+                        priority=5,
+                    )
+                    logger.info("send_ticket_enqueued_for_upsell lead=%s campaign=%s", lead_id, campaign_id)
+                except Exception as eq_exc:
+                    logger.warning("send_ticket_enqueue_failed lead=%s err=%s", lead_id, str(eq_exc)[:100])
                 return {"status": "sent", "message": f"Boleto {tier.upper()} enviado exitosamente"}
             else:
                 return {"status": "error", "message": "No se pudo enviar el boleto. Revisa tu WhatsApp o contáctanos."}
