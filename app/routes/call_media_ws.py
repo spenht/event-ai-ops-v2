@@ -602,8 +602,8 @@ async def media_stream(websocket: WebSocket, call_control_id: str):
                     tier=tier.upper(),
                     event=ticket_event_facts,
                     ticket_config=ticket_config,
-                    campaign_id=campaign_id,
                 )
+                logger.info("send_ticket_generated ok ticket_id=%s", ticket.get("ticket_id", ""))
             except Exception as exc:
                 logger.error("send_ticket_gen_failed err=%s", str(exc)[:200])
                 return {"status": "error", "message": f"Error al generar boleto: {str(exc)[:80]}"}
