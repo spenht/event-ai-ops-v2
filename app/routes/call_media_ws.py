@@ -652,20 +652,29 @@ async def media_stream(websocket: WebSocket, call_control_id: str):
                     logger.info("send_ticket_template_ok lead=%s tier=%s", lead_id, tier)
                 except Exception as exc2:
                     logger.error("send_ticket_template_failed err=%s", str(exc2)[:200])
-                    # Last resort: try SMS via Telnyx
+                    # Last resort: try SMS via Telnyx (use messaging-enabled number)
                     try:
                         import httpx as _httpx
                         _telnyx_key = (campaign.get("telnyx_api_key") or "").strip()
-                        _from_num = (campaign.get("telnyx_from_number") or "").strip()
-                        if _telnyx_key and _from_num:
+                        _sms_from = "+16186770164"  # Messaging-enabled number
+                        if _telnyx_key:
+                            _sms_text = (
+                                f"🎟️ Hola {lead.get('name', '')}! Tu boleto GRATIS para "
+                                f"{(campaign.get('event_name') or 'el evento')} esta listo.\n\n"
+                                f"Descargalo aqui: {media_url}\n\n"
+                                f"Guardalo y presentalo en la entrada. Te esperamos!"
+                            )
                             async with _httpx.AsyncClient(timeout=10.0) as _client:
-                                await _client.post(
+                                _sms_resp = await _client.post(
                                     "https://api.telnyx.com/v2/messages",
                                     headers={"Authorization": f"Bearer {_telnyx_key}", "Content-Type": "application/json"},
-                                    json={"from": _from_num, "to": wa_number, "text": f"{msg}\n\n{media_url}", "type": "SMS"},
+                                    json={"from": _sms_from, "to": wa_number, "text": _sms_text, "type": "SMS"},
                                 )
-                            sent = True
-                            logger.info("send_ticket_sms_ok lead=%s tier=%s", lead_id, tier)
+                                if _sms_resp.status_code < 300:
+                                    sent = True
+                                    logger.info("send_ticket_sms_ok lead=%s tier=%s", lead_id, tier)
+                                else:
+                                    logger.error("send_ticket_sms_status=%s body=%s", _sms_resp.status_code, _sms_resp.text[:200])
                     except Exception as exc3:
                         logger.error("send_ticket_sms_failed err=%s", str(exc3)[:200])
 
