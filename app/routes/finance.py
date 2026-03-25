@@ -173,13 +173,15 @@ async def project_profitability(
     """Per-project profitability from stored transactions."""
     _require_super_admin(request)
 
-    # Use the RPC function if no specific project
+    # Use the RPC function if stored transactions exist
     if not project_id:
         try:
             r = sb.rpc("fn_project_profitability", {"p_days": days}).execute()
-            return {"ok": True, "data": r.data or []}
+            if r.data:  # Only return if we have stored data
+                return {"ok": True, "data": r.data}
         except Exception:
             pass
+    # Fallback: calculate from live Stripe API data
 
     # Fallback: calculate from live revenue data
     # Get revenue by source for the period
