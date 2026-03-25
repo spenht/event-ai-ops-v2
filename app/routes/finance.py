@@ -1179,3 +1179,50 @@ async def project_profitability(
             "period_days": days,
         },
     }
+
+
+# ─── AI Financial Advisor ─────────────────────────────────────────────────
+
+@router.get("/ai-insights")
+async def get_ai_insights(
+    request: Request,
+    days: int = Query(30, ge=7, le=365),
+    language: str = Query("es", regex="^(es|en)$"),
+):
+    """AI-powered financial analysis with actionable recommendations."""
+    _require_super_admin(request)
+
+    from ..services.ai_finance_advisor import gather_financial_snapshot, generate_ai_insights
+
+    # Step 1: Gather all financial data
+    snapshot = await gather_financial_snapshot(days=days)
+
+    # Step 2: Generate AI insights
+    insights = await generate_ai_insights(snapshot, language=language)
+
+    return {
+        "ok": True,
+        "data": {
+            "insights": insights,
+            "snapshot_summary": {
+                "period_days": days,
+                "revenue_sources": len(snapshot.get("revenue_by_source", {})),
+                "expense_categories": len(snapshot.get("expenses_by_category", {})),
+                "recurring_expenses_found": len(snapshot.get("recurring_expenses", [])),
+                "generated_at": snapshot.get("generated_at"),
+            },
+        },
+    }
+
+
+@router.get("/ai-insights/snapshot")
+async def get_financial_snapshot(
+    request: Request,
+    days: int = Query(30, ge=7, le=365),
+):
+    """Raw financial snapshot (without AI analysis) — useful for debugging."""
+    _require_super_admin(request)
+
+    from ..services.ai_finance_advisor import gather_financial_snapshot
+    snapshot = await gather_financial_snapshot(days=days)
+    return {"ok": True, "data": snapshot}
