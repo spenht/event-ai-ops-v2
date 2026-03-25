@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# Environment
+.env
+
+# IDEs
+.idea/
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/*
+!.claude/rules/
+!.claude/commands/
+
+# Fly.io
+.fly/
