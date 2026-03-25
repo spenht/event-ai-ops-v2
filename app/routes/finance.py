@@ -368,55 +368,48 @@ async def revenue_by_period(
             try:
                 headers_whop = {"Authorization": f"Bearer {whop_key}"}
                 whop_count = 0
-                whop_skipped = 0
-                for page in range(1, 10):  # up to 900 payments
+                # Whop returns 1043 total payments, ~11 pages. Iterate all.
+                # Payments may NOT be in chronological order so we can't break early.
+                for page in range(1, 15):  # up to 1400 payments
                     pr = await client.get(
                         f"https://api.whop.com/api/v5/company/payments?per=100&page={page}&status=paid",
                         headers=headers_whop,
                     )
-                    logger.info("whop_revenue_page page=%d status=%d", page, pr.status_code)
                     if pr.status_code != 200:
-                        logger.warning("whop_revenue_page_error body=%s", str(pr.text)[:200])
                         break
                     payments = pr.json().get("data", [])
-                    logger.info("whop_revenue_payments_count page=%d count=%d", page, len(payments))
-                    past_window = False
                     for p in payments:
                         created = p.get("created_at") or p.get("paid_at") or 0
                         if not created:
                             continue
-                        # created_at is a unix timestamp (int), not ISO string
                         try:
                             if isinstance(created, (int, float)):
-                                dt = datetime.fromtimestamp(created, tz=timezone.utc)
+                                dt = datetime.fromtimestamp(int(created), tz=timezone.utc)
                             else:
                                 dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
                         except Exception:
                             continue
                         if dt < since:
-                            past_window = True
-                            whop_skipped += 1
-                            continue
+                            continue  # skip but don't break — order not guaranteed
                         subtotal = p.get("subtotal", 0) or 0
-                        # Whop subtotal is in cents (like Stripe)
-                        amount_usd = subtotal / 100 if subtotal > 500 else subtotal
-                        if amount_usd > 0:
-                            revenue.append({
-                                "source": "stripe_lba",  # Whop = Legacy Business Academy
-                                "source_name": "Legacy Business Academy",
-                                "amount": amount_usd,
-                                "currency": "USD",
-                                "date": dt.isoformat(),
-                                "campaign_id": "",
-                                "lead_id": "",
-                                "description": f"Whop: {p.get('product_name', p.get('plan_id', 'Payment'))}",
-                            })
-                            whop_count += 1
-                    if past_window and whop_skipped > 20:
-                        break  # Past our date window
+                        if subtotal <= 0:
+                            continue
+                        # Whop subtotal: use as-is (dollars, not cents)
+                        # Values like 97.0 = $97, 1999.0 = $1999
+                        revenue.append({
+                            "source": "stripe_lba",  # Whop = Legacy Business Academy
+                            "source_name": "Legacy Business Academy",
+                            "amount": subtotal,
+                            "currency": "USD",
+                            "date": dt.isoformat(),
+                            "campaign_id": "",
+                            "lead_id": "",
+                            "description": f"Whop: {p.get('product_name') or p.get('plan_id') or 'Payment'}",
+                        })
+                        whop_count += 1
                     if not payments or not pr.json().get("pagination", {}).get("next_page"):
                         break
-                logger.info("whop_revenue_done added=%d skipped=%d", whop_count, whop_skipped)
+                logger.info("whop_revenue_done added=%d total_pages=%d", whop_count, page)
             except Exception as e:
                 import traceback
                 logger.error("whop_revenue_error err=%s trace=%s", str(e)[:100], traceback.format_exc()[-300:])
