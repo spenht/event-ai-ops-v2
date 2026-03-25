@@ -363,7 +363,7 @@ async def bulk_approve_commissions(request: Request):
         agent_id = body.get("agent_id")  # optional filter
         if not campaign_id:
             raise HTTPException(status_code=400, detail="campaign_id or commission_ids required")
-        q = sb.table("commissions").update({"status": "approved", "approved_at": "now()", "approved_by": approved_by}).eq("campaign_id", campaign_id).eq("status", "pending")
+        q = sb.table("commissions").update({"status": "approved", "approved_at": datetime.now(timezone.utc).isoformat(), "approved_by": approved_by}).eq("campaign_id", campaign_id).eq("status", "pending")
         if agent_id:
             q = q.eq("agent_id", agent_id)
         r = q.execute()
@@ -372,7 +372,7 @@ async def bulk_approve_commissions(request: Request):
     count = 0
     for cid in commission_ids:
         try:
-            sb.table("commissions").update({"status": "approved", "approved_at": "now()", "approved_by": approved_by}).eq("id", cid).eq("status", "pending").execute()
+            sb.table("commissions").update({"status": "approved", "approved_at": datetime.now(timezone.utc).isoformat(), "approved_by": approved_by}).eq("id", cid).eq("status", "pending").execute()
             count += 1
         except Exception:
             pass
@@ -392,7 +392,7 @@ async def bulk_pay_commissions(request: Request):
         agent_id = body.get("agent_id")
         if not campaign_id:
             raise HTTPException(status_code=400, detail="campaign_id or commission_ids required")
-        q = sb.table("commissions").update({"status": "paid", "paid_at": "now()", "payout_ref": payout_ref}).eq("campaign_id", campaign_id).eq("status", "approved")
+        q = sb.table("commissions").update({"status": "paid", "paid_at": datetime.now(timezone.utc).isoformat(), "payout_ref": payout_ref}).eq("campaign_id", campaign_id).eq("status", "approved")
         if agent_id:
             q = q.eq("agent_id", agent_id)
         r = q.execute()
@@ -401,7 +401,7 @@ async def bulk_pay_commissions(request: Request):
     count = 0
     for cid in commission_ids:
         try:
-            sb.table("commissions").update({"status": "paid", "paid_at": "now()", "payout_ref": payout_ref}).eq("id", cid).eq("status", "approved").execute()
+            sb.table("commissions").update({"status": "paid", "paid_at": datetime.now(timezone.utc).isoformat(), "payout_ref": payout_ref}).eq("id", cid).eq("status", "approved").execute()
             count += 1
         except Exception:
             pass
