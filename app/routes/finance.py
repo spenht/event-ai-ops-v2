@@ -122,6 +122,167 @@ async def update_project(project_id: str, request: Request):
     return {"ok": True}
 
 
+# ─── Project Clients CRUD ──────────────────────────────────────────────────
+
+
+@router.get("/projects/{project_id}/clients")
+async def list_project_clients(project_id: str, request: Request, status: Optional[str] = None):
+    _require_super_admin(request)
+    q = sb.table("project_clients").select("*").eq("project_id", project_id).order("created_at", desc=True)
+    if status:
+        q = q.eq("status", status)
+    r = q.execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/projects/{project_id}/clients")
+async def create_project_client(project_id: str, request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    if not body.get("name"):
+        raise HTTPException(status_code=400, detail="name is required")
+    r = sb.table("project_clients").insert({
+        "project_id": project_id,
+        "name": body["name"],
+        "email": body.get("email", ""),
+        "phone": body.get("phone", ""),
+        "status": body.get("status", "active"),
+        "total_amount": body.get("total_amount", 0),
+        "paid_amount": body.get("paid_amount", 0),
+        "currency": body.get("currency", "USD"),
+        "payment_plan": body.get("payment_plan", {}),
+        "notes": body.get("notes", ""),
+        "lead_id": body.get("lead_id", ""),
+        "stripe_customer_id": body.get("stripe_customer_id", ""),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.patch("/clients/{client_id}")
+async def update_project_client(client_id: str, request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    allowed = {"name", "email", "phone", "status", "total_amount", "paid_amount",
+               "currency", "payment_plan", "notes", "metadata"}
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        r = sb.table("project_clients").update(updates).eq("id", client_id).execute()
+        return {"ok": True, "data": (r.data or [{}])[0]}
+    return {"ok": True}
+
+
+# ─── Client Payments ──────────────────────────────────────────────────────
+
+
+@router.get("/clients/{client_id}/payments")
+async def list_client_payments(client_id: str, request: Request):
+    _require_super_admin(request)
+    r = sb.table("client_payments").select("*").eq("client_id", client_id).order("txn_date", desc=True).execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/clients/{client_id}/payments")
+async def create_client_payment(client_id: str, request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    # Get client to find project_id
+    client = sb.table("project_clients").select("project_id,paid_amount").eq("id", client_id).limit(1).execute()
+    if not client.data:
+        raise HTTPException(status_code=404, detail="Client not found")
+    project_id = client.data[0]["project_id"]
+    amount = body.get("amount", 0)
+
+    r = sb.table("client_payments").insert({
+        "client_id": client_id,
+        "project_id": project_id,
+        "amount": amount,
+        "currency": body.get("currency", "USD"),
+        "payment_method": body.get("payment_method", "stripe"),
+        "status": body.get("status", "completed"),
+        "txn_date": body.get("txn_date", datetime.now(timezone.utc).isoformat()),
+        "external_id": body.get("external_id", ""),
+        "description": body.get("description", ""),
+    }).execute()
+
+    # Update client paid_amount
+    if body.get("status", "completed") == "completed":
+        new_paid = (client.data[0].get("paid_amount") or 0) + amount
+        sb.table("project_clients").update({
+            "paid_amount": new_paid,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", client_id).execute()
+
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+# ─── Manual Transactions (Zelle, Cash, Wire) ──────────────────────────────
+
+
+@router.get("/manual-transactions")
+async def list_manual_transactions(request: Request, project_id: Optional[str] = None, days: int = Query(30)):
+    _require_super_admin(request)
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    q = sb.table("manual_transactions").select("*, projects(name)").gte("txn_date", since).order("txn_date", desc=True)
+    if project_id:
+        q = q.eq("project_id", project_id)
+    r = q.execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/manual-transactions")
+async def create_manual_transaction(request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    required = ["project_id", "type", "amount", "payment_method"]
+    for f in required:
+        if not body.get(f):
+            raise HTTPException(status_code=400, detail=f"{f} is required")
+    r = sb.table("manual_transactions").insert({
+        "project_id": body["project_id"],
+        "client_id": body.get("client_id"),
+        "type": body["type"],
+        "amount": body["amount"],
+        "currency": body.get("currency", "USD"),
+        "payment_method": body["payment_method"],
+        "counterparty": body.get("counterparty", ""),
+        "description": body.get("description", ""),
+        "txn_date": body.get("txn_date", datetime.now(timezone.utc).isoformat()),
+        "receipt_url": body.get("receipt_url", ""),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+# ─── Project Expense Sources (Mercury cards) ──────────────────────────────
+
+
+@router.get("/projects/{project_id}/expense-sources")
+async def list_expense_sources(project_id: str, request: Request):
+    _require_super_admin(request)
+    r = sb.table("project_expense_sources").select("*").eq("project_id", project_id).execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/projects/{project_id}/expense-sources")
+async def create_expense_source(project_id: str, request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    r = sb.table("project_expense_sources").insert({
+        "project_id": project_id,
+        "source_type": body.get("source_type", "mercury_card"),
+        "identifier": body.get("identifier", ""),
+        "label": body.get("label", ""),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.delete("/expense-sources/{source_id}")
+async def delete_expense_source(source_id: str, request: Request):
+    _require_super_admin(request)
+    sb.table("project_expense_sources").delete().eq("id", source_id).execute()
+    return {"ok": True}
+
+
 # ─── Assignment Rules CRUD ──────────────────────────────────────────────────
 
 
