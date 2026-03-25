@@ -265,15 +265,17 @@ async def financial_overview(request: Request):
                             for bal_entry in balances:
                                 curr = (bal_entry.get("currency", "usd") or "usd").lower()
                                 if curr == "usd":
-                                    total_bal = bal_entry.get("balance", 0) or 0
+                                    # Whop "balance" = available cash (not total!)
+                                    # Total = balance + pending + reserved
+                                    available_bal = bal_entry.get("balance", 0) or 0
                                     pending_bal = bal_entry.get("pending_balance", 0) or 0
                                     reserve_bal = bal_entry.get("reserve_balance", 0) or 0
-                                    # Convert from cents if needed (Whop sometimes uses cents)
-                                    if total_bal > 100000:
-                                        total_bal /= 100
+                                    # Convert from cents if values seem too large
+                                    if available_bal > 1000000:
+                                        available_bal /= 100
                                         pending_bal /= 100
                                         reserve_bal /= 100
-                                    available_bal = total_bal - pending_bal - reserve_bal
+                                    total_bal = available_bal + pending_bal + reserve_bal
                                     whop_data["balance"] = {
                                         "available": round(available_bal, 2),
                                         "pending": round(pending_bal, 2),
