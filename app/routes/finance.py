@@ -116,10 +116,69 @@ async def update_project(project_id: str, request: Request):
     allowed = {"name", "description", "stripe_account", "mercury_account", "status", "config"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if updates:
-        updates["updated_at"] = "now()"
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
         r = sb.table("projects").update(updates).eq("id", project_id).execute()
         return {"ok": True, "data": (r.data or [{}])[0]}
     return {"ok": True}
+
+
+# ─── Project Roles ────────────────────────────────────────────────────────────
+
+
+@router.get("/projects/{project_id}/roles")
+async def list_project_roles(project_id: str, request: Request):
+    _require_super_admin(request)
+    r = sb.table("project_roles").select("*, auth_users:user_id(email, raw_user_meta_data)").eq("project_id", project_id).execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/projects/{project_id}/roles")
+async def assign_project_role(project_id: str, request: Request):
+    """Assign a user to a role in a project. Admin only."""
+    _require_super_admin(request)
+    body = await request.json()
+    user_id = body.get("user_id", "").strip()
+    role = body.get("role", "").strip()
+    if not user_id or not role:
+        raise HTTPException(status_code=400, detail="user_id and role required")
+    valid_roles = ["owner", "leader", "closer", "confirmador", "setter", "admin", "viewer"]
+    if role not in valid_roles:
+        raise HTTPException(status_code=400, detail=f"role must be one of: {', '.join(valid_roles)}")
+    r = sb.table("project_roles").upsert({
+        "project_id": project_id,
+        "user_id": user_id,
+        "role": role,
+        "permissions": body.get("permissions", {}),
+        "assigned_by": body.get("assigned_by", ""),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }, on_conflict="project_id,user_id").execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.delete("/projects/{project_id}/roles/{user_id}")
+async def remove_project_role(project_id: str, user_id: str, request: Request):
+    _require_super_admin(request)
+    sb.table("project_roles").delete().eq("project_id", project_id).eq("user_id", user_id).execute()
+    return {"ok": True}
+
+
+@router.get("/my-projects")
+async def my_projects(request: Request):
+    """Get projects for the current user based on their roles."""
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="auth required")
+    import jwt as pyjwt
+    try:
+        decoded = pyjwt.decode(token, options={"verify_signature": False})
+        uid = decoded.get("sub", "")
+    except Exception:
+        raise HTTPException(status_code=401, detail="invalid token")
+    if not uid:
+        raise HTTPException(status_code=401, detail="no user id")
+
+    roles = sb.table("project_roles").select("*, projects(*)").eq("user_id", uid).execute()
+    return {"ok": True, "data": roles.data or []}
 
 
 # ─── Global Financial Overview ──────────────────────────────────────────────
@@ -188,23 +247,42 @@ async def financial_overview(request: Request):
                 if r.status_code == 200:
                     whop_data["name"] = r.json().get("title", "Whop")
 
-                # Try to get ledger/balance info via v1 API
-                try:
-                    br = await client.get("https://api.whop.com/api/v1/ledger-accounts",
-                                          headers=headers_whop)
-                    if br.status_code == 200:
-                        ledger_data = br.json()
-                        accounts = ledger_data.get("data", ledger_data) if isinstance(ledger_data, dict) else ledger_data
-                        if isinstance(accounts, list) and accounts:
-                            la = accounts[0]
-                            whop_data["balance"] = {
-                                "available": la.get("available_balance", la.get("available", 0)),
-                                "pending": la.get("pending_balance", la.get("pending", 0)),
-                                "reserved": la.get("reserved_balance", la.get("reserved", 0)),
-                                "total": la.get("balance", la.get("total", 0)),
-                            }
-                except Exception:
-                    pass  # Ledger endpoint may not be available
+                # Try multiple Whop balance endpoints
+                for balance_url in [
+                    "https://api.whop.com/api/v5/company/balance",
+                    "https://api.whop.com/api/v2/company/balance",
+                    "https://api.whop.com/api/v1/ledger-accounts",
+                ]:
+                    try:
+                        br = await client.get(balance_url, headers=headers_whop)
+                        logger.info("whop_balance_try url=%s status=%s body=%s", balance_url, br.status_code, str(br.text)[:300])
+                        if br.status_code == 200:
+                            bdata = br.json()
+                            # Try direct balance fields
+                            if isinstance(bdata, dict):
+                                avail = bdata.get("available", bdata.get("available_balance", 0))
+                                pending = bdata.get("pending", bdata.get("pending_balance", 0))
+                                reserved = bdata.get("reserved", bdata.get("reserved_balance", 0))
+                                total = bdata.get("total", bdata.get("balance", 0))
+                                if any([avail, pending, reserved, total]):
+                                    whop_data["balance"] = {
+                                        "available": avail, "pending": pending,
+                                        "reserved": reserved, "total": total or (avail + pending + reserved),
+                                    }
+                                    break
+                                # Try nested data array
+                                accounts = bdata.get("data", [])
+                                if isinstance(accounts, list) and accounts:
+                                    la = accounts[0]
+                                    whop_data["balance"] = {
+                                        "available": la.get("available_balance", la.get("available", 0)),
+                                        "pending": la.get("pending_balance", la.get("pending", 0)),
+                                        "reserved": la.get("reserved_balance", la.get("reserved", 0)),
+                                        "total": la.get("balance", la.get("total", 0)),
+                                    }
+                                    break
+                    except Exception:
+                        continue
 
                 # Get last 30 days of payments for revenue calculation
                 thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
