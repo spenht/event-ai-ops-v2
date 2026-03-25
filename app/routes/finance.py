@@ -248,38 +248,64 @@ async def financial_overview(request: Request):
                     whop_data["name"] = r.json().get("title", "Whop")
 
                 # Try multiple Whop balance endpoints
-                for balance_url in [
+                balance_urls = [
                     "https://api.whop.com/api/v5/company/balance",
+                    "https://api.whop.com/api/v5/company/payouts",
+                    "https://api.whop.com/api/v5/company",
                     "https://api.whop.com/api/v2/company/balance",
+                    "https://api.whop.com/api/v1/me/balance",
                     "https://api.whop.com/api/v1/ledger-accounts",
-                ]:
+                ]
+                for balance_url in balance_urls:
                     try:
                         br = await client.get(balance_url, headers=headers_whop)
-                        logger.info("whop_balance_try url=%s status=%s body=%s", balance_url, br.status_code, str(br.text)[:300])
+                        logger.info("whop_balance_try url=%s status=%s body=%s", balance_url, br.status_code, str(br.text)[:500])
                         if br.status_code == 200:
                             bdata = br.json()
-                            # Try direct balance fields
-                            if isinstance(bdata, dict):
-                                avail = bdata.get("available", bdata.get("available_balance", 0))
-                                pending = bdata.get("pending", bdata.get("pending_balance", 0))
-                                reserved = bdata.get("reserved", bdata.get("reserved_balance", 0))
-                                total = bdata.get("total", bdata.get("balance", 0))
-                                if any([avail, pending, reserved, total]):
-                                    whop_data["balance"] = {
-                                        "available": avail, "pending": pending,
-                                        "reserved": reserved, "total": total or (avail + pending + reserved),
-                                    }
+                            if not isinstance(bdata, dict):
+                                continue
+                            # Check all possible balance field patterns
+                            def _extract_balance(d):
+                                """Try to extract balance from various Whop API response shapes."""
+                                for avail_key in ["available", "available_balance", "available_amount"]:
+                                    avail = d.get(avail_key, 0)
+                                    if avail:
+                                        pending = d.get("pending", d.get("pending_balance", d.get("pending_amount", 0)))
+                                        reserved = d.get("reserved", d.get("reserved_balance", d.get("reserved_amount", 0)))
+                                        total = d.get("total", d.get("balance", d.get("total_balance", 0)))
+                                        # Convert from cents if needed
+                                        if avail > 100000: avail /= 100
+                                        if pending > 100000: pending /= 100
+                                        if reserved > 100000: reserved /= 100
+                                        if total > 100000: total /= 100
+                                        return {
+                                            "available": avail, "pending": pending,
+                                            "reserved": reserved,
+                                            "total": total or (avail + pending + reserved),
+                                        }
+                                return None
+
+                            # Try top-level
+                            bal = _extract_balance(bdata)
+                            if bal:
+                                whop_data["balance"] = bal
+                                break
+                            # Try nested "balance" key
+                            if "balance" in bdata and isinstance(bdata["balance"], dict):
+                                bal = _extract_balance(bdata["balance"])
+                                if bal:
+                                    whop_data["balance"] = bal
                                     break
-                                # Try nested data array
-                                accounts = bdata.get("data", [])
-                                if isinstance(accounts, list) and accounts:
-                                    la = accounts[0]
-                                    whop_data["balance"] = {
-                                        "available": la.get("available_balance", la.get("available", 0)),
-                                        "pending": la.get("pending_balance", la.get("pending", 0)),
-                                        "reserved": la.get("reserved_balance", la.get("reserved", 0)),
-                                        "total": la.get("balance", la.get("total", 0)),
-                                    }
+                            # Try nested data array
+                            accounts = bdata.get("data", [])
+                            if isinstance(accounts, list):
+                                for acct in accounts:
+                                    if isinstance(acct, dict):
+                                        bal = _extract_balance(acct)
+                                        if bal:
+                                            whop_data["balance"] = bal
+                                            break
+                                if whop_data["balance"]:
                                     break
                     except Exception:
                         continue
@@ -332,12 +358,17 @@ async def financial_overview(request: Request):
             total_mxn += acct["available"] + acct["pending"]
     for acct in result["mercury"].values():
         total_usd += acct["balance"]
-    # Whop balance (available) if we got it, otherwise skip
-    whop_balance = result.get("whop", {}).get("balance", {})
+    # Whop balance — only add REAL balance, never revenue as proxy
+    whop_data = result.get("whop") or {}
+    whop_balance = whop_data.get("balance", {})
+    whop_balance_total = 0
     if whop_balance.get("total"):
-        total_usd += whop_balance["total"]
+        whop_balance_total = whop_balance["total"]
+        total_usd += whop_balance_total
     elif whop_balance.get("available"):
-        total_usd += whop_balance["available"] + whop_balance.get("pending", 0) + whop_balance.get("reserved", 0)
+        whop_balance_total = whop_balance["available"] + whop_balance.get("pending", 0) + whop_balance.get("reserved", 0)
+        total_usd += whop_balance_total
+    # NOTE: revenue_30d is NOT balance — never add it to total
     result["totals"] = {"usd": total_usd, "mxn": total_mxn}
 
     return {"ok": True, "data": result}
@@ -446,14 +477,15 @@ async def revenue_by_period(
                     else:
                         created = str(raw_date) if raw_date else ""
                     items_out.append({
-                        "source": "whop",
-                        "source_name": "Whop",
+                        "source": "stripe_lba",
+                        "source_name": "Legacy Business Academy",
+                        "source_detail": "whop",
                         "amount": amt,
                         "currency": (p.get("currency", "usd") or "usd").upper(),
                         "date": created,
                         "campaign_id": "",
                         "lead_id": "",
-                        "description": p.get("product_name", p.get("plan_name", "")),
+                        "description": p.get("product_name", p.get("plan_name", "Whop payment")),
                         "whop_id": p.get("id", ""),
                         "customer_email": p.get("user_email", p.get("email", "")),
                     })
@@ -709,8 +741,9 @@ async def unified_transactions(
                         txn_dt = datetime.fromtimestamp(raw_d, tz=timezone.utc).isoformat() if isinstance(raw_d, (int, float)) else str(raw_d or "")
                         txns.append({
                             "id": p.get("id", ""),
-                            "source": "whop",
-                            "source_name": "Whop",
+                            "source": "stripe_lba",
+                            "source_name": "Legacy Business Academy",
+                            "source_detail": "whop",
                             "type": "sale",
                             "amount": amt,
                             "currency": (p.get("currency", "usd") or "usd").upper(),
