@@ -349,7 +349,12 @@ async def revenue_by_period(
                         amt = p.get("final_amount", p.get("subtotal", 0)) or 0
                         if amt > 10000:
                             amt = amt / 100
-                        created = p.get("created_at", p.get("updated_at", ""))
+                        raw_date = p.get("created_at", p.get("updated_at", ""))
+                        # Whop may return epoch int or ISO string
+                        if isinstance(raw_date, (int, float)):
+                            created = datetime.fromtimestamp(raw_date, tz=timezone.utc).isoformat()
+                        else:
+                            created = str(raw_date) if raw_date else ""
                         revenue.append({
                             "source": "whop",
                             "source_name": "Whop",
@@ -585,6 +590,8 @@ async def unified_transactions(
                         amt = p.get("final_amount", p.get("subtotal", 0)) or 0
                         if amt > 10000:
                             amt = amt / 100
+                        raw_d = p.get("created_at", p.get("updated_at", ""))
+                        txn_dt = datetime.fromtimestamp(raw_d, tz=timezone.utc).isoformat() if isinstance(raw_d, (int, float)) else str(raw_d or "")
                         txns.append({
                             "id": p.get("id", ""),
                             "source": "whop",
@@ -592,7 +599,7 @@ async def unified_transactions(
                             "type": "sale",
                             "amount": amt,
                             "currency": (p.get("currency", "usd") or "usd").upper(),
-                            "date": p.get("created_at", p.get("updated_at", "")),
+                            "date": txn_dt,
                             "description": p.get("product_name", p.get("plan_name", "Whop payment")),
                             "counterparty": p.get("user_email", p.get("email", "")),
                             "campaign_id": "",
