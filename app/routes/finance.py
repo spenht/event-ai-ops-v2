@@ -282,101 +282,118 @@ async def revenue_by_period(
     since = datetime.now(timezone.utc) - timedelta(days=days)
     since_ts = int(since.timestamp())
 
+    import asyncio
+
+    async def _fetch_stripe_revenue(client, acct_id, info, since_ts):
+        """Fetch revenue from a single Stripe account."""
+        items_out = []
+        key = _get_stripe_key(acct_id)
+        if not key:
+            return items_out
+        try:
+            starting_after = None
+            for _ in range(20):
+                params = {"created[gte]": since_ts, "limit": 100}
+                if starting_after:
+                    params["starting_after"] = starting_after
+                r = await client.get("https://api.stripe.com/v1/payment_intents",
+                                     params=params, auth=(key, ""))
+                if r.status_code != 200:
+                    logger.warning("stripe_revenue_status acct=%s status=%s", acct_id, r.status_code)
+                    break
+                data = r.json()
+                fetched = data.get("data", [])
+                for pi in fetched:
+                    if pi.get("status") != "succeeded":
+                        continue
+                    meta = pi.get("metadata") or {}
+                    items_out.append({
+                        "source": f"stripe_{acct_id}",
+                        "source_name": info["name"],
+                        "amount": pi["amount"] / 100,
+                        "currency": pi["currency"].upper(),
+                        "date": datetime.fromtimestamp(pi["created"], tz=timezone.utc).isoformat(),
+                        "campaign_id": meta.get("campaign_id", ""),
+                        "lead_id": meta.get("lead_id", ""),
+                        "description": pi.get("description", ""),
+                        "stripe_id": pi.get("id", ""),
+                        "customer_email": pi.get("receipt_email", ""),
+                    })
+                if not data.get("has_more") or not fetched:
+                    break
+                starting_after = fetched[-1]["id"]
+            logger.info("revenue_fetched acct=%s items=%s", acct_id, len(items_out))
+        except Exception as e:
+            logger.warning("stripe_revenue_error acct=%s err=%s", acct_id, str(e)[:80])
+        return items_out
+
+    async def _fetch_whop_revenue(client, since_iso):
+        """Fetch revenue from Whop."""
+        items_out = []
+        whop_key = getattr(settings, "whop_api_key", "")
+        if not whop_key:
+            return items_out
+        try:
+            headers_whop = {"Authorization": f"Bearer {whop_key}"}
+            cursor = None
+            for _ in range(20):
+                params = {"per": 100, "status": "paid", "created_after": since_iso}
+                if cursor:
+                    params["cursor"] = cursor
+                pr = await client.get(
+                    "https://api.whop.com/api/v5/company/payments",
+                    params=params, headers=headers_whop,
+                )
+                if pr.status_code != 200:
+                    break
+                body = pr.json()
+                for p in body.get("data", []):
+                    amt = p.get("final_amount", p.get("subtotal", 0)) or 0
+                    if amt > 10000:
+                        amt = amt / 100
+                    raw_date = p.get("created_at", p.get("updated_at", ""))
+                    if isinstance(raw_date, (int, float)):
+                        created = datetime.fromtimestamp(raw_date, tz=timezone.utc).isoformat()
+                    else:
+                        created = str(raw_date) if raw_date else ""
+                    items_out.append({
+                        "source": "whop",
+                        "source_name": "Whop",
+                        "amount": amt,
+                        "currency": (p.get("currency", "usd") or "usd").upper(),
+                        "date": created,
+                        "campaign_id": "",
+                        "lead_id": "",
+                        "description": p.get("product_name", p.get("plan_name", "")),
+                        "whop_id": p.get("id", ""),
+                        "customer_email": p.get("user_email", p.get("email", "")),
+                    })
+                pagination = body.get("pagination", {})
+                cursor = pagination.get("next_cursor", pagination.get("next_page"))
+                if not cursor:
+                    break
+            logger.info("revenue_fetched_whop items=%s", len(items_out))
+        except Exception as e:
+            logger.warning("whop_revenue_error err=%s", str(e)[:80])
+        return items_out
+
     revenue = []
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        # ── Stripe payment_intents (with pagination) ──
-        logger.info("revenue_start stripe_accounts=%s source_filter=%s days=%s", list(STRIPE_ACCOUNTS.keys()), source, days)
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        # Fetch ALL sources in parallel
+        tasks = []
         for acct_id, info in STRIPE_ACCOUNTS.items():
             if source and source != f"stripe_{acct_id}":
                 continue
-            key = _get_stripe_key(acct_id)
-            if not key:
-                logger.warning("revenue_no_key acct=%s", acct_id)
-                continue
-            logger.info("revenue_fetch acct=%s since_ts=%s", acct_id, since_ts)
-            try:
-                starting_after = None
-                for _ in range(20):  # max 2000 transactions
-                    params = {"created[gte]": since_ts, "limit": 100}
-                    if starting_after:
-                        params["starting_after"] = starting_after
-                    r = await client.get("https://api.stripe.com/v1/payment_intents",
-                                         params=params, auth=(key, ""))
-                    if r.status_code != 200:
-                        logger.warning("stripe_revenue_status acct=%s status=%s", acct_id, r.status_code)
-                        break
-                    data = r.json()
-                    items = data.get("data", [])
-                    for pi in items:
-                        if pi.get("status") != "succeeded":
-                            continue
-                        meta = pi.get("metadata") or {}
-                        revenue.append({
-                            "source": f"stripe_{acct_id}",
-                            "source_name": info["name"],
-                            "amount": pi["amount"] / 100,
-                            "currency": pi["currency"].upper(),
-                            "date": datetime.fromtimestamp(pi["created"], tz=timezone.utc).isoformat(),
-                            "campaign_id": meta.get("campaign_id", ""),
-                            "lead_id": meta.get("lead_id", ""),
-                            "description": pi.get("description", ""),
-                            "stripe_id": pi.get("id", ""),
-                            "customer_email": pi.get("receipt_email", ""),
-                        })
-                    if not data.get("has_more") or not items:
-                        break
-                    starting_after = items[-1]["id"]
-                logger.info("revenue_fetched acct=%s items=%s", acct_id, len([r for r in revenue if r.get("source") == f"stripe_{acct_id}"]))
-            except Exception as e:
-                logger.warning("stripe_revenue_error acct=%s err=%s", acct_id, str(e)[:80])
+            tasks.append(_fetch_stripe_revenue(client, acct_id, info, since_ts))
+        if not source or source == "whop":
+            tasks.append(_fetch_whop_revenue(client, since.isoformat()))
 
-        # ── Whop payments ──
-        whop_key = getattr(settings, "whop_api_key", "")
-        if whop_key and (not source or source == "whop"):
-            try:
-                headers_whop = {"Authorization": f"Bearer {whop_key}"}
-                cursor = None
-                for _ in range(20):
-                    params = {"per": 100, "status": "paid",
-                              "created_after": since.isoformat()}
-                    if cursor:
-                        params["cursor"] = cursor
-                    pr = await client.get(
-                        "https://api.whop.com/api/v5/company/payments",
-                        params=params, headers=headers_whop,
-                    )
-                    if pr.status_code != 200:
-                        break
-                    body = pr.json()
-                    payments = body.get("data", [])
-                    for p in payments:
-                        amt = p.get("final_amount", p.get("subtotal", 0)) or 0
-                        if amt > 10000:
-                            amt = amt / 100
-                        raw_date = p.get("created_at", p.get("updated_at", ""))
-                        # Whop may return epoch int or ISO string
-                        if isinstance(raw_date, (int, float)):
-                            created = datetime.fromtimestamp(raw_date, tz=timezone.utc).isoformat()
-                        else:
-                            created = str(raw_date) if raw_date else ""
-                        revenue.append({
-                            "source": "whop",
-                            "source_name": "Whop",
-                            "amount": amt,
-                            "currency": (p.get("currency", "usd") or "usd").upper(),
-                            "date": created,
-                            "campaign_id": "",
-                            "lead_id": "",
-                            "description": p.get("product_name", p.get("plan_name", "")),
-                            "whop_id": p.get("id", ""),
-                            "customer_email": p.get("user_email", p.get("email", "")),
-                        })
-                    pagination = body.get("pagination", {})
-                    cursor = pagination.get("next_cursor", pagination.get("next_page"))
-                    if not cursor:
-                        break
-            except Exception as e:
-                logger.warning("whop_revenue_error err=%s", str(e)[:80])
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, list):
+                revenue.extend(r)
+            elif isinstance(r, Exception):
+                logger.warning("revenue_task_error err=%s", str(r)[:80])
 
     # Sort all revenue by date
     revenue.sort(key=lambda x: x.get("date", ""), reverse=True)
