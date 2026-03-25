@@ -219,25 +219,37 @@ async def financial_overview(request: Request):
                     except Exception as e:
                         logger.warning("whop_balance_error err=%s", str(e)[:100])
 
-                # Get recent payments to calculate revenue (last 500)
+                # Get recent payments to calculate revenue (last 30 days)
                 total_rev = 0
                 total_count = 0
-                for page in range(1, 6):
+                thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+                for page in range(1, 10):
                     pr = await client.get(
                         f"https://api.whop.com/api/v5/company/payments?per=100&page={page}&status=paid",
                         headers=headers_whop,
                     )
-                    if pr.status_code == 200:
-                        payments = pr.json().get("data", [])
-                        for p in payments:
-                            total_rev += p.get("subtotal", 0) or 0
-                            total_count += 1
-                        if not pr.json().get("pagination", {}).get("next_page"):
-                            break
-                    else:
+                    if pr.status_code != 200:
+                        break
+                    payments = pr.json().get("data", [])
+                    past_window = False
+                    for p in payments:
+                        created = p.get("created_at") or p.get("paid_at") or 0
+                        if isinstance(created, (int, float)) and created > 0:
+                            dt = datetime.fromtimestamp(created, tz=timezone.utc)
+                            if dt < thirty_days_ago:
+                                past_window = True
+                                continue
+                        subtotal = p.get("subtotal", 0) or 0
+                        # Convert from cents if needed
+                        amount = subtotal / 100 if subtotal > 500 else subtotal
+                        total_rev += amount
+                        total_count += 1
+                    if past_window:
+                        break
+                    if not pr.json().get("pagination", {}).get("next_page"):
                         break
 
-                whop_data["revenue_30d"] = total_rev
+                whop_data["revenue_30d"] = round(total_rev, 2)
                 whop_data["payments_30d"] = total_count
                 result["whop"] = whop_data
             except Exception as e:
@@ -370,24 +382,29 @@ async def revenue_by_period(
                     logger.info("whop_revenue_payments_count page=%d count=%d", page, len(payments))
                     past_window = False
                     for p in payments:
-                        created = p.get("created_at", p.get("updated_at", ""))
+                        created = p.get("created_at") or p.get("paid_at") or 0
                         if not created:
                             continue
+                        # created_at is a unix timestamp (int), not ISO string
                         try:
-                            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                            if isinstance(created, (int, float)):
+                                dt = datetime.fromtimestamp(created, tz=timezone.utc)
+                            else:
+                                dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
                         except Exception:
                             continue
                         if dt < since:
                             past_window = True
                             whop_skipped += 1
-                            continue  # skip old ones, don't break (order may not be strict)
+                            continue
                         subtotal = p.get("subtotal", 0) or 0
-                        # Whop subtotal is in dollars (not cents)
-                        if subtotal > 0:
+                        # Whop subtotal is in cents (like Stripe)
+                        amount_usd = subtotal / 100 if subtotal > 500 else subtotal
+                        if amount_usd > 0:
                             revenue.append({
                                 "source": "stripe_lba",  # Whop = Legacy Business Academy
                                 "source_name": "Legacy Business Academy",
-                                "amount": subtotal,
+                                "amount": amount_usd,
                                 "currency": "USD",
                                 "date": dt.isoformat(),
                                 "campaign_id": "",
@@ -395,9 +412,9 @@ async def revenue_by_period(
                                 "description": f"Whop: {p.get('product_name', p.get('plan_id', 'Payment'))}",
                             })
                             whop_count += 1
-                    if past_window and whop_skipped > 10:
-                        break  # We're clearly past our date window
-                    if not pr.json().get("pagination", {}).get("next_page"):
+                    if past_window and whop_skipped > 20:
+                        break  # Past our date window
+                    if not payments or not pr.json().get("pagination", {}).get("next_page"):
                         break
                 logger.info("whop_revenue_done added=%d skipped=%d", whop_count, whop_skipped)
             except Exception as e:
