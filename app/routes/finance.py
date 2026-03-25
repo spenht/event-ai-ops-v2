@@ -331,85 +331,79 @@ async def revenue_by_period(
     since_ts = int(since.timestamp())
 
     revenue = []
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        for acct_id, info in STRIPE_ACCOUNTS.items():
-            key = _get_stripe_key(acct_id)
-            if not key:
-                continue
-            try:
-                # Get ALL payment_intents from Stripe with pagination
-                has_more = True
-                starting_after = None
-                page_count = 0
-                while has_more and page_count < 20:  # max 2000 txns per account
-                    params = {"created[gte]": since_ts, "limit": 100}
-                    if starting_after:
-                        params["starting_after"] = starting_after
-                    r = await client.get("https://api.stripe.com/v1/payment_intents",
-                                         params=params, auth=(key, ""))
-                    if r.status_code != 200:
-                        logger.warning("stripe_revenue_status acct=%s status=%s", acct_id, r.status_code)
-                        break
-                    data = r.json()
-                    items = data.get("data", [])
-                    for pi in items:
-                        if pi.get("status") != "succeeded":
-                            continue
-                        meta = pi.get("metadata") or {}
-                        revenue.append({
-                            "source": f"stripe_{acct_id}",
-                            "source_name": info["name"],
-                            "amount": pi["amount"] / 100,
-                            "currency": pi["currency"].upper(),
-                            "date": datetime.fromtimestamp(pi["created"], tz=timezone.utc).isoformat(),
-                            "campaign_id": meta.get("campaign_id", ""),
-                            "lead_id": meta.get("lead_id", ""),
-                            "description": pi.get("description", ""),
-                        })
-                    has_more = data.get("has_more", False)
-                    if items:
-                        starting_after = items[-1]["id"]
-                    page_count += 1
-            except Exception as e:
-                logger.warning("stripe_revenue_error acct=%s err=%s", acct_id, str(e)[:80])
 
-        # Whop payments — mapped to Legacy Business Academy
+    async def _fetch_stripe_account(client, acct_id, info, since_ts):
+        """Fetch all payment_intents for one Stripe account with pagination."""
+        key = _get_stripe_key(acct_id)
+        if not key:
+            return []
+        results = []
+        try:
+            has_more = True
+            starting_after = None
+            page_count = 0
+            while has_more and page_count < 20:
+                params = {"created[gte]": since_ts, "limit": 100}
+                if starting_after:
+                    params["starting_after"] = starting_after
+                r = await client.get("https://api.stripe.com/v1/payment_intents",
+                                     params=params, auth=(key, ""))
+                if r.status_code != 200:
+                    break
+                data = r.json()
+                items = data.get("data", [])
+                for pi in items:
+                    if pi.get("status") != "succeeded":
+                        continue
+                    meta = pi.get("metadata") or {}
+                    results.append({
+                        "source": f"stripe_{acct_id}",
+                        "source_name": info["name"],
+                        "amount": pi["amount"] / 100,
+                        "currency": pi["currency"].upper(),
+                        "date": datetime.fromtimestamp(pi["created"], tz=timezone.utc).isoformat(),
+                        "campaign_id": meta.get("campaign_id", ""),
+                        "lead_id": meta.get("lead_id", ""),
+                        "description": pi.get("description", ""),
+                    })
+                has_more = data.get("has_more", False)
+                if items:
+                    starting_after = items[-1]["id"]
+                page_count += 1
+        except Exception as e:
+            logger.warning("stripe_revenue_error acct=%s err=%s", acct_id, str(e)[:80])
+        return results
+
+    async def _fetch_whop_payments(client, since):
+        """Fetch Whop payments within date range."""
         whop_key = getattr(settings, "whop_api_key", "")
-        logger.info("whop_revenue_check key_exists=%s", bool(whop_key))
-        if whop_key:
-            try:
-                headers_whop = {"Authorization": f"Bearer {whop_key}"}
-                whop_count = 0
-                # Whop returns 1043 total payments, ~11 pages. Iterate all.
-                # Payments may NOT be in chronological order so we can't break early.
-                for page in range(1, 15):  # up to 1400 payments
-                    pr = await client.get(
-                        f"https://api.whop.com/api/v5/company/payments?per=100&page={page}&status=paid",
-                        headers=headers_whop,
-                    )
-                    if pr.status_code != 200:
-                        break
-                    payments = pr.json().get("data", [])
-                    for p in payments:
-                        created = p.get("created_at") or p.get("paid_at") or 0
-                        if not created:
-                            continue
-                        try:
-                            if isinstance(created, (int, float)):
-                                dt = datetime.fromtimestamp(int(created), tz=timezone.utc)
-                            else:
-                                dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
-                        except Exception:
-                            continue
-                        if dt < since:
-                            continue  # skip but don't break — order not guaranteed
-                        subtotal = p.get("subtotal", 0) or 0
-                        if subtotal <= 0:
-                            continue
-                        # Whop subtotal: use as-is (dollars, not cents)
-                        # Values like 97.0 = $97, 1999.0 = $1999
-                        revenue.append({
-                            "source": "stripe_lba",  # Whop = Legacy Business Academy
+        if not whop_key:
+            return []
+        results = []
+        try:
+            headers_whop = {"Authorization": f"Bearer {whop_key}"}
+            for page in range(1, 15):
+                pr = await client.get(
+                    f"https://api.whop.com/api/v5/company/payments?per=100&page={page}&status=paid",
+                    headers=headers_whop,
+                )
+                if pr.status_code != 200:
+                    break
+                payments = pr.json().get("data", [])
+                for p in payments:
+                    created = p.get("created_at") or p.get("paid_at") or 0
+                    if not created:
+                        continue
+                    try:
+                        dt = datetime.fromtimestamp(int(created), tz=timezone.utc) if isinstance(created, (int, float)) else datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+                    if dt < since:
+                        continue
+                    subtotal = p.get("subtotal", 0) or 0
+                    if subtotal > 0:
+                        results.append({
+                            "source": "stripe_lba",
                             "source_name": "Legacy Business Academy",
                             "amount": subtotal,
                             "currency": "USD",
@@ -418,13 +412,28 @@ async def revenue_by_period(
                             "lead_id": "",
                             "description": f"Whop: {p.get('product_name') or p.get('plan_id') or 'Payment'}",
                         })
-                        whop_count += 1
-                    if not payments or not pr.json().get("pagination", {}).get("next_page"):
-                        break
-                logger.info("whop_revenue_done added=%d total_pages=%d", whop_count, page)
-            except Exception as e:
-                import traceback
-                logger.error("whop_revenue_error err=%s trace=%s", str(e)[:100], traceback.format_exc()[-300:])
+                if not payments or not pr.json().get("pagination", {}).get("next_page"):
+                    break
+        except Exception as e:
+            logger.warning("whop_revenue_error err=%s", str(e)[:100])
+        return results
+
+    # Fetch ALL sources in PARALLEL for speed
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        import asyncio
+        tasks = []
+        for acct_id, info in STRIPE_ACCOUNTS.items():
+            tasks.append(_fetch_stripe_account(client, acct_id, info, since_ts))
+        tasks.append(_fetch_whop_payments(client, since))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, list):
+                revenue.extend(r)
+            elif isinstance(r, Exception):
+                logger.warning("revenue_task_error err=%s", str(r)[:100])
+
+        # Whop is now fetched in parallel above
 
     # Group by period
     grouped = {}
