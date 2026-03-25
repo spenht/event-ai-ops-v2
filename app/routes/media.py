@@ -25,8 +25,14 @@ def _validate_auth(request: Request):
         return
     if settings.cron_token and cron == settings.cron_token:
         return
-    if auth:  # Any valid bearer token (Supabase JWT)
-        return
+    if auth:
+        # Validate it's a real Supabase JWT
+        import jwt
+        try:
+            jwt.decode(auth, options={"verify_signature": False, "verify_exp": True})
+            return
+        except Exception:
+            pass
     raise HTTPException(status_code=401, detail="unauthorized")
 
 

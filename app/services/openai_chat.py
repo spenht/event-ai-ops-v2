@@ -106,18 +106,18 @@ async def generate_reply(
 
     payload = {
         "model": model,
-        "input": [
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": "DATOS (fuente de verdad): " + json.dumps(facts_block, ensure_ascii=False)},
             *conversation,
         ],
-        "max_output_tokens": 420,
+        "max_tokens": 420,
     }
 
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:
             resp = await client.post(
-                "https://api.openai.com/v1/responses",
+                "https://api.openai.com/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
@@ -129,16 +129,10 @@ async def generate_reply(
                 return None
             data = resp.json()
 
-        if isinstance(data.get("output_text"), str) and data["output_text"].strip():
-            return data["output_text"].strip()
-
-        parts: list[str] = []
-        for item in data.get("output", []) or []:
-            for c in item.get("content", []) or []:
-                if c.get("type") == "output_text" and c.get("text"):
-                    parts.append(c["text"])
-        txt = "\n".join(parts).strip()
-        return txt or None
+        choices = data.get("choices", [])
+        if choices and choices[0].get("message", {}).get("content"):
+            return choices[0]["message"]["content"].strip()
+        return None
 
     except Exception as e:
         logger.exception("openai_exception %s", str(e)[:300])

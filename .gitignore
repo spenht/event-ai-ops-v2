@@ -17,8 +17,4 @@ __pycache__/
 
 # Claude Code
 .claude/*
-!.claude/rules/
-!.claude/commands/
-
-# Fly.io
-.fly/
+!.claude/settings.json

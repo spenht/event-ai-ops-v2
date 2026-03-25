@@ -942,6 +942,14 @@ async def clone_from_url(request: Request):
 
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
+    # SSRF protection: only allow http/https and public hostnames
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Only http/https URLs allowed")
+    hostname = parsed.hostname or ""
+    if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or hostname.startswith("10.") or hostname.startswith("192.168.") or hostname.startswith("172."):
+        raise HTTPException(status_code=400, detail="Internal URLs not allowed")
     if campaign_id:
         _validate_auth(request, campaign_id)
 
