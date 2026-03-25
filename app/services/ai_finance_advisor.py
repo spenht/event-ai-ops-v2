@@ -1,6 +1,7 @@
 """AI Financial Advisor — analyzes all financial data and gives actionable insights."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -42,63 +43,52 @@ async def gather_financial_snapshot(days: int = 30) -> dict[str, Any]:
         "mercury_transactions": [],
     }
 
-    # ── 1. Stripe revenue from all accounts ──
-    for key, meta in STRIPE_ACCOUNTS.items():
+    created_gte = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+
+    # ── Helper: fetch one Stripe account ──
+    async def _fetch_stripe(key: str, meta: dict) -> None:
         sk = getattr(settings, f"stripe_key_{key}", "")
         if not sk:
-            continue
+            return
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
+            async with httpx.AsyncClient(timeout=15) as client:
                 total = 0
                 count = 0
                 cursor = None
-                for _ in range(5):
-                    params = {"limit": 100, "created[gte]": int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())}
+                for _ in range(3):  # max 3 pages = 300 txns
+                    params: dict = {"limit": 100, "created[gte]": created_gte}
                     if cursor:
                         params["starting_after"] = cursor
-                    r = await client.get(
-                        "https://api.stripe.com/v1/payment_intents",
-                        params=params,
-                        auth=(sk, ""),
-                    )
+                    r = await client.get("https://api.stripe.com/v1/payment_intents", params=params, auth=(sk, ""))
                     if r.status_code != 200:
                         break
                     data = r.json()
                     for pi in data.get("data", []):
                         if pi.get("status") == "succeeded":
-                            amt = (pi.get("amount", 0) or 0) / 100
-                            total += amt
+                            total += (pi.get("amount", 0) or 0) / 100
                             count += 1
                     if not data.get("has_more"):
                         break
                     items = data.get("data", [])
-                    if items:
-                        cursor = items[-1]["id"]
-
+                    cursor = items[-1]["id"] if items else None
                 snapshot["revenue_by_source"][meta["name"]] = {
-                    "amount": round(total, 2),
-                    "currency": meta["currency"],
-                    "transactions": count,
+                    "amount": round(total, 2), "currency": meta["currency"], "transactions": count,
                 }
         except Exception as e:
             logger.warning("stripe_snapshot_error key=%s err=%s", key, str(e)[:80])
 
-    # ── 2. Mercury transactions (expenses + income) ──
-    for key, meta in MERCURY_ACCOUNTS.items():
+    # ── Helper: fetch one Mercury org ──
+    async def _fetch_mercury(key: str, meta: dict) -> None:
         token = getattr(settings, f"mercury_key_{key}", "")
         if not token:
-            continue
+            return
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                # First get all accounts for this org
-                accts_r = await client.get(
-                    "https://api.mercury.com/api/v1/accounts",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
+            async with httpx.AsyncClient(timeout=15) as client:
+                accts_r = await client.get("https://api.mercury.com/api/v1/accounts",
+                                           headers={"Authorization": f"Bearer {token}"})
                 if accts_r.status_code != 200:
-                    continue
+                    return
                 accounts = accts_r.json().get("accounts", [])
-
                 all_txns = []
                 for acct in accounts:
                     acc_id = acct.get("id", "")
@@ -111,7 +101,6 @@ async def gather_financial_snapshot(days: int = 30) -> dict[str, Any]:
                     )
                     if r.status_code == 200:
                         all_txns.extend(r.json().get("transactions", []))
-
                 txns = all_txns
 
                 expenses = {}
@@ -139,7 +128,6 @@ async def gather_financial_snapshot(days: int = 30) -> dict[str, Any]:
                     else:
                         income_total += amt
 
-                # Identify recurring expenses (same counterparty, 2+ transactions)
                 for cp, info in expenses.items():
                     if info["count"] >= 2:
                         snapshot["recurring_expenses"].append({
@@ -162,6 +150,14 @@ async def gather_financial_snapshot(days: int = 30) -> dict[str, Any]:
                 }
         except Exception as e:
             logger.warning("mercury_snapshot_error key=%s err=%s", key, str(e)[:80])
+
+    # ── Run all fetches in parallel ──
+    tasks = []
+    for key, meta in STRIPE_ACCOUNTS.items():
+        tasks.append(_fetch_stripe(key, meta))
+    for key, meta in MERCURY_ACCOUNTS.items():
+        tasks.append(_fetch_mercury(key, meta))
+    await asyncio.gather(*tasks, return_exceptions=True)
 
     # ── 3. Sort recurring expenses by total (biggest first) ──
     snapshot["recurring_expenses"].sort(key=lambda x: x["total"], reverse=True)
