@@ -3,6 +3,7 @@ Agent Profiles — CRUD for agent role assignments per campaign.
 Each agent can have multiple profiles (confirmador, setter, closer, etc.)
 """
 import logging
+from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from ..settings import settings
@@ -126,7 +127,7 @@ async def update_profile(profile_id: str, body: UpdateProfileRequest):
     if not updates:
         raise HTTPException(status_code=400, detail="Nothing to update")
 
-    updates["updated_at"] = "now()"
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     r = sb.table("agent_profiles").update(updates).eq("id", profile_id).execute()
     return {"ok": True, "data": (r.data or [{}])[0]}
 
@@ -137,7 +138,7 @@ async def delete_profile(profile_id: str):
     sb = _sb()
     r = (
         sb.table("agent_profiles")
-        .update({"is_active": False, "updated_at": "now()"})
+        .update({"is_active": False, "updated_at": datetime.now(timezone.utc).isoformat()})
         .eq("id", profile_id)
         .execute()
     )

@@ -881,7 +881,7 @@ async def upsert_commission_rule(request: Request):
         r = sb.table("commission_configs").update({
             "commission_type": commission_type,
             "commission_value": commission_value,
-            "updated_at": "now()",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", existing.data[0]["id"]).execute()
     else:
         r = sb.table("commission_configs").insert({
@@ -1008,7 +1008,7 @@ async def assign_transaction(txn_id: str, request: Request):
     r = sb.table("financial_transactions").update({
         "project_id": project_id,
         "auto_assigned": False,
-        "updated_at": "now()",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", txn_id).execute()
 
     if not r.data:
@@ -1032,7 +1032,7 @@ async def bulk_assign_transactions(request: Request):
             sb.table("financial_transactions").update({
                 "project_id": project_id,
                 "auto_assigned": False,
-                "updated_at": "now()",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             }).eq("id", tid).execute()
             updated += 1
         except Exception:
@@ -1089,7 +1089,7 @@ async def update_assignment_rule(rule_id: str, request: Request):
     allowed = {"project_id", "field", "operator", "value", "priority", "enabled"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if updates:
-        updates["updated_at"] = "now()"
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
         r = sb.table("transaction_assignment_rules").update(updates).eq("id", rule_id).execute()
         return {"ok": True, "data": (r.data or [{}])[0]}
     return {"ok": True}

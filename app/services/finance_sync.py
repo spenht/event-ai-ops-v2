@@ -61,7 +61,7 @@ def _set_cursor(source_id: str, synced_at: datetime):
         sb.table("sync_cursors").upsert({
             "id": source_id,
             "last_synced_at": synced_at.isoformat(),
-            "updated_at": "now()",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }, on_conflict="id").execute()
     except Exception as e:
         logger.warning("cursor_update_error source=%s err=%s", source_id, str(e)[:80])
@@ -445,7 +445,7 @@ def apply_rules_to_unassigned() -> dict:
                 sb.table("financial_transactions").update({
                     "project_id": pid,
                     "auto_assigned": True,
-                    "updated_at": "now()",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 }).eq("id", txn["id"]).execute()
                 assigned += 1
             except Exception:
