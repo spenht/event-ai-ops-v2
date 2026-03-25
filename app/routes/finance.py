@@ -175,15 +175,49 @@ async def financial_overview(request: Request):
             except Exception as e:
                 logger.warning("mercury_balance_error acct=%s err=%s", acct_id, str(e)[:80])
 
-        # Whop — get company info + recent revenue
+        # Whop — get company info + balance + recent revenue
         whop_key = getattr(settings, "whop_api_key", "")
         if whop_key:
             try:
                 headers_whop = {"Authorization": f"Bearer {whop_key}"}
+                whop_data: dict = {"name": "Whop", "connected": True, "balance": None, "revenue_30d": 0, "payments_30d": 0, "currency": "USD"}
+
+                # Company info + get company ID for balance
+                company_id = None
                 r = await client.get("https://api.whop.com/api/v5/company", headers=headers_whop)
-                whop_data = {"name": "Whop", "connected": True, "total_revenue": 0, "total_payments": 0, "currency": "USD"}
                 if r.status_code == 200:
-                    whop_data["name"] = r.json().get("title", "Whop")
+                    company_data = r.json()
+                    whop_data["name"] = company_data.get("title", "Whop")
+                    company_id = company_data.get("id", "")
+
+                # Fetch balance via ledger_accounts endpoint (correct API)
+                if company_id:
+                    try:
+                        ledger_url = f"https://api.whop.com/api/v1/ledger_accounts/{company_id}"
+                        br = await client.get(ledger_url, headers=headers_whop)
+                        logger.info("whop_balance url=%s status=%s", ledger_url, br.status_code)
+                        if br.status_code == 200:
+                            bdata = br.json()
+                            for bal_entry in bdata.get("balances", []):
+                                curr = (bal_entry.get("currency", "usd") or "usd").lower()
+                                if curr == "usd":
+                                    available_bal = bal_entry.get("balance", 0) or 0
+                                    pending_bal = bal_entry.get("pending_balance", 0) or 0
+                                    reserve_bal = bal_entry.get("reserve_balance", 0) or 0
+                                    if available_bal > 1000000:
+                                        available_bal /= 100
+                                        pending_bal /= 100
+                                        reserve_bal /= 100
+                                    total_bal = available_bal + pending_bal + reserve_bal
+                                    whop_data["balance"] = {
+                                        "available": round(available_bal, 2),
+                                        "pending": round(pending_bal, 2),
+                                        "reserved": round(reserve_bal, 2),
+                                        "total": round(total_bal, 2),
+                                    }
+                                    break
+                    except Exception as e:
+                        logger.warning("whop_balance_error err=%s", str(e)[:100])
 
                 # Get recent payments to calculate revenue (last 500)
                 total_rev = 0
@@ -203,8 +237,8 @@ async def financial_overview(request: Request):
                     else:
                         break
 
-                whop_data["total_revenue"] = total_rev
-                whop_data["total_payments"] = total_count
+                whop_data["revenue_30d"] = total_rev
+                whop_data["payments_30d"] = total_count
                 result["whop"] = whop_data
             except Exception as e:
                 logger.warning("whop_error err=%s", str(e)[:80])
@@ -219,8 +253,9 @@ async def financial_overview(request: Request):
             total_mxn += acct["available"] + acct["pending"]
     for acct in result["mercury"].values():
         total_usd += acct["balance"]
-    if result.get("whop", {}).get("total_revenue"):
-        total_usd += result["whop"]["total_revenue"]
+    whop_balance = (result.get("whop") or {}).get("balance") or {}
+    if whop_balance.get("total"):
+        total_usd += whop_balance["total"]
     result["totals"] = {"usd": total_usd, "mxn": total_mxn}
 
     return {"ok": True, "data": result}
@@ -292,13 +327,20 @@ async def revenue_by_period(
             grouped[key]["total_mxn"] += item["amount"]
         grouped[key]["count"] += 1
 
-        src = item["source"]
+        # Key by source + currency so MXN and USD from same source stay separate
+        src = f"{item['source']}_{item['currency']}"
         if src not in grouped[key]["by_source"]:
             grouped[key]["by_source"][src] = {"name": item["source_name"], "amount": 0, "currency": item["currency"]}
         grouped[key]["by_source"][src]["amount"] += item["amount"]
 
     periods = sorted(grouped.values(), key=lambda x: x["period"], reverse=True)
-    return {"ok": True, "data": {"periods": periods, "transactions": revenue}}
+    total_usd = sum(t["amount"] for t in revenue if t["currency"] == "USD")
+    total_mxn = sum(t["amount"] for t in revenue if t["currency"] == "MXN")
+    return {"ok": True, "data": {
+        "periods": periods,
+        "transactions": revenue,
+        "summary": {"total_usd": total_usd, "total_mxn": total_mxn, "count": len(revenue)},
+    }}
 
 
 # ─── Mercury transactions ──────────────────────────────────────────────────
