@@ -347,8 +347,18 @@ async def revenue_by_period(
                 if pr.status_code != 200:
                     break
                 body = pr.json()
-                for p in body.get("data", []):
-                    amt = p.get("final_amount", p.get("subtotal", 0)) or 0
+                whop_payments = body.get("data", [])
+                if whop_payments and not items_out:
+                    # Log first payment to debug amount fields
+                    sample = {k: v for k, v in whop_payments[0].items() if "amount" in k.lower() or k in ("id", "status", "currency", "final_amount", "subtotal", "total", "charged_amount")}
+                    logger.info("whop_sample_payment keys=%s sample=%s", list(whop_payments[0].keys())[:20], sample)
+                for p in whop_payments:
+                    amt = p.get("final_amount", p.get("charged_amount", p.get("subtotal", p.get("total", 0)))) or 0
+                    if isinstance(amt, str):
+                        try:
+                            amt = float(amt)
+                        except ValueError:
+                            amt = 0
                     if amt > 10000:
                         amt = amt / 100
                     raw_date = p.get("created_at", p.get("updated_at", ""))
