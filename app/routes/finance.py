@@ -223,7 +223,7 @@ async def financial_overview(request: Request):
                         body = pr.json()
                         payments = body.get("data", [])
                         for p in payments:
-                            amt = p.get("final_amount", p.get("subtotal", 0)) or 0
+                            amt = p.get("subtotal", 0) or p.get("final_amount", 0) or 0
                             # Whop amounts may be in cents
                             if amt > 10000:
                                 amt = amt / 100
@@ -353,7 +353,8 @@ async def revenue_by_period(
                     sample = {k: v for k, v in whop_payments[0].items() if "amount" in k.lower() or k in ("id", "status", "currency", "final_amount", "subtotal", "total", "charged_amount")}
                     logger.info("whop_sample_payment keys=%s sample=%s", list(whop_payments[0].keys())[:20], sample)
                 for p in whop_payments:
-                    amt = p.get("final_amount", p.get("charged_amount", p.get("subtotal", p.get("total", 0)))) or 0
+                    # subtotal = sale price, final_amount = after Whop fees (often 0)
+                    amt = p.get("subtotal", 0) or p.get("final_amount", 0) or 0
                     if isinstance(amt, str):
                         try:
                             amt = float(amt)
@@ -623,7 +624,7 @@ async def unified_transactions(
                         break
                     body = pr.json()
                     for p in body.get("data", []):
-                        amt = p.get("final_amount", p.get("subtotal", 0)) or 0
+                        amt = p.get("subtotal", 0) or p.get("final_amount", 0) or 0
                         if amt > 10000:
                             amt = amt / 100
                         raw_d = p.get("created_at", p.get("updated_at", ""))
