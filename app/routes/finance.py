@@ -285,6 +285,7 @@ async def revenue_by_period(
     revenue = []
     async with httpx.AsyncClient(timeout=30.0) as client:
         # ── Stripe payment_intents (with pagination) ──
+        logger.info("revenue_start stripe_accounts=%s source_filter=%s days=%s", list(STRIPE_ACCOUNTS.keys()), source, days)
         for acct_id, info in STRIPE_ACCOUNTS.items():
             if source and source != f"stripe_{acct_id}":
                 continue
