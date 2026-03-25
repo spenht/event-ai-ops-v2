@@ -175,36 +175,71 @@ async def financial_overview(request: Request):
             except Exception as e:
                 logger.warning("mercury_balance_error acct=%s err=%s", acct_id, str(e)[:80])
 
-        # Whop — get company info + recent revenue
+        # Whop — get company info + balance + recent revenue
         whop_key = getattr(settings, "whop_api_key", "")
         if whop_key:
             try:
                 headers_whop = {"Authorization": f"Bearer {whop_key}"}
+                whop_data = {"name": "Whop", "connected": True, "currency": "USD",
+                             "balance": {}, "revenue_30d": 0, "payments_30d": 0}
+
+                # Company info
                 r = await client.get("https://api.whop.com/api/v5/company", headers=headers_whop)
-                whop_data = {"name": "Whop", "connected": True, "total_revenue": 0, "total_payments": 0, "currency": "USD"}
                 if r.status_code == 200:
                     whop_data["name"] = r.json().get("title", "Whop")
 
-                # Get recent payments to calculate revenue (last 500)
+                # Try to get ledger/balance info via v1 API
+                try:
+                    br = await client.get("https://api.whop.com/api/v1/ledger-accounts",
+                                          headers=headers_whop)
+                    if br.status_code == 200:
+                        ledger_data = br.json()
+                        accounts = ledger_data.get("data", ledger_data) if isinstance(ledger_data, dict) else ledger_data
+                        if isinstance(accounts, list) and accounts:
+                            la = accounts[0]
+                            whop_data["balance"] = {
+                                "available": la.get("available_balance", la.get("available", 0)),
+                                "pending": la.get("pending_balance", la.get("pending", 0)),
+                                "reserved": la.get("reserved_balance", la.get("reserved", 0)),
+                                "total": la.get("balance", la.get("total", 0)),
+                            }
+                except Exception:
+                    pass  # Ledger endpoint may not be available
+
+                # Get last 30 days of payments for revenue calculation
+                thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
                 total_rev = 0
                 total_count = 0
-                for page in range(1, 6):
+                cursor = None
+                for _ in range(10):  # max 10 pages
+                    params = {"per": 100, "status": "paid", "created_after": thirty_days_ago}
+                    if cursor:
+                        params["cursor"] = cursor
                     pr = await client.get(
-                        f"https://api.whop.com/api/v5/company/payments?per=100&page={page}&status=paid",
-                        headers=headers_whop,
+                        "https://api.whop.com/api/v5/company/payments",
+                        params=params, headers=headers_whop,
                     )
                     if pr.status_code == 200:
-                        payments = pr.json().get("data", [])
+                        body = pr.json()
+                        payments = body.get("data", [])
                         for p in payments:
-                            total_rev += p.get("subtotal", 0) or 0
+                            amt = p.get("final_amount", p.get("subtotal", 0)) or 0
+                            # Whop amounts may be in cents
+                            if amt > 10000:
+                                amt = amt / 100
+                            total_rev += amt
                             total_count += 1
-                        if not pr.json().get("pagination", {}).get("next_page"):
+                        pagination = body.get("pagination", {})
+                        if not pagination.get("next_page") and not pagination.get("next_cursor"):
+                            break
+                        cursor = pagination.get("next_cursor", pagination.get("next_page"))
+                        if not cursor:
                             break
                     else:
                         break
 
-                whop_data["total_revenue"] = total_rev
-                whop_data["total_payments"] = total_count
+                whop_data["revenue_30d"] = round(total_rev, 2)
+                whop_data["payments_30d"] = total_count
                 result["whop"] = whop_data
             except Exception as e:
                 logger.warning("whop_error err=%s", str(e)[:80])
@@ -219,8 +254,12 @@ async def financial_overview(request: Request):
             total_mxn += acct["available"] + acct["pending"]
     for acct in result["mercury"].values():
         total_usd += acct["balance"]
-    if result.get("whop", {}).get("total_revenue"):
-        total_usd += result["whop"]["total_revenue"]
+    # Whop balance (available) if we got it, otherwise skip
+    whop_balance = result.get("whop", {}).get("balance", {})
+    if whop_balance.get("total"):
+        total_usd += whop_balance["total"]
+    elif whop_balance.get("available"):
+        total_usd += whop_balance["available"] + whop_balance.get("pending", 0) + whop_balance.get("reserved", 0)
     result["totals"] = {"usd": total_usd, "mxn": total_mxn}
 
     return {"ok": True, "data": result}
@@ -235,8 +274,9 @@ async def revenue_by_period(
     period: str = Query("day", description="day|week|month"),
     days: int = Query(30, description="lookback days"),
     project_id: Optional[str] = None,
+    source: Optional[str] = Query(None, description="filter: stripe_uvul, stripe_lba, whop, etc."),
 ):
-    """Revenue from Stripe charges, grouped by period."""
+    """Revenue from ALL sources (Stripe + Whop), grouped by period."""
     _require_super_admin(request)
 
     since = datetime.now(timezone.utc) - timedelta(days=days)
@@ -244,17 +284,27 @@ async def revenue_by_period(
 
     revenue = []
     async with httpx.AsyncClient(timeout=30.0) as client:
+        # ── Stripe payment_intents (with pagination) ──
         for acct_id, info in STRIPE_ACCOUNTS.items():
+            if source and source != f"stripe_{acct_id}":
+                continue
             key = _get_stripe_key(acct_id)
             if not key:
                 continue
             try:
-                # Get payment_intents from Stripe (more reliable than charges)
-                params = {"created[gte]": since_ts, "limit": 100}
-                r = await client.get("https://api.stripe.com/v1/payment_intents",
-                                     params=params, auth=(key, ""))
-                if r.status_code == 200:
-                    for pi in r.json().get("data", []):
+                starting_after = None
+                for _ in range(20):  # max 2000 transactions
+                    params = {"created[gte]": since_ts, "limit": 100}
+                    if starting_after:
+                        params["starting_after"] = starting_after
+                    r = await client.get("https://api.stripe.com/v1/payment_intents",
+                                         params=params, auth=(key, ""))
+                    if r.status_code != 200:
+                        logger.warning("stripe_revenue_status acct=%s status=%s", acct_id, r.status_code)
+                        break
+                    data = r.json()
+                    items = data.get("data", [])
+                    for pi in items:
                         if pi.get("status") != "succeeded":
                             continue
                         meta = pi.get("metadata") or {}
@@ -263,42 +313,113 @@ async def revenue_by_period(
                             "source_name": info["name"],
                             "amount": pi["amount"] / 100,
                             "currency": pi["currency"].upper(),
-                            "date": datetime.fromtimestamp(pi["created"], tz=timezone.utc).isoformat(),
+                            "txn_date": datetime.fromtimestamp(pi["created"], tz=timezone.utc).isoformat(),
                             "campaign_id": meta.get("campaign_id", ""),
                             "lead_id": meta.get("lead_id", ""),
                             "description": pi.get("description", ""),
+                            "stripe_id": pi.get("id", ""),
+                            "customer_email": pi.get("receipt_email", ""),
                         })
-                else:
-                    logger.warning("stripe_revenue_status acct=%s status=%s", acct_id, r.status_code)
+                    if not data.get("has_more") or not items:
+                        break
+                    starting_after = items[-1]["id"]
             except Exception as e:
                 logger.warning("stripe_revenue_error acct=%s err=%s", acct_id, str(e)[:80])
+
+        # ── Whop payments ──
+        whop_key = getattr(settings, "whop_api_key", "")
+        if whop_key and (not source or source == "whop"):
+            try:
+                headers_whop = {"Authorization": f"Bearer {whop_key}"}
+                cursor = None
+                for _ in range(20):
+                    params = {"per": 100, "status": "paid",
+                              "created_after": since.isoformat()}
+                    if cursor:
+                        params["cursor"] = cursor
+                    pr = await client.get(
+                        "https://api.whop.com/api/v5/company/payments",
+                        params=params, headers=headers_whop,
+                    )
+                    if pr.status_code != 200:
+                        break
+                    body = pr.json()
+                    payments = body.get("data", [])
+                    for p in payments:
+                        amt = p.get("final_amount", p.get("subtotal", 0)) or 0
+                        if amt > 10000:
+                            amt = amt / 100
+                        created = p.get("created_at", p.get("updated_at", ""))
+                        revenue.append({
+                            "source": "whop",
+                            "source_name": "Whop",
+                            "amount": amt,
+                            "currency": (p.get("currency", "usd") or "usd").upper(),
+                            "date": created,
+                            "campaign_id": "",
+                            "lead_id": "",
+                            "description": p.get("product_name", p.get("plan_name", "")),
+                            "whop_id": p.get("id", ""),
+                            "customer_email": p.get("user_email", p.get("email", "")),
+                        })
+                    pagination = body.get("pagination", {})
+                    cursor = pagination.get("next_cursor", pagination.get("next_page"))
+                    if not cursor:
+                        break
+            except Exception as e:
+                logger.warning("whop_revenue_error err=%s", str(e)[:80])
+
+    # Sort all revenue by date
+    revenue.sort(key=lambda x: x.get("date", ""), reverse=True)
 
     # Group by period
     grouped = {}
     for item in revenue:
-        dt = datetime.fromisoformat(item["date"])
+        try:
+            dt = datetime.fromisoformat(item["date"].replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
         if period == "day":
-            key = dt.strftime("%Y-%m-%d")
+            pkey = dt.strftime("%Y-%m-%d")
         elif period == "week":
-            key = f"{dt.year}-W{dt.isocalendar()[1]:02d}"
+            pkey = f"{dt.year}-W{dt.isocalendar()[1]:02d}"
         else:
-            key = dt.strftime("%Y-%m")
+            pkey = dt.strftime("%Y-%m")
 
-        if key not in grouped:
-            grouped[key] = {"period": key, "total_usd": 0, "total_mxn": 0, "count": 0, "by_source": {}}
+        if pkey not in grouped:
+            grouped[pkey] = {"period": pkey, "total_usd": 0, "total_mxn": 0, "count": 0, "by_source": {}}
         if item["currency"] == "USD":
-            grouped[key]["total_usd"] += item["amount"]
+            grouped[pkey]["total_usd"] += item["amount"]
         elif item["currency"] == "MXN":
-            grouped[key]["total_mxn"] += item["amount"]
-        grouped[key]["count"] += 1
+            grouped[pkey]["total_mxn"] += item["amount"]
+        grouped[pkey]["count"] += 1
 
         src = item["source"]
-        if src not in grouped[key]["by_source"]:
-            grouped[key]["by_source"][src] = {"name": item["source_name"], "amount": 0, "currency": item["currency"]}
-        grouped[key]["by_source"][src]["amount"] += item["amount"]
+        if src not in grouped[pkey]["by_source"]:
+            grouped[pkey]["by_source"][src] = {"name": item["source_name"], "amount": 0, "currency": item["currency"]}
+        grouped[pkey]["by_source"][src]["amount"] += item["amount"]
 
     periods = sorted(grouped.values(), key=lambda x: x["period"], reverse=True)
-    return {"ok": True, "data": {"periods": periods, "transactions": revenue}}
+
+    # Round amounts
+    for p in periods:
+        p["total_usd"] = round(p["total_usd"], 2)
+        p["total_mxn"] = round(p["total_mxn"], 2)
+        for s in p["by_source"].values():
+            s["amount"] = round(s["amount"], 2)
+
+    return {
+        "ok": True,
+        "data": {
+            "periods": periods,
+            "transactions": revenue,
+            "summary": {
+                "total_usd": round(sum(p["total_usd"] for p in periods), 2),
+                "total_mxn": round(sum(p["total_mxn"] for p in periods), 2),
+                "total_transactions": len(revenue),
+            },
+        },
+    }
 
 
 # ─── Mercury transactions ──────────────────────────────────────────────────
@@ -380,6 +501,184 @@ async def expenses(
     }
 
 
+# ─── Unified Transactions (all sources as line items) ─────────────────────
+
+
+@router.get("/transactions")
+async def unified_transactions(
+    request: Request,
+    days: int = Query(30, description="lookback days"),
+    source: Optional[str] = Query(None, description="filter: stripe_uvul, mercury_oll, whop, etc."),
+    type: Optional[str] = Query(None, description="filter: income|expense|sale"),
+    limit: int = Query(200, description="max results"),
+):
+    """Unified transaction feed — ALL money movements across Stripe, Whop, and Mercury."""
+    _require_super_admin(request)
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since_ts = int(since.timestamp())
+    since_str = since.strftime("%Y-%m-%d")
+    txns = []
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # ── Stripe sales ──
+        if not source or source.startswith("stripe"):
+            for acct_id, info in STRIPE_ACCOUNTS.items():
+                if source and source != f"stripe_{acct_id}":
+                    continue
+                key = _get_stripe_key(acct_id)
+                if not key:
+                    continue
+                try:
+                    starting_after = None
+                    for _ in range(10):
+                        params = {"created[gte]": since_ts, "limit": 100}
+                        if starting_after:
+                            params["starting_after"] = starting_after
+                        r = await client.get("https://api.stripe.com/v1/payment_intents",
+                                             params=params, auth=(key, ""))
+                        if r.status_code != 200:
+                            break
+                        data = r.json()
+                        items = data.get("data", [])
+                        for pi in items:
+                            if pi.get("status") != "succeeded":
+                                continue
+                            meta = pi.get("metadata") or {}
+                            txns.append({
+                                "id": pi["id"],
+                                "source": f"stripe_{acct_id}",
+                                "source_name": info["name"],
+                                "type": "sale",
+                                "amount": pi["amount"] / 100,
+                                "currency": pi["currency"].upper(),
+                                "txn_date": datetime.fromtimestamp(pi["created"], tz=timezone.utc).isoformat(),
+                                "description": pi.get("description") or f"Stripe payment",
+                                "counterparty": pi.get("receipt_email", ""),
+                                "campaign_id": meta.get("campaign_id", ""),
+                                "lead_id": meta.get("lead_id", ""),
+                            })
+                        if not data.get("has_more") or not items:
+                            break
+                        starting_after = items[-1]["id"]
+                except Exception as e:
+                    logger.warning("txn_stripe_error acct=%s err=%s", acct_id, str(e)[:80])
+
+        # ── Whop sales ──
+        whop_key = getattr(settings, "whop_api_key", "")
+        if whop_key and (not source or source == "whop"):
+            try:
+                headers_whop = {"Authorization": f"Bearer {whop_key}"}
+                cursor = None
+                for _ in range(10):
+                    params = {"per": 100, "status": "paid", "created_after": since.isoformat()}
+                    if cursor:
+                        params["cursor"] = cursor
+                    pr = await client.get(
+                        "https://api.whop.com/api/v5/company/payments",
+                        params=params, headers=headers_whop,
+                    )
+                    if pr.status_code != 200:
+                        break
+                    body = pr.json()
+                    for p in body.get("data", []):
+                        amt = p.get("final_amount", p.get("subtotal", 0)) or 0
+                        if amt > 10000:
+                            amt = amt / 100
+                        txns.append({
+                            "id": p.get("id", ""),
+                            "source": "whop",
+                            "source_name": "Whop",
+                            "type": "sale",
+                            "amount": amt,
+                            "currency": (p.get("currency", "usd") or "usd").upper(),
+                            "date": p.get("created_at", p.get("updated_at", "")),
+                            "description": p.get("product_name", p.get("plan_name", "Whop payment")),
+                            "counterparty": p.get("user_email", p.get("email", "")),
+                            "campaign_id": "",
+                            "lead_id": "",
+                        })
+                    pagination = body.get("pagination", {})
+                    cursor = pagination.get("next_cursor", pagination.get("next_page"))
+                    if not cursor:
+                        break
+            except Exception as e:
+                logger.warning("txn_whop_error err=%s", str(e)[:80])
+
+        # ── Mercury banking (income + expenses) ──
+        if not source or source.startswith("mercury"):
+            for acct_id, info in MERCURY_ACCOUNTS.items():
+                if source and source != f"mercury_{acct_id}":
+                    continue
+                key = _get_mercury_key(acct_id)
+                if not key:
+                    continue
+                try:
+                    r = await client.get("https://api.mercury.com/api/v1/accounts",
+                                         headers={"Authorization": f"Bearer {key}"})
+                    if r.status_code != 200:
+                        continue
+                    merc_accounts = r.json().get("accounts", r.json()) if isinstance(r.json(), dict) else r.json()
+                    for ma in merc_accounts:
+                        if not isinstance(ma, dict) or not ma.get("id"):
+                            continue
+                        tr = await client.get(
+                            f"https://api.mercury.com/api/v1/account/{ma['id']}/transactions",
+                            params={"start": since_str, "limit": 500},
+                            headers={"Authorization": f"Bearer {key}"},
+                        )
+                        if tr.status_code == 200:
+                            raw = tr.json().get("transactions", tr.json()) if isinstance(tr.json(), dict) else tr.json()
+                            for t in (raw if isinstance(raw, list) else []):
+                                amt = t.get("amount", 0)
+                                txns.append({
+                                    "id": t.get("id", ""),
+                                    "source": f"mercury_{acct_id}",
+                                    "source_name": info["name"],
+                                    "type": "income" if amt > 0 else "expense",
+                                    "amount": abs(amt),
+                                    "currency": "USD",
+                                    "date": t.get("postedDate", t.get("createdAt", "")),
+                                    "description": t.get("bankDescription", t.get("note", "")),
+                                    "counterparty": t.get("counterpartyName", ""),
+                                    "account_name": ma.get("name", ""),
+                                    "campaign_id": "",
+                                    "lead_id": "",
+                                })
+                except Exception as e:
+                    logger.warning("txn_mercury_error acct=%s err=%s", acct_id, str(e)[:80])
+
+    # Filter by type
+    if type:
+        txns = [t for t in txns if t["type"] == type]
+
+    # Sort by date descending
+    txns.sort(key=lambda x: x.get("date", ""), reverse=True)
+    txns = txns[:limit]
+
+    # Summary
+    total_sales = round(sum(t["amount"] for t in txns if t["type"] == "sale" and t["currency"] == "USD"), 2)
+    total_sales_mxn = round(sum(t["amount"] for t in txns if t["type"] == "sale" and t["currency"] == "MXN"), 2)
+    total_income = round(sum(t["amount"] for t in txns if t["type"] == "income"), 2)
+    total_expense = round(sum(t["amount"] for t in txns if t["type"] == "expense"), 2)
+
+    return {
+        "ok": True,
+        "data": {
+            "transactions": txns,
+            "summary": {
+                "sales_usd": total_sales,
+                "sales_mxn": total_sales_mxn,
+                "mercury_income": total_income,
+                "mercury_expense": total_expense,
+                "net_usd": total_sales + total_income - total_expense,
+            },
+            "count": len(txns),
+            "sources": list(set(t["source"] for t in txns)),
+        },
+    }
+
+
 # ─── Commission config per profile ─────────────────────────────────────────
 
 
@@ -439,3 +738,311 @@ async def upsert_commission_rule(request: Request):
         }).execute()
 
     return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FINANCIAL TRANSACTIONS — Persisted + Project Linking
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+# ─── Sync endpoints ───────────────────────────────────────────────────────
+
+
+@router.post("/sync")
+async def trigger_sync(request: Request):
+    """Sync ALL sources (Stripe + Mercury + Whop) → financial_transactions."""
+    _require_super_admin(request)
+    from ..services.finance_sync import sync_all
+    result = await sync_all()
+    return {"ok": True, "data": result}
+
+
+@router.post("/sync/{source}")
+async def trigger_sync_source(source: str, request: Request):
+    """Sync a single source, e.g. stripe_uvul, mercury_oll, whop."""
+    _require_super_admin(request)
+    from ..services.finance_sync import sync_stripe, sync_mercury, sync_whop
+
+    if source.startswith("stripe_"):
+        acct_id = source.replace("stripe_", "")
+        result = await sync_stripe(acct_id)
+    elif source.startswith("mercury_"):
+        acct_id = source.replace("mercury_", "")
+        result = await sync_mercury(acct_id)
+    elif source == "whop":
+        result = await sync_whop()
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown source: {source}")
+    return {"ok": True, "data": result}
+
+
+# ─── Persisted transactions (read from Supabase) ─────────────────────────
+
+
+@router.get("/stored-transactions")
+async def stored_transactions(
+    request: Request,
+    days: int = Query(30),
+    source: Optional[str] = None,
+    type: Optional[str] = None,
+    project_id: Optional[str] = None,
+    unassigned_only: bool = Query(False),
+    limit: int = Query(200),
+    offset: int = Query(0),
+):
+    """Read persisted transactions from DB with filters."""
+    _require_super_admin(request)
+
+    q = sb.table("financial_transactions").select(
+        "*, projects(name)"
+    ).order("txn_date", desc=True)
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    q = q.gte("txn_date", since)
+
+    if source:
+        q = q.eq("source", source)
+    if type:
+        q = q.eq("type", type)
+    if project_id:
+        q = q.eq("project_id", project_id)
+    if unassigned_only:
+        q = q.is_("project_id", "null")
+
+    q = q.range(offset, offset + limit - 1)
+    r = q.execute()
+    txns = r.data or []
+
+    # Get counts
+    count_q = sb.table("financial_transactions").select("id", count="exact")
+    count_q = count_q.gte("txn_date", since)
+    if source:
+        count_q = count_q.eq("source", source)
+    if type:
+        count_q = count_q.eq("type", type)
+    if project_id:
+        count_q = count_q.eq("project_id", project_id)
+    if unassigned_only:
+        count_q = count_q.is_("project_id", "null")
+    count_r = count_q.execute()
+
+    return {
+        "ok": True,
+        "data": {
+            "transactions": txns,
+            "count": len(txns),
+            "total": count_r.count if hasattr(count_r, "count") else len(txns),
+            "offset": offset,
+            "limit": limit,
+        },
+    }
+
+
+# ─── Transaction assignment ──────────────────────────────────────────────
+
+
+@router.post("/transactions/{txn_id}/assign")
+async def assign_transaction(txn_id: str, request: Request):
+    """Manually assign a transaction to a project."""
+    _require_super_admin(request)
+    body = await request.json()
+    project_id = body.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id required")
+
+    r = sb.table("financial_transactions").update({
+        "project_id": project_id,
+        "auto_assigned": False,
+        "updated_at": "now()",
+    }).eq("id", txn_id).execute()
+
+    if not r.data:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return {"ok": True, "data": r.data[0]}
+
+
+@router.post("/transactions/bulk-assign")
+async def bulk_assign_transactions(request: Request):
+    """Bulk assign multiple transactions to a project."""
+    _require_super_admin(request)
+    body = await request.json()
+    project_id = body.get("project_id")
+    transaction_ids = body.get("transaction_ids", [])
+    if not project_id or not transaction_ids:
+        raise HTTPException(status_code=400, detail="project_id and transaction_ids required")
+
+    updated = 0
+    for tid in transaction_ids:
+        try:
+            sb.table("financial_transactions").update({
+                "project_id": project_id,
+                "auto_assigned": False,
+                "updated_at": "now()",
+            }).eq("id", tid).execute()
+            updated += 1
+        except Exception:
+            pass
+
+    return {"ok": True, "data": {"updated": updated, "total": len(transaction_ids)}}
+
+
+@router.post("/transactions/apply-rules")
+async def apply_rules(request: Request):
+    """Re-apply assignment rules to all unassigned transactions."""
+    _require_super_admin(request)
+    from ..services.finance_sync import apply_rules_to_unassigned
+    result = apply_rules_to_unassigned()
+    return {"ok": True, "data": result}
+
+
+# ─── Assignment rules CRUD ───────────────────────────────────────────────
+
+
+@router.get("/assignment-rules")
+async def list_assignment_rules(request: Request):
+    _require_super_admin(request)
+    r = sb.table("transaction_assignment_rules").select(
+        "*, projects(name)"
+    ).order("priority", desc=True).execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/assignment-rules")
+async def create_assignment_rule(request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    required = ["project_id", "field", "value"]
+    for f in required:
+        if not body.get(f):
+            raise HTTPException(status_code=400, detail=f"{f} required")
+
+    r = sb.table("transaction_assignment_rules").insert({
+        "project_id": body["project_id"],
+        "field": body["field"],
+        "operator": body.get("operator", "equals"),
+        "value": body["value"],
+        "priority": body.get("priority", 0),
+        "enabled": body.get("enabled", True),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.patch("/assignment-rules/{rule_id}")
+async def update_assignment_rule(rule_id: str, request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    allowed = {"project_id", "field", "operator", "value", "priority", "enabled"}
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if updates:
+        updates["updated_at"] = "now()"
+        r = sb.table("transaction_assignment_rules").update(updates).eq("id", rule_id).execute()
+        return {"ok": True, "data": (r.data or [{}])[0]}
+    return {"ok": True}
+
+
+@router.delete("/assignment-rules/{rule_id}")
+async def delete_assignment_rule(rule_id: str, request: Request):
+    _require_super_admin(request)
+    sb.table("transaction_assignment_rules").delete().eq("id", rule_id).execute()
+    return {"ok": True}
+
+
+# ─── Profitability per project ───────────────────────────────────────────
+
+
+@router.get("/profitability")
+async def project_profitability(
+    request: Request,
+    days: int = Query(30),
+    project_id: Optional[str] = None,
+):
+    """Per-project profitability: revenue - expenses."""
+    _require_super_admin(request)
+
+    # Try RPC first (faster), fall back to Python aggregation
+    try:
+        rpc_result = sb.rpc("fn_project_profitability", {"p_days": days}).execute()
+        projects_data = rpc_result.data or []
+    except Exception:
+        # Fallback: aggregate in Python
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        q = sb.table("financial_transactions").select(
+            "project_id,type,amount,currency"
+        ).gte("txn_date", since).not_.is_("project_id", "null").neq("type", "transfer")
+        if project_id:
+            q = q.eq("project_id", project_id)
+        r = q.execute()
+
+        agg = {}
+        for t in (r.data or []):
+            pid = t["project_id"]
+            if pid not in agg:
+                agg[pid] = {"project_id": pid, "revenue_usd": 0, "revenue_mxn": 0,
+                            "expenses_usd": 0, "expenses_mxn": 0, "refunds_usd": 0,
+                            "transaction_count": 0}
+            a = agg[pid]
+            a["transaction_count"] += 1
+            if t["type"] in ("sale", "income"):
+                if t["currency"] == "USD":
+                    a["revenue_usd"] += float(t["amount"])
+                elif t["currency"] == "MXN":
+                    a["revenue_mxn"] += float(t["amount"])
+            elif t["type"] == "expense":
+                if t["currency"] == "USD":
+                    a["expenses_usd"] += float(t["amount"])
+                elif t["currency"] == "MXN":
+                    a["expenses_mxn"] += float(t["amount"])
+            elif t["type"] == "refund":
+                a["refunds_usd"] += float(t["amount"])
+
+        # Get project names
+        proj_r = sb.table("projects").select("id,name").execute()
+        proj_names = {p["id"]: p["name"] for p in (proj_r.data or [])}
+        for v in agg.values():
+            v["project_name"] = proj_names.get(v["project_id"], "Unknown")
+
+        projects_data = sorted(agg.values(), key=lambda x: x["revenue_usd"], reverse=True)
+
+    # Filter if specific project requested
+    if project_id:
+        projects_data = [p for p in projects_data if p.get("project_id") == project_id]
+
+    # Calculate profit + margin for each
+    for p in projects_data:
+        p["revenue_usd"] = round(float(p.get("revenue_usd", 0)), 2)
+        p["revenue_mxn"] = round(float(p.get("revenue_mxn", 0)), 2)
+        p["expenses_usd"] = round(float(p.get("expenses_usd", 0)), 2)
+        p["expenses_mxn"] = round(float(p.get("expenses_mxn", 0)), 2)
+        p["refunds_usd"] = round(float(p.get("refunds_usd", 0)), 2)
+        p["profit_usd"] = round(p["revenue_usd"] - p["expenses_usd"] - p["refunds_usd"], 2)
+        p["margin_pct"] = round(
+            p["profit_usd"] / p["revenue_usd"] * 100, 1
+        ) if p["revenue_usd"] > 0 else 0
+
+    # Totals
+    totals = {
+        "revenue_usd": round(sum(p["revenue_usd"] for p in projects_data), 2),
+        "revenue_mxn": round(sum(p["revenue_mxn"] for p in projects_data), 2),
+        "expenses_usd": round(sum(p["expenses_usd"] for p in projects_data), 2),
+        "refunds_usd": round(sum(p["refunds_usd"] for p in projects_data), 2),
+        "profit_usd": round(sum(p["profit_usd"] for p in projects_data), 2),
+    }
+
+    # Count unassigned
+    try:
+        unassigned_r = sb.table("financial_transactions").select(
+            "id", count="exact"
+        ).is_("project_id", "null").execute()
+        unassigned_count = unassigned_r.count if hasattr(unassigned_r, "count") else 0
+    except Exception:
+        unassigned_count = 0
+
+    return {
+        "ok": True,
+        "data": {
+            "projects": projects_data,
+            "totals": totals,
+            "unassigned_count": unassigned_count,
+            "period_days": days,
+        },
+    }
