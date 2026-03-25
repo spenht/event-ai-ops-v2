@@ -310,17 +310,24 @@ async def revenue_by_period(
 
         # Whop payments — mapped to Legacy Business Academy
         whop_key = getattr(settings, "whop_api_key", "")
+        logger.info("whop_revenue_check key_exists=%s", bool(whop_key))
         if whop_key:
             try:
                 headers_whop = {"Authorization": f"Bearer {whop_key}"}
+                whop_count = 0
+                whop_skipped = 0
                 for page in range(1, 10):  # up to 900 payments
                     pr = await client.get(
                         f"https://api.whop.com/api/v5/company/payments?per=100&page={page}&status=paid",
                         headers=headers_whop,
                     )
+                    logger.info("whop_revenue_page page=%d status=%d", page, pr.status_code)
                     if pr.status_code != 200:
+                        logger.warning("whop_revenue_page_error body=%s", str(pr.text)[:200])
                         break
                     payments = pr.json().get("data", [])
+                    logger.info("whop_revenue_payments_count page=%d count=%d", page, len(payments))
+                    past_window = False
                     for p in payments:
                         created = p.get("created_at", p.get("updated_at", ""))
                         if not created:
@@ -330,23 +337,28 @@ async def revenue_by_period(
                         except Exception:
                             continue
                         if dt < since:
-                            break  # older than window
-                        revenue.append({
-                            "source": "stripe_lba",  # Whop = Legacy Business Academy
-                            "source_name": "Legacy Business Academy",
-                            "amount": (p.get("subtotal", 0) or 0),
-                            "currency": "USD",
-                            "date": dt.isoformat(),
-                            "campaign_id": "",
-                            "lead_id": "",
-                            "description": f"Whop: {p.get('product_name', p.get('plan_id', 'Payment'))}",
-                        })
-                    # Stop if we've gone past our date range
-                    if payments and any(True for px in payments if px.get("created_at", "") and
-                                        datetime.fromisoformat(px["created_at"].replace("Z", "+00:00")) < since):
-                        break
+                            past_window = True
+                            whop_skipped += 1
+                            continue  # skip old ones, don't break (order may not be strict)
+                        subtotal = p.get("subtotal", 0) or 0
+                        # Whop subtotal is in dollars (not cents)
+                        if subtotal > 0:
+                            revenue.append({
+                                "source": "stripe_lba",  # Whop = Legacy Business Academy
+                                "source_name": "Legacy Business Academy",
+                                "amount": subtotal,
+                                "currency": "USD",
+                                "date": dt.isoformat(),
+                                "campaign_id": "",
+                                "lead_id": "",
+                                "description": f"Whop: {p.get('product_name', p.get('plan_id', 'Payment'))}",
+                            })
+                            whop_count += 1
+                    if past_window and whop_skipped > 10:
+                        break  # We're clearly past our date window
                     if not pr.json().get("pagination", {}).get("next_page"):
                         break
+                logger.info("whop_revenue_done added=%d skipped=%d", whop_count, whop_skipped)
             except Exception as e:
                 logger.warning("whop_revenue_error err=%s", str(e)[:100])
 
