@@ -261,6 +261,47 @@ async def financial_overview(request: Request):
     return {"ok": True, "data": result}
 
 
+# ─── Debug Whop ──────────────────────────────────────────────────────────
+
+
+@router.get("/debug-whop")
+async def debug_whop(request: Request):
+    """Temporary debug endpoint for Whop payments."""
+    _require_super_admin(request)
+    whop_key = getattr(settings, "whop_api_key", "")
+    result = {"key_exists": bool(whop_key), "key_len": len(whop_key)}
+    if not whop_key:
+        return {"ok": False, "data": result}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        headers_whop = {"Authorization": f"Bearer {whop_key}"}
+        pr = await client.get(
+            "https://api.whop.com/api/v5/company/payments?per=3&page=1&status=paid",
+            headers=headers_whop,
+        )
+        result["status"] = pr.status_code
+        if pr.status_code == 200:
+            data = pr.json()
+            result["pagination"] = data.get("pagination", {})
+            result["count"] = len(data.get("data", []))
+            result["sample_payments"] = []
+            for p in data.get("data", [])[:3]:
+                result["sample_payments"].append({
+                    "subtotal": p.get("subtotal"),
+                    "final_amount": p.get("final_amount"),
+                    "amount": p.get("amount"),
+                    "created_at": p.get("created_at"),
+                    "product_name": p.get("product_name"),
+                    "status": p.get("status"),
+                    "currency": p.get("currency"),
+                    "keys": list(p.keys())[:20],
+                })
+        else:
+            result["body"] = pr.text[:500]
+
+    return {"ok": True, "data": result}
+
+
 # ─── Revenue by period ──────────────────────────────────────────────────────
 
 
