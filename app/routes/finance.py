@@ -278,7 +278,7 @@ async def revenue_by_period(
     since_ts = int(since.timestamp())
 
     revenue = []
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         for acct_id, info in STRIPE_ACCOUNTS.items():
             key = _get_stripe_key(acct_id)
             if not key:
@@ -360,7 +360,8 @@ async def revenue_by_period(
                         break
                 logger.info("whop_revenue_done added=%d skipped=%d", whop_count, whop_skipped)
             except Exception as e:
-                logger.warning("whop_revenue_error err=%s", str(e)[:100])
+                import traceback
+                logger.error("whop_revenue_error err=%s trace=%s", str(e)[:100], traceback.format_exc()[-300:])
 
     # Group by period
     grouped = {}
