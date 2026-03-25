@@ -122,6 +122,140 @@ async def update_project(project_id: str, request: Request):
     return {"ok": True}
 
 
+# ─── Assignment Rules CRUD ──────────────────────────────────────────────────
+
+
+@router.get("/assignment-rules")
+async def list_assignment_rules(request: Request, project_id: Optional[str] = None):
+    _require_super_admin(request)
+    q = sb.table("transaction_assignment_rules").select("*").order("priority", desc=True)
+    if project_id:
+        q = q.eq("project_id", project_id)
+    r = q.execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/assignment-rules")
+async def create_assignment_rule(request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    required = ["project_id", "field", "value"]
+    for f in required:
+        if not body.get(f):
+            raise HTTPException(status_code=400, detail=f"{f} is required")
+    r = sb.table("transaction_assignment_rules").insert({
+        "project_id": body["project_id"],
+        "field": body["field"],
+        "operator": body.get("operator", "equals"),
+        "value": body["value"],
+        "priority": body.get("priority", 0),
+        "enabled": body.get("enabled", True),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.delete("/assignment-rules/{rule_id}")
+async def delete_assignment_rule(rule_id: str, request: Request):
+    _require_super_admin(request)
+    sb.table("transaction_assignment_rules").delete().eq("id", rule_id).execute()
+    return {"ok": True}
+
+
+# ─── Project Profitability ──────────────────────────────────────────────────
+
+
+@router.get("/profitability")
+async def project_profitability(
+    request: Request,
+    days: int = Query(30),
+    project_id: Optional[str] = None,
+):
+    """Per-project profitability from stored transactions."""
+    _require_super_admin(request)
+
+    # Use the RPC function if no specific project
+    if not project_id:
+        try:
+            r = sb.rpc("fn_project_profitability", {"p_days": days}).execute()
+            return {"ok": True, "data": r.data or []}
+        except Exception:
+            pass
+
+    # Fallback: calculate from live revenue data
+    # Get revenue by source for the period
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since_ts = int(since.timestamp())
+
+    # Get projects
+    projects_q = sb.table("projects").select("*")
+    if project_id:
+        projects_q = projects_q.eq("id", project_id)
+    projects = (projects_q.execute()).data or []
+
+    # Get revenue per source from Stripe
+    revenue_by_source = {}
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        import asyncio
+
+        async def fetch_stripe_total(acct_id, info):
+            key = _get_stripe_key(acct_id)
+            if not key:
+                return acct_id, 0, 0, 0
+            usd, mxn, count = 0, 0, 0
+            try:
+                has_more, starting_after, pages = True, None, 0
+                while has_more and pages < 20:
+                    params = {"created[gte]": since_ts, "limit": 100}
+                    if starting_after:
+                        params["starting_after"] = starting_after
+                    r = await client.get("https://api.stripe.com/v1/payment_intents",
+                                         params=params, auth=(key, ""))
+                    if r.status_code != 200:
+                        break
+                    data = r.json()
+                    for pi in data.get("data", []):
+                        if pi.get("status") != "succeeded":
+                            continue
+                        amt = pi["amount"] / 100
+                        if pi["currency"].upper() == "USD":
+                            usd += amt
+                        else:
+                            mxn += amt
+                        count += 1
+                    has_more = data.get("has_more", False)
+                    items = data.get("data", [])
+                    if items:
+                        starting_after = items[-1]["id"]
+                    pages += 1
+            except Exception:
+                pass
+            return acct_id, usd, mxn, count
+
+        tasks = [fetch_stripe_total(aid, info) for aid, info in STRIPE_ACCOUNTS.items()]
+        results = await asyncio.gather(*tasks)
+        for acct_id, usd, mxn, count in results:
+            revenue_by_source[acct_id] = {"usd": usd, "mxn": mxn, "count": count}
+
+    # Map projects to their revenue
+    profitability = []
+    for proj in projects:
+        stripe_acct = proj.get("stripe_account", "")
+        rev = revenue_by_source.get(stripe_acct, {"usd": 0, "mxn": 0, "count": 0})
+        profitability.append({
+            "project_id": proj["id"],
+            "project_name": proj["name"],
+            "stripe_account": stripe_acct,
+            "mercury_account": proj.get("mercury_account", ""),
+            "revenue_usd": round(rev["usd"], 2),
+            "revenue_mxn": round(rev["mxn"], 2),
+            "transaction_count": rev["count"],
+            "status": proj.get("status", "active"),
+        })
+
+    profitability.sort(key=lambda x: x["revenue_usd"], reverse=True)
+    return {"ok": True, "data": profitability}
+
+
 # ─── Global Financial Overview ──────────────────────────────────────────────
 
 
