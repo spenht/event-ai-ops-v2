@@ -308,6 +308,48 @@ async def revenue_by_period(
             except Exception as e:
                 logger.warning("stripe_revenue_error acct=%s err=%s", acct_id, str(e)[:80])
 
+        # Whop payments — mapped to Legacy Business Academy
+        whop_key = getattr(settings, "whop_api_key", "")
+        if whop_key:
+            try:
+                headers_whop = {"Authorization": f"Bearer {whop_key}"}
+                for page in range(1, 10):  # up to 900 payments
+                    pr = await client.get(
+                        f"https://api.whop.com/api/v5/company/payments?per=100&page={page}&status=paid",
+                        headers=headers_whop,
+                    )
+                    if pr.status_code != 200:
+                        break
+                    payments = pr.json().get("data", [])
+                    for p in payments:
+                        created = p.get("created_at", p.get("updated_at", ""))
+                        if not created:
+                            continue
+                        try:
+                            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        except Exception:
+                            continue
+                        if dt < since:
+                            break  # older than window
+                        revenue.append({
+                            "source": "stripe_lba",  # Whop = Legacy Business Academy
+                            "source_name": "Legacy Business Academy",
+                            "amount": (p.get("subtotal", 0) or 0),
+                            "currency": "USD",
+                            "date": dt.isoformat(),
+                            "campaign_id": "",
+                            "lead_id": "",
+                            "description": f"Whop: {p.get('product_name', p.get('plan_id', 'Payment'))}",
+                        })
+                    # Stop if we've gone past our date range
+                    if payments and any(True for px in payments if px.get("created_at", "") and
+                                        datetime.fromisoformat(px["created_at"].replace("Z", "+00:00")) < since):
+                        break
+                    if not pr.json().get("pagination", {}).get("next_page"):
+                        break
+            except Exception as e:
+                logger.warning("whop_revenue_error err=%s", str(e)[:100])
+
     # Group by period
     grouped = {}
     for item in revenue:
