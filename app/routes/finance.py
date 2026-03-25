@@ -58,16 +58,19 @@ def _require_super_admin(request: Request):
         return
     if spartans_key and settings.spartans_key and spartans_key == settings.spartans_key:
         return
-    # Check if user is org owner
+    # Check if user is org owner via JWT
     if token:
         try:
-            from supabase import create_client
-            sb_client = create_client(settings.supabase_url, settings.supabase_service_role_key)
-            user = sb_client.auth.get_user(token)
-            if user and user.user:
-                uid = user.user.id
-                org = sb_client.table("orgs").select("owner_id").eq("owner_id", uid).limit(1).execute()
+            import jwt
+            decoded = jwt.decode(token, options={"verify_signature": False})
+            uid = decoded.get("sub", "")
+            if uid:
+                org = sb.table("orgs").select("owner_id").eq("owner_id", uid).limit(1).execute()
                 if org.data:
+                    return
+                # Also check org_members for owner role
+                member = sb.table("org_members").select("role").eq("user_id", uid).eq("role", "owner").limit(1).execute()
+                if member.data:
                     return
         except Exception:
             pass
