@@ -242,73 +242,49 @@ async def financial_overview(request: Request):
                 whop_data = {"name": "Whop", "connected": True, "currency": "USD",
                              "balance": {}, "revenue_30d": 0, "payments_30d": 0}
 
-                # Company info
+                # Company info + get company ID for balance
+                company_id = None
                 r = await client.get("https://api.whop.com/api/v5/company", headers=headers_whop)
                 if r.status_code == 200:
-                    whop_data["name"] = r.json().get("title", "Whop")
+                    company_data = r.json()
+                    whop_data["name"] = company_data.get("title", "Whop")
+                    company_id = company_data.get("id", "")  # biz_xxx
+                    logger.info("whop_company id=%s name=%s", company_id, whop_data["name"])
 
-                # Try multiple Whop balance endpoints
-                balance_urls = [
-                    "https://api.whop.com/api/v5/company/balance",
-                    "https://api.whop.com/api/v5/company/payouts",
-                    "https://api.whop.com/api/v5/company",
-                    "https://api.whop.com/api/v2/company/balance",
-                    "https://api.whop.com/api/v1/me/balance",
-                    "https://api.whop.com/api/v1/ledger-accounts",
-                ]
-                for balance_url in balance_urls:
+                # Fetch balance via ledger_accounts endpoint
+                # Correct endpoint: GET /api/v1/ledger_accounts/{biz_xxx}
+                if company_id:
+                    ledger_url = f"https://api.whop.com/api/v1/ledger_accounts/{company_id}"
                     try:
-                        br = await client.get(balance_url, headers=headers_whop)
-                        logger.info("whop_balance_try url=%s status=%s body=%s", balance_url, br.status_code, str(br.text)[:500])
+                        br = await client.get(ledger_url, headers=headers_whop)
+                        logger.info("whop_balance url=%s status=%s body=%s", ledger_url, br.status_code, str(br.text)[:500])
                         if br.status_code == 200:
                             bdata = br.json()
-                            if not isinstance(bdata, dict):
-                                continue
-                            # Check all possible balance field patterns
-                            def _extract_balance(d):
-                                """Try to extract balance from various Whop API response shapes."""
-                                for avail_key in ["available", "available_balance", "available_amount"]:
-                                    avail = d.get(avail_key, 0)
-                                    if avail:
-                                        pending = d.get("pending", d.get("pending_balance", d.get("pending_amount", 0)))
-                                        reserved = d.get("reserved", d.get("reserved_balance", d.get("reserved_amount", 0)))
-                                        total = d.get("total", d.get("balance", d.get("total_balance", 0)))
-                                        # Convert from cents if needed
-                                        if avail > 100000: avail /= 100
-                                        if pending > 100000: pending /= 100
-                                        if reserved > 100000: reserved /= 100
-                                        if total > 100000: total /= 100
-                                        return {
-                                            "available": avail, "pending": pending,
-                                            "reserved": reserved,
-                                            "total": total or (avail + pending + reserved),
-                                        }
-                                return None
-
-                            # Try top-level
-                            bal = _extract_balance(bdata)
-                            if bal:
-                                whop_data["balance"] = bal
-                                break
-                            # Try nested "balance" key
-                            if "balance" in bdata and isinstance(bdata["balance"], dict):
-                                bal = _extract_balance(bdata["balance"])
-                                if bal:
-                                    whop_data["balance"] = bal
+                            # Response has balances array: [{balance, pending_balance, reserve_balance, currency}]
+                            balances = bdata.get("balances", [])
+                            for bal_entry in balances:
+                                curr = (bal_entry.get("currency", "usd") or "usd").lower()
+                                if curr == "usd":
+                                    total_bal = bal_entry.get("balance", 0) or 0
+                                    pending_bal = bal_entry.get("pending_balance", 0) or 0
+                                    reserve_bal = bal_entry.get("reserve_balance", 0) or 0
+                                    # Convert from cents if needed (Whop sometimes uses cents)
+                                    if total_bal > 100000:
+                                        total_bal /= 100
+                                        pending_bal /= 100
+                                        reserve_bal /= 100
+                                    available_bal = total_bal - pending_bal - reserve_bal
+                                    whop_data["balance"] = {
+                                        "available": round(available_bal, 2),
+                                        "pending": round(pending_bal, 2),
+                                        "reserved": round(reserve_bal, 2),
+                                        "total": round(total_bal, 2),
+                                    }
+                                    logger.info("whop_balance_found total=%s available=%s pending=%s reserved=%s",
+                                                total_bal, available_bal, pending_bal, reserve_bal)
                                     break
-                            # Try nested data array
-                            accounts = bdata.get("data", [])
-                            if isinstance(accounts, list):
-                                for acct in accounts:
-                                    if isinstance(acct, dict):
-                                        bal = _extract_balance(acct)
-                                        if bal:
-                                            whop_data["balance"] = bal
-                                            break
-                                if whop_data["balance"]:
-                                    break
-                    except Exception:
-                        continue
+                    except Exception as e:
+                        logger.warning("whop_balance_error err=%s", str(e)[:100])
 
                 # Get last 30 days of payments for revenue calculation
                 thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
