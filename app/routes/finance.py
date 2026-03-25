@@ -290,7 +290,9 @@ async def revenue_by_period(
                 continue
             key = _get_stripe_key(acct_id)
             if not key:
+                logger.warning("revenue_no_key acct=%s", acct_id)
                 continue
+            logger.info("revenue_fetch acct=%s since_ts=%s", acct_id, since_ts)
             try:
                 starting_after = None
                 for _ in range(20):  # max 2000 transactions
@@ -323,6 +325,7 @@ async def revenue_by_period(
                     if not data.get("has_more") or not items:
                         break
                     starting_after = items[-1]["id"]
+                logger.info("revenue_fetched acct=%s items=%s", acct_id, len([r for r in revenue if r.get("source") == f"stripe_{acct_id}"]))
             except Exception as e:
                 logger.warning("stripe_revenue_error acct=%s err=%s", acct_id, str(e)[:80])
 
