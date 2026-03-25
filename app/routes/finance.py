@@ -223,7 +223,7 @@ async def financial_overview(request: Request):
                 total_rev = 0
                 total_count = 0
                 thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
-                for page in range(1, 10):
+                for page in range(1, 15):
                     pr = await client.get(
                         f"https://api.whop.com/api/v5/company/payments?per=100&page={page}&status=paid",
                         headers=headers_whop,
@@ -231,22 +231,19 @@ async def financial_overview(request: Request):
                     if pr.status_code != 200:
                         break
                     payments = pr.json().get("data", [])
-                    past_window = False
                     for p in payments:
                         created = p.get("created_at") or p.get("paid_at") or 0
                         if isinstance(created, (int, float)) and created > 0:
-                            dt = datetime.fromtimestamp(created, tz=timezone.utc)
+                            dt = datetime.fromtimestamp(int(created), tz=timezone.utc)
                             if dt < thirty_days_ago:
-                                past_window = True
-                                continue
+                                continue  # skip but don't break — order not guaranteed
+                        else:
+                            continue
                         subtotal = p.get("subtotal", 0) or 0
-                        # Convert from cents if needed
-                        amount = subtotal / 100 if subtotal > 500 else subtotal
-                        total_rev += amount
-                        total_count += 1
-                    if past_window:
-                        break
-                    if not pr.json().get("pagination", {}).get("next_page"):
+                        if subtotal > 0:
+                            total_rev += subtotal  # already in dollars
+                            total_count += 1
+                    if not payments or not pr.json().get("pagination", {}).get("next_page"):
                         break
 
                 whop_data["revenue_30d"] = round(total_rev, 2)
