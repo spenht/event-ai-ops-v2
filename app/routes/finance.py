@@ -337,12 +337,22 @@ async def revenue_by_period(
             if not key:
                 continue
             try:
-                # Get payment_intents from Stripe (more reliable than charges)
-                params = {"created[gte]": since_ts, "limit": 100}
-                r = await client.get("https://api.stripe.com/v1/payment_intents",
-                                     params=params, auth=(key, ""))
-                if r.status_code == 200:
-                    for pi in r.json().get("data", []):
+                # Get ALL payment_intents from Stripe with pagination
+                has_more = True
+                starting_after = None
+                page_count = 0
+                while has_more and page_count < 20:  # max 2000 txns per account
+                    params = {"created[gte]": since_ts, "limit": 100}
+                    if starting_after:
+                        params["starting_after"] = starting_after
+                    r = await client.get("https://api.stripe.com/v1/payment_intents",
+                                         params=params, auth=(key, ""))
+                    if r.status_code != 200:
+                        logger.warning("stripe_revenue_status acct=%s status=%s", acct_id, r.status_code)
+                        break
+                    data = r.json()
+                    items = data.get("data", [])
+                    for pi in items:
                         if pi.get("status") != "succeeded":
                             continue
                         meta = pi.get("metadata") or {}
@@ -356,8 +366,10 @@ async def revenue_by_period(
                             "lead_id": meta.get("lead_id", ""),
                             "description": pi.get("description", ""),
                         })
-                else:
-                    logger.warning("stripe_revenue_status acct=%s status=%s", acct_id, r.status_code)
+                    has_more = data.get("has_more", False)
+                    if items:
+                        starting_after = items[-1]["id"]
+                    page_count += 1
             except Exception as e:
                 logger.warning("stripe_revenue_error acct=%s err=%s", acct_id, str(e)[:80])
 
