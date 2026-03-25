@@ -388,13 +388,18 @@ async def revenue_by_period(
         if not source or source == "whop":
             tasks.append(_fetch_whop_revenue(client, since.isoformat()))
 
+        logger.info("revenue_gathering tasks=%s", len(tasks))
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
+        for i, r in enumerate(results):
             if isinstance(r, list):
+                logger.info("revenue_task_%s items=%s", i, len(r))
                 revenue.extend(r)
             elif isinstance(r, Exception):
-                logger.warning("revenue_task_error err=%s", str(r)[:80])
+                logger.warning("revenue_task_error_%s err=%s", i, str(r)[:200])
+            else:
+                logger.warning("revenue_task_%s unexpected_type=%s", i, type(r))
 
+    logger.info("revenue_total items=%s", len(revenue))
     # Sort all revenue by date
     revenue.sort(key=lambda x: x.get("date", ""), reverse=True)
 
