@@ -54,28 +54,31 @@ def _require_super_admin(request: Request):
     token = (request.headers.get("authorization") or "").replace("Bearer ", "").strip()
     spartans_key = (request.headers.get("x-spartans-key") or "").strip()
     cron_token = (request.headers.get("x-cron-token") or "").strip()
+
     if settings.cron_token and cron_token == settings.cron_token:
         return
     if spartans_key and settings.spartans_key and spartans_key == settings.spartans_key:
         return
-    # Check if user is org owner via JWT
+
+    # Check JWT from Supabase auth — verify user is org owner
     if token:
         try:
-            import jwt
-            decoded = jwt.decode(token, options={"verify_signature": False})
+            import jwt as pyjwt
+            decoded = pyjwt.decode(token, options={"verify_signature": False})
             uid = decoded.get("sub", "")
             if uid:
-                org = sb.table("orgs").select("owner_id").eq("owner_id", uid).limit(1).execute()
-                if org.data:
-                    return
-                # Also check org_members for owner role
                 member = sb.table("org_members").select("role").eq("user_id", uid).eq("role", "owner").limit(1).execute()
                 if member.data:
+                    logger.info("finance_auth_ok user=%s role=owner", uid)
                     return
-        except Exception:
-            pass
+                logger.warning("finance_auth_denied user=%s no_owner_role", uid)
+        except Exception as e:
+            logger.warning("finance_auth_jwt_error err=%s", str(e)[:80])
+
+    # Dev mode fallback
     if not settings.cron_token:
-        return  # dev mode
+        return
+
     raise HTTPException(status_code=403, detail="Super admin access required")
 
 
