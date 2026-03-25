@@ -175,16 +175,39 @@ async def financial_overview(request: Request):
             except Exception as e:
                 logger.warning("mercury_balance_error acct=%s err=%s", acct_id, str(e)[:80])
 
-        # Whop
+        # Whop — get company info + recent revenue
         whop_key = getattr(settings, "whop_api_key", "")
         if whop_key:
             try:
-                r = await client.get("https://api.whop.com/api/v5/company",
-                                     headers={"Authorization": f"Bearer {whop_key}"})
+                headers_whop = {"Authorization": f"Bearer {whop_key}"}
+                r = await client.get("https://api.whop.com/api/v5/company", headers=headers_whop)
+                whop_data = {"name": "Whop", "connected": True, "total_revenue": 0, "total_payments": 0, "currency": "USD"}
                 if r.status_code == 200:
-                    result["whop"] = {"name": r.json().get("title", "Whop"), "connected": True}
-            except Exception:
-                pass
+                    whop_data["name"] = r.json().get("title", "Whop")
+
+                # Get recent payments to calculate revenue (last 500)
+                total_rev = 0
+                total_count = 0
+                for page in range(1, 6):
+                    pr = await client.get(
+                        f"https://api.whop.com/api/v5/company/payments?per=100&page={page}&status=paid",
+                        headers=headers_whop,
+                    )
+                    if pr.status_code == 200:
+                        payments = pr.json().get("data", [])
+                        for p in payments:
+                            total_rev += p.get("subtotal", 0) or 0
+                            total_count += 1
+                        if not pr.json().get("pagination", {}).get("next_page"):
+                            break
+                    else:
+                        break
+
+                whop_data["total_revenue"] = total_rev
+                whop_data["total_payments"] = total_count
+                result["whop"] = whop_data
+            except Exception as e:
+                logger.warning("whop_error err=%s", str(e)[:80])
 
     # Calculate totals
     total_usd = 0
@@ -196,6 +219,8 @@ async def financial_overview(request: Request):
             total_mxn += acct["available"] + acct["pending"]
     for acct in result["mercury"].values():
         total_usd += acct["balance"]
+    if result.get("whop", {}).get("total_revenue"):
+        total_usd += result["whop"]["total_revenue"]
     result["totals"] = {"usd": total_usd, "mxn": total_mxn}
 
     return {"ok": True, "data": result}
@@ -224,25 +249,27 @@ async def revenue_by_period(
             if not key:
                 continue
             try:
-                # Get charges from Stripe
-                params = {"created[gte]": since_ts, "limit": 100, "expand[]": "data.metadata"}
-                r = await client.get("https://api.stripe.com/v1/charges",
+                # Get payment_intents from Stripe (more reliable than charges)
+                params = {"created[gte]": since_ts, "limit": 100}
+                r = await client.get("https://api.stripe.com/v1/payment_intents",
                                      params=params, auth=(key, ""))
                 if r.status_code == 200:
-                    for charge in r.json().get("data", []):
-                        if charge.get("status") != "succeeded":
+                    for pi in r.json().get("data", []):
+                        if pi.get("status") != "succeeded":
                             continue
-                        meta = charge.get("metadata") or {}
+                        meta = pi.get("metadata") or {}
                         revenue.append({
                             "source": f"stripe_{acct_id}",
                             "source_name": info["name"],
-                            "amount": charge["amount"] / 100,
-                            "currency": charge["currency"].upper(),
-                            "date": datetime.fromtimestamp(charge["created"], tz=timezone.utc).isoformat(),
+                            "amount": pi["amount"] / 100,
+                            "currency": pi["currency"].upper(),
+                            "date": datetime.fromtimestamp(pi["created"], tz=timezone.utc).isoformat(),
                             "campaign_id": meta.get("campaign_id", ""),
                             "lead_id": meta.get("lead_id", ""),
-                            "description": charge.get("description", ""),
+                            "description": pi.get("description", ""),
                         })
+                else:
+                    logger.warning("stripe_revenue_status acct=%s status=%s", acct_id, r.status_code)
             except Exception as e:
                 logger.warning("stripe_revenue_error acct=%s err=%s", acct_id, str(e)[:80])
 
