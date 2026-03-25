@@ -6,6 +6,7 @@ import time
 import random
 import string
 import asyncio
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Query, UploadFile, File, Form, BackgroundTasks
@@ -451,7 +452,7 @@ async def update_landing_page(page_id: str, request: Request):
                "tiktok_pixel_id", "og_title", "og_description", "og_image", "custom_domain",
                "status", "form_id", "template_id"}
     updates = {k: v for k, v in body.items() if k in allowed}
-    updates["updated_at"] = "now()"
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     r = sb.table("landing_pages").update(updates).eq("id", page_id).execute()
     return {"ok": True, "data": (r.data or [{}])[0]}
@@ -960,6 +961,9 @@ async def clone_from_url(request: Request):
 
 # ─── Signed Upload URL (browser uploads directly to Supabase) ────────────────
 
+ALLOWED_STORAGE_BUCKETS = {"media", "assets", "whatsapp"}
+
+
 @router.get("/media/signed-upload-url")
 async def get_signed_upload_url(
     request: Request,
@@ -968,6 +972,11 @@ async def get_signed_upload_url(
 ):
     """Generate a signed upload URL so the browser can upload directly to Supabase Storage.
     This bypasses Fly.io entirely — no size limits, no timeouts."""
+    if bucket not in ALLOWED_STORAGE_BUCKETS:
+        raise HTTPException(status_code=400, detail="Invalid storage bucket")
+    if ".." in path or "\\" in path:
+        raise HTTPException(status_code=400, detail="Invalid path")
+
     sb = _sb()
     try:
         result = sb.storage.from_(bucket).create_signed_upload_url(path)
