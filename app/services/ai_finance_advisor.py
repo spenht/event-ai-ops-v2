@@ -44,7 +44,7 @@ async def gather_financial_snapshot(days: int = 30) -> dict[str, Any]:
 
     # ── 1. Stripe revenue from all accounts ──
     for key, meta in STRIPE_ACCOUNTS.items():
-        sk = getattr(settings, f"stripe_secret_key_{key}", "")
+        sk = getattr(settings, f"stripe_key_{key}", "")
         if not sk:
             continue
         try:
@@ -85,20 +85,34 @@ async def gather_financial_snapshot(days: int = 30) -> dict[str, Any]:
 
     # ── 2. Mercury transactions (expenses + income) ──
     for key, meta in MERCURY_ACCOUNTS.items():
-        token = getattr(settings, f"mercury_api_token_{key}", "")
-        acc_id = getattr(settings, f"mercury_account_id_{key}", "")
-        if not token or not acc_id:
+        token = getattr(settings, f"mercury_key_{key}", "")
+        if not token:
             continue
         try:
             async with httpx.AsyncClient(timeout=20) as client:
-                r = await client.get(
-                    f"https://api.mercury.com/api/v1/account/{acc_id}/transactions",
-                    params={"limit": 500, "start": since[:10], "end": datetime.now(timezone.utc).strftime("%Y-%m-%d")},
+                # First get all accounts for this org
+                accts_r = await client.get(
+                    "https://api.mercury.com/api/v1/accounts",
                     headers={"Authorization": f"Bearer {token}"},
                 )
-                if r.status_code != 200:
+                if accts_r.status_code != 200:
                     continue
-                txns = r.json().get("transactions", [])
+                accounts = accts_r.json().get("accounts", [])
+
+                all_txns = []
+                for acct in accounts:
+                    acc_id = acct.get("id", "")
+                    if not acc_id:
+                        continue
+                    r = await client.get(
+                        f"https://api.mercury.com/api/v1/account/{acc_id}/transactions",
+                        params={"limit": 500, "start": since[:10], "end": datetime.now(timezone.utc).strftime("%Y-%m-%d")},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    if r.status_code == 200:
+                        all_txns.extend(r.json().get("transactions", []))
+
+                txns = all_txns
 
                 expenses = {}
                 income_total = 0
