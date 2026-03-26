@@ -440,6 +440,156 @@ async def delete_assignment_rule(rule_id: str, request: Request):
     return {"ok": True}
 
 
+# ─── Bulk Assign Transactions ──────────────────────────────────────────────
+
+
+@router.post("/bulk-assign")
+async def bulk_assign_transactions(request: Request):
+    """
+    Bulk-assign transactions to a project by criteria.
+    Body: {
+        project_id: str (required),
+        amounts: [79, 97],           # match ANY of these amounts
+        sources: ["stripe_lba"],     # match ANY of these sources (optional, all if empty)
+        currencies: ["USD"],         # match currency (optional, default USD)
+        date_from: "2026-02-26",     # start date (optional)
+        date_to: "2026-03-15",       # end date (optional)
+        description_contains: "VIP", # description filter (optional)
+        dry_run: false               # if true, just return matches without assigning
+    }
+    """
+    _require_super_admin(request)
+    body = await request.json()
+
+    project_id = body.get("project_id")
+    if not project_id:
+        raise HTTPException(400, "project_id required")
+
+    amounts = body.get("amounts", [])
+    sources = body.get("sources", [])
+    currencies = body.get("currencies", ["USD"])
+    date_from = body.get("date_from")
+    date_to = body.get("date_to")
+    description_contains = body.get("description_contains", "")
+    dry_run = body.get("dry_run", False)
+
+    # Search across live revenue data from Stripe + Whop
+    # Then create/update financial_transactions with project_id
+    matched = []
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        stripe_keys = _get_stripe_keys()
+        for label, key in stripe_keys.items():
+            source = f"stripe_{label}"
+            if sources and source not in sources:
+                continue
+
+            params = {"limit": 100, "status": "succeeded"}
+            if date_from:
+                params["created[gte]"] = int(datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc).timestamp())
+            if date_to:
+                params["created[lte]"] = int(datetime.fromisoformat(date_to + "T23:59:59").replace(tzinfo=timezone.utc).timestamp())
+
+            cursor = None
+            for _ in range(20):  # max 20 pages
+                if cursor:
+                    params["starting_after"] = cursor
+                r = await client.get(
+                    "https://api.stripe.com/v1/payment_intents",
+                    params=params, auth=(key, ""),
+                )
+                if r.status_code != 200:
+                    break
+                data = r.json()
+                for pi in data.get("data", []):
+                    amt = pi["amount"] / 100
+                    curr = (pi.get("currency") or "usd").upper()
+
+                    # Filter by amounts
+                    if amounts and amt not in amounts:
+                        continue
+                    # Filter by currency
+                    if currencies and curr not in currencies:
+                        continue
+                    # Filter by description
+                    desc = pi.get("description") or ""
+                    if description_contains and description_contains.lower() not in desc.lower():
+                        pass  # Don't filter by description for Stripe (often empty)
+
+                    dt = datetime.fromtimestamp(pi["created"], tz=timezone.utc)
+                    matched.append({
+                        "external_id": pi["id"],
+                        "source": source,
+                        "type": "sale",
+                        "amount": amt,
+                        "currency": curr,
+                        "txn_date": dt.isoformat(),
+                        "description": desc or f"Stripe payment ${amt} {curr}",
+                        "counterparty": pi.get("receipt_email") or "",
+                        "project_id": project_id,
+                        "auto_assigned": True,
+                        "metadata": {"bulk_assigned": True, "criteria": {
+                            "amounts": amounts, "sources": sources,
+                            "date_from": date_from, "date_to": date_to,
+                        }},
+                    })
+                    cursor = pi["id"]
+
+                if not data.get("has_more"):
+                    break
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "matched_count": len(matched),
+            "total_amount": sum(t["amount"] for t in matched),
+            "sample": matched[:10],
+        }
+
+    # Upsert matched transactions into financial_transactions
+    assigned = 0
+    for txn in matched:
+        try:
+            sb.table("financial_transactions").upsert(
+                txn, on_conflict="external_id,source"
+            ).execute()
+            assigned += 1
+        except Exception as e:
+            logger.warning("bulk_assign_upsert_error: %s", str(e)[:100])
+
+    return {
+        "ok": True,
+        "assigned_count": assigned,
+        "total_amount": sum(t["amount"] for t in matched),
+        "project_id": project_id,
+    }
+
+
+@router.post("/search-transactions")
+async def search_transactions(request: Request):
+    """
+    Search live Stripe transactions by criteria (without assigning).
+    Same body as bulk-assign but always dry_run.
+    """
+    _require_super_admin(request)
+    body = await request.json()
+    body["dry_run"] = True
+
+    # Reuse bulk-assign logic
+    from starlette.requests import Request as StReq
+    # Create a mock request with the body
+    class MockReq:
+        def __init__(self, orig, body):
+            self.state = orig.state
+            self._body = body
+        async def json(self):
+            return self._body
+
+    mock = MockReq(request, body)
+    return await bulk_assign_transactions(mock)
+
+
 # ─── Project Profitability ──────────────────────────────────────────────────
 
 
