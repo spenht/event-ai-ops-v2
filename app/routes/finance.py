@@ -113,7 +113,7 @@ async def create_project(request: Request):
 async def update_project(project_id: str, request: Request):
     _require_super_admin(request)
     body = await request.json()
-    allowed = {"name", "description", "stripe_account", "mercury_account", "status", "config"}
+    allowed = {"name", "description", "stripe_account", "mercury_account", "status", "config", "leader_id", "leader_name"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if updates:
         updates["updated_at"] = "now()"
@@ -280,6 +280,124 @@ async def create_expense_source(project_id: str, request: Request):
 async def delete_expense_source(source_id: str, request: Request):
     _require_super_admin(request)
     sb.table("project_expense_sources").delete().eq("id", source_id).execute()
+    return {"ok": True}
+
+
+# ─── Campaign–Project Linking ──────────────────────────────────────────────
+
+
+@router.get("/projects/{project_id}/campaigns")
+async def list_project_campaigns(project_id: str, request: Request):
+    """List campaigns linked to a project."""
+    _require_super_admin(request)
+    r = (
+        sb.table("campaigns")
+        .select("id, name, status, event_name, event_date, created_at, project_id")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/projects/{project_id}/campaigns/{campaign_id}/link")
+async def link_campaign_to_project(project_id: str, campaign_id: str, request: Request):
+    """Link a campaign to a project."""
+    _require_super_admin(request)
+    r = sb.table("campaigns").update({"project_id": project_id}).eq("id", campaign_id).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.delete("/projects/{project_id}/campaigns/{campaign_id}/unlink")
+async def unlink_campaign_from_project(project_id: str, campaign_id: str, request: Request):
+    """Unlink a campaign from a project."""
+    _require_super_admin(request)
+    r = sb.table("campaigns").update({"project_id": None}).eq("id", campaign_id).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.get("/unlinked-campaigns")
+async def list_unlinked_campaigns(request: Request):
+    """List campaigns that are not linked to any project."""
+    _require_super_admin(request)
+    r = (
+        sb.table("campaigns")
+        .select("id, name, status, event_name, created_at")
+        .is_("project_id", "null")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return {"ok": True, "data": r.data or []}
+
+
+# ─── Project Agents CRUD ──────────────────────────────────────────────────
+
+
+@router.get("/projects/{project_id}/agents")
+async def list_project_agents(project_id: str, request: Request):
+    """List agents assigned to a project."""
+    _require_super_admin(request)
+    r = sb.table("project_agents").select("*").eq("project_id", project_id).order("created_at", desc=True).execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/projects/{project_id}/agents")
+async def create_project_agent(project_id: str, request: Request):
+    """Add an agent to a project."""
+    _require_super_admin(request)
+    body = await request.json()
+    if not body.get("user_id"):
+        raise HTTPException(status_code=400, detail="user_id is required")
+    r = sb.table("project_agents").insert({
+        "project_id": project_id,
+        "user_id": body["user_id"],
+        "role": body.get("role", "agent"),
+        "commission_rate": body.get("commission_rate", 0),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.delete("/agents/{agent_id}")
+async def delete_project_agent(agent_id: str, request: Request):
+    """Remove an agent from a project."""
+    _require_super_admin(request)
+    sb.table("project_agents").delete().eq("id", agent_id).execute()
+    return {"ok": True}
+
+
+# ─── Project Payment Gateways CRUD ────────────────────────────────────────
+
+
+@router.get("/projects/{project_id}/payment-gateways")
+async def list_project_payment_gateways(project_id: str, request: Request):
+    """List payment gateways for a project."""
+    _require_super_admin(request)
+    r = sb.table("project_payment_gateways").select("*").eq("project_id", project_id).order("created_at", desc=True).execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/projects/{project_id}/payment-gateways")
+async def create_project_payment_gateway(project_id: str, request: Request):
+    """Add a payment gateway to a project."""
+    _require_super_admin(request)
+    body = await request.json()
+    if not body.get("gateway_type"):
+        raise HTTPException(status_code=400, detail="gateway_type is required")
+    r = sb.table("project_payment_gateways").insert({
+        "project_id": project_id,
+        "gateway_type": body["gateway_type"],
+        "gateway_key": body.get("gateway_key", ""),
+        "label": body.get("label", ""),
+        "is_primary": body.get("is_primary", False),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.delete("/payment-gateways/{gateway_id}")
+async def delete_project_payment_gateway(gateway_id: str, request: Request):
+    """Remove a payment gateway from a project."""
+    _require_super_admin(request)
+    sb.table("project_payment_gateways").delete().eq("id", gateway_id).execute()
     return {"ok": True}
 
 
