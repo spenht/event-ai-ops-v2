@@ -109,6 +109,31 @@ async def create_project(request: Request):
     return {"ok": True, "data": (r.data or [{}])[0]}
 
 
+@router.get("/projects/{project_id}")
+async def get_project(project_id: str, request: Request):
+    _require_super_admin(request)
+    r = sb.table("projects").select("*").eq("id", project_id).execute()
+    if not r.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project = r.data[0]
+    # Fetch assigned transaction stats
+    try:
+        txn_r = sb.table("financial_transactions").select(
+            "type,amount,currency"
+        ).eq("project_id", project_id).execute()
+        txns = txn_r.data or []
+        revenue = sum(t["amount"] for t in txns if t["type"] in ("sale", "income") and t.get("currency", "USD") == "USD")
+        expenses = sum(t["amount"] for t in txns if t["type"] == "expense" and t.get("currency", "USD") == "USD")
+        project["total_revenue"] = round(revenue, 2)
+        project["total_expenses"] = round(expenses, 2)
+        project["transaction_count"] = len(txns)
+    except Exception:
+        project["total_revenue"] = 0
+        project["total_expenses"] = 0
+        project["transaction_count"] = 0
+    return {"ok": True, "data": project}
+
+
 @router.patch("/projects/{project_id}")
 async def update_project(project_id: str, request: Request):
     _require_super_admin(request)
