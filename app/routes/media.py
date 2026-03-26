@@ -13,6 +13,7 @@ router = APIRouter(prefix="/v1/media", tags=["media"])
 # Max file size: 50 MB
 MAX_FILE_SIZE = 50 * 1024 * 1024
 ALLOWED_MIME_PREFIXES = ("image/", "video/", "audio/")
+ALLOWED_BUCKETS = {"whatsapp", "assets", "media"}
 
 
 def _validate_auth(request: Request):
@@ -45,6 +46,10 @@ async def upload_media(
     """Upload a media file to Supabase Storage and return the public URL."""
     _validate_auth(request)
 
+    # Validate campaign_id against path traversal
+    if ".." in campaign_id or "/" in campaign_id or "\\" in campaign_id:
+        raise HTTPException(status_code=400, detail="Invalid campaign_id")
+
     # Validate MIME type
     content_type = file.content_type or ""
     if not any(content_type.startswith(p) for p in ALLOWED_MIME_PREFIXES):
@@ -67,14 +72,18 @@ async def upload_media(
         from supabase import create_client
         sb = create_client(settings.supabase_url, settings.supabase_service_role_key)
 
-        result = sb.storage.from_("media").upload(
+        bucket = "media"
+        if bucket not in ALLOWED_BUCKETS:
+            raise HTTPException(status_code=400, detail="Invalid storage bucket")
+
+        result = sb.storage.from_(bucket).upload(
             storage_path,
             data,
             file_options={"content-type": content_type, "cache-control": "3600"},
         )
 
         # Build public URL
-        public_url = sb.storage.from_("media").get_public_url(storage_path)
+        public_url = sb.storage.from_(bucket).get_public_url(storage_path)
 
         logger.info("media_uploaded campaign=%s path=%s size=%d", campaign_id, storage_path, len(data))
 

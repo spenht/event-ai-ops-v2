@@ -251,16 +251,16 @@ async def ai_coach(request: Request, body: AICoachRequest):
 
         payload = {
             "model": "gpt-4o-mini",
-            "input": [
+            "messages": [
                 {"role": "system", "content": AI_COACH_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            "max_output_tokens": 500,
+            "max_tokens": 500,
         }
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
-                "https://api.openai.com/v1/responses",
+                "https://api.openai.com/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
@@ -280,15 +280,9 @@ async def ai_coach(request: Request, body: AICoachRequest):
 
         # Extract text from response
         raw_text = ""
-        if isinstance(data.get("output_text"), str):
-            raw_text = data["output_text"].strip()
-        else:
-            for item in (data.get("output") or []):
-                if item.get("type") == "message":
-                    for block in (item.get("content") or []):
-                        if block.get("type") == "output_text":
-                            raw_text = block.get("text", "").strip()
-                            break
+        choices = data.get("choices") or []
+        if choices:
+            raw_text = (choices[0].get("message", {}).get("content") or "").strip()
 
         # Parse JSON response
         if raw_text.startswith("```"):
