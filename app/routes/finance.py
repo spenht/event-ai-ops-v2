@@ -491,7 +491,7 @@ async def bulk_assign_transactions(request: Request):
             if sources and source not in sources:
                 continue
 
-            params = {"limit": 100, "status": "succeeded"}
+            params = {"limit": 100}
             if date_from:
                 params["created[gte]"] = int(datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc).timestamp())
             if date_to:
@@ -506,12 +506,15 @@ async def bulk_assign_transactions(request: Request):
                     params=params, auth=(key, ""),
                 )
                 if r.status_code != 200:
-                    logger.warning("bulk_assign stripe_error source=%s status=%s", source, r.status_code)
+                    logger.warning("bulk_assign stripe_error source=%s status=%s body=%s", source, r.status_code, r.text[:200])
                     break
                 data = r.json()
                 page_items = data.get("data", [])
                 logger.info("bulk_assign page source=%s items=%d", source, len(page_items))
                 for pi in page_items:
+                    # Only succeeded payments
+                    if pi.get("status") != "succeeded":
+                        continue
                     amt = pi["amount"] / 100
                     curr = (pi.get("currency") or "usd").upper()
 
