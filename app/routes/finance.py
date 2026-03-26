@@ -1546,11 +1546,11 @@ def _run_smart_match(
 ) -> dict:
     """Core matching logic using invoice line-item product names.
 
-    Groups by (project_id, product_name) for granular buckets.
+    Groups by project_id so each project gets ONE suggestion card.
     Returns suggestions + unmatched stats.
     """
-    # bucket key = (project_id, primary_product_name)
-    buckets: dict[tuple[str, str], dict] = {}
+    # bucket key = project_id
+    buckets: dict[str, dict] = {}
     unmatched: list[dict] = []
 
     for txn in transactions:
@@ -1587,7 +1587,7 @@ def _run_smart_match(
 
         if best_proj and best_conf > 0:
             pid = best_proj["id"]
-            bucket_key = (pid, best_product)
+            bucket_key = pid
             if bucket_key not in buckets:
                 buckets[bucket_key] = {
                     "project_id": pid,
