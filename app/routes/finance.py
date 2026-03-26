@@ -1193,23 +1193,57 @@ async def upsert_commission_rule(request: Request):
 
 # Project keyword map: project display name → list of lowercase keywords to match
 _PROJECT_KEYWORDS = {
-    "Beyond Wealth CDMX": ["beyond wealth cdmx", "bw cdmx", "cdmx 2025", "cdmx 2026"],
-    "Beyond Wealth Miami": ["beyond wealth miami", "bw miami", "miami", "expert certification usa"],
-    "Beyond Wealth CR": ["beyond wealth costa rica", "bw costa rica", "bw cr", "costa rica"],
-    "Beyond Wealth Lima": ["beyond wealth lima", "bw lima", "lima"],
-    "Contexto Millonario LATAM": ["contexto millonario", "contexto", "cm latam"],
+    "Beyond Wealth CDMX": [
+        "beyond wealth cdmx", "bw cdmx", "cdmx 2025", "cdmx 2026",
+        "pase vip beyond wealth cdmx", "pase diamond beyond wealth cdmx",
+        "pase general beyond wealth cdmx", "acceso diamond cdmx",
+        "acceso vip beyond wealth cdmx", "libro beyond wealth cdmx",
+        "pase beyond wealth cdmx", "beyond wealth || cdmx",
+        "despertar millonario",
+    ],
+    "Beyond Wealth Miami": [
+        "beyond wealth miami", "bw miami", "expert certification usa",
+        "conquer wealth usa", "conquer wealth", "pase vip conquer",
+        "business leader vip", "expert certification",
+    ],
+    "Beyond Wealth CR": [
+        "beyond wealth costa rica", "bw costa rica", "bw cr",
+        "acceso vip a beyond wealth costa rica", "acceso diamond a beyond wealth costa rica",
+    ],
+    "Beyond Wealth Lima": [
+        "beyond wealth lima", "bw lima", "pase vip beyond wealth lima",
+        "acceso vip beyond wealth lima", "acceso diamond beyond wealth lima",
+    ],
+    "Contexto Millonario LATAM": [
+        "contexto millonario", "contexto", "cm latam",
+        "boleto contexto", "boleto cm",
+    ],
     "Contexto Millonario USA": ["contexto usa", "cm usa"],
-    "Cashflow Master LATAM": ["cashflow", "cfm", "cashflow master"],
+    "Cashflow Master LATAM": [
+        "cashflow", "cfm", "cashflow master",
+        "1% club", "1 % club", "inner circle",
+    ],
     "Cashflow Master USA": ["cashflow usa"],
-    "VSL 24/7": ["vsl", "24/7"],
-    "Mentorías Especiales": ["mentoría", "mentoria", "mentorías"],
-    "Viajes": ["viaje", "dubai", "trip"],
+    "VSL 24/7": ["vsl", "24/7", "viral", "5000 upsell viral"],
+    "Mentorías Especiales": [
+        "mentoría", "mentoria", "mentorías", "panda",
+        "aportación legacy", "apartado legacy", "legacy mentorship",
+        "owner", "legacy business", "one life legacy",
+    ],
+    "Viajes": ["viaje", "dubai", "trip", "apartado viaje"],
     "Podcast": ["podcast"],
     "Content Scale": ["content scale", "contenido viral"],
-    "Sprint": ["sprint", "arranque"],
-    "Consultoría": ["consultoría", "consultoria", "consulting"],
+    "Sprint": ["sprint", "arranque", "mi primer negocio digital"],
+    "Consultoría": [
+        "consultoría", "consultoria", "consulting",
+        "asesoria", "asesoría",
+    ],
     "Escuela de Amor Consciente": ["amor consciente", "coach amor"],
-    "2clicks.com": ["2clicks", "2 clicks", "auto-recharge"],
+    "2clicks.com": [
+        "2clicks", "2 clicks", "auto-recharge", "manual recharge",
+        "sub-account", "viva2clicks", "2clicks4friends",
+        "todoen2clicks", "mireto100m",
+    ],
 }
 
 
@@ -1637,11 +1671,26 @@ def _run_smart_match(
     # ── New project suggestions from unmatched transactions ──
     new_project_suggestions = _build_new_project_suggestions(unmatched, projects)
 
+    # Sample unmatched descriptions for debugging
+    unmatched_samples = []
+    seen_descs: set = set()
+    for t in sorted(unmatched, key=lambda x: -x["amount"])[:50]:
+        desc = t["description"][:100]
+        if desc not in seen_descs:
+            seen_descs.add(desc)
+            unmatched_samples.append({
+                "description": desc,
+                "amount": t["amount"],
+                "currency": t["currency"],
+                "source": t["source"],
+            })
+
     return {
         "suggestions": suggestions,
         "new_project_suggestions": new_project_suggestions,
         "unmatched_count": len(unmatched),
         "unmatched_total_usd": round(unmatched_usd, 2),
+        "unmatched_samples": unmatched_samples[:30],
         "total_unassigned": len(transactions) - len(already_assigned & {t["id"] for t in transactions}),
     }
 
