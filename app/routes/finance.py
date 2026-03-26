@@ -478,8 +478,15 @@ async def bulk_assign_transactions(request: Request):
     matched = []
 
     async with httpx.AsyncClient(timeout=30) as client:
-        stripe_keys = _get_stripe_keys()
+        stripe_keys = {
+            "uvul": _get_stripe_key("uvul"),
+            "lba": _get_stripe_key("lba"),
+            "oll": _get_stripe_key("oll"),
+            "2clicks": _get_stripe_key("2clicks"),
+        }
         for label, key in stripe_keys.items():
+            if not key:
+                continue
             source = f"stripe_{label}"
             if sources and source not in sources:
                 continue
