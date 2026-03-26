@@ -1418,6 +1418,128 @@ async def _fetch_noninvoice_payment_intents(
     return all_pis
 
 
+def _clean_suggested_name(raw: str) -> str:
+    """Clean up a product name to suggest as a project name."""
+    import re
+    name = raw.strip()
+    # Remove common prefixes/noise words
+    noise = ["APARTADO", "PASE", "PAGO", "CUOTA", "ABONO", "INSCRIPCION", "INSCRIPCIÓN", "REGISTRO"]
+    for word in noise:
+        name = re.sub(rf'\b{word}\b', '', name, flags=re.IGNORECASE)
+    # Remove leading/trailing numbers, dashes, spaces
+    name = re.sub(r'^[\d\s\-–—]+', '', name)
+    name = re.sub(r'[\d\s\-–—]+$', '', name)
+    name = name.strip(" -–—")
+    # Title case
+    if name == name.upper() and len(name) > 3:
+        name = name.title()
+    return name or raw.strip().title()
+
+
+def _similarity_score(a: str, b: str) -> int:
+    """Simple keyword-overlap similarity between two strings (0-100)."""
+    a_words = set(a.lower().split())
+    b_words = set(b.lower().split())
+    if not a_words or not b_words:
+        return 0
+    # Check substring containment first
+    a_lower, b_lower = a.lower(), b.lower()
+    if a_lower in b_lower or b_lower in a_lower:
+        return 85
+    # Word overlap
+    overlap = a_words & b_words
+    if not overlap:
+        # Check partial word matching (e.g. "dubai" in "viaje dubai")
+        for wa in a_words:
+            for wb in b_words:
+                if len(wa) > 3 and (wa in wb or wb in wa):
+                    return 60
+        return 0
+    return min(100, int(len(overlap) / max(len(a_words), len(b_words)) * 100))
+
+
+def _build_new_project_suggestions(
+    unmatched: list[dict],
+    projects: list[dict],
+) -> list[dict]:
+    """Group unmatched transactions by product name and suggest new projects.
+
+    Only groups with 2+ transactions are suggested.
+    """
+    # Group by normalized product name
+    groups: dict[str, dict] = {}
+    for txn in unmatched:
+        # Use first product name if available, else description
+        product_names = txn.get("product_names") or []
+        label = product_names[0] if product_names else (txn.get("description") or "")
+        if not label or not label.strip():
+            continue
+        norm = label.lower().strip()
+        if norm not in groups:
+            groups[norm] = {
+                "raw_name": label.strip(),
+                "product_names": set(),
+                "transaction_ids": [],
+                "total_usd": 0.0,
+                "total_mxn": 0.0,
+                "sources": set(),
+                "sample_descriptions": [],
+            }
+        g = groups[norm]
+        g["product_names"].add(label.strip())
+        g["transaction_ids"].append(txn["id"])
+        g["sources"].add(txn["source"])
+        if txn["currency"] == "MXN":
+            g["total_mxn"] += txn["amount"]
+        else:
+            g["total_usd"] += txn["amount"]
+        desc = txn.get("description") or ""
+        if desc and len(g["sample_descriptions"]) < 5 and desc not in g["sample_descriptions"]:
+            g["sample_descriptions"].append(desc)
+
+    # Build suggestions for groups with 2+ transactions
+    suggestions = []
+    for _norm, g in groups.items():
+        if len(g["transaction_ids"]) < 2:
+            continue
+
+        suggested_name = _clean_suggested_name(g["raw_name"])
+
+        # Find closest existing project
+        closest = None
+        best_sim = 0
+        for proj in projects:
+            pname = proj.get("name") or ""
+            sim = _similarity_score(suggested_name, pname)
+            if sim > best_sim:
+                best_sim = sim
+                closest = proj
+
+        closest_info = None
+        if closest and best_sim > 0:
+            closest_info = {
+                "id": closest["id"],
+                "name": closest.get("name", ""),
+                "similarity": best_sim,
+            }
+
+        suggestions.append({
+            "suggested_name": suggested_name,
+            "product_names": sorted(g["product_names"]),
+            "transaction_count": len(g["transaction_ids"]),
+            "total_usd": round(g["total_usd"], 2),
+            "total_mxn": round(g["total_mxn"], 2),
+            "sources": sorted(g["sources"]),
+            "sample_descriptions": g["sample_descriptions"],
+            "transaction_ids": g["transaction_ids"],
+            "closest_existing_project": closest_info,
+        })
+
+    # Sort by total value descending
+    suggestions.sort(key=lambda x: x["total_usd"] + x["total_mxn"], reverse=True)
+    return suggestions
+
+
 def _run_smart_match(
     projects: list[dict],
     transactions: list[dict],
@@ -1512,8 +1634,13 @@ def _run_smart_match(
         })
 
     unmatched_usd = sum(t["amount"] for t in unmatched if t["currency"] != "MXN")
+
+    # ── New project suggestions from unmatched transactions ──
+    new_project_suggestions = _build_new_project_suggestions(unmatched, projects)
+
     return {
         "suggestions": suggestions,
+        "new_project_suggestions": new_project_suggestions,
         "unmatched_count": len(unmatched),
         "unmatched_total_usd": round(unmatched_usd, 2),
         "total_unassigned": len(transactions) - len(already_assigned & {t["id"] for t in transactions}),
