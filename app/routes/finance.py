@@ -1186,3 +1186,440 @@ async def upsert_commission_rule(request: Request):
         }).execute()
 
     return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+# ─── Smart Auto-Match Engine ──────────────────────────────────────────────
+
+
+# Keyword → project name fragments for fuzzy matching
+_KEYWORD_MAP = {
+    "beyond wealth": ["beyond wealth"],
+    "bw": ["beyond wealth"],
+    "contexto": ["contexto millonario", "contexto"],
+    "cashflow": ["cashflow master", "cashflow"],
+    "cfm": ["cashflow master", "cashflow"],
+    "vsl": ["vsl 24/7", "vsl"],
+    "mentoría": ["mentoría", "mentoria", "especial"],
+    "mentoria": ["mentoría", "mentoria", "especial"],
+    "expert": ["beyond wealth", "expert"],
+    "boleto": [],  # resolved by amount
+    "vip": [],  # resolved by amount
+}
+
+# Amount → likely project keywords (when description is generic)
+_AMOUNT_PROJECT_HINTS = {
+    79: "beyond wealth",
+    97: "beyond wealth",
+    19: "contexto millonario",
+    29: "cashflow master",
+    197: "beyond wealth",
+    297: "beyond wealth",
+    497: "beyond wealth",
+    997: "beyond wealth",
+}
+
+
+def _match_product_to_project(
+    product_name: str,
+    product_amount: float | None,
+    projects: list[dict],
+) -> tuple[dict | None, int, str]:
+    """Return (project, confidence, reason) for a Stripe product."""
+    pname_lower = product_name.lower().strip()
+
+    # 1) Exact / substring match on project name
+    for proj in projects:
+        proj_name = (proj.get("name") or "").lower()
+        if not proj_name:
+            continue
+        if proj_name in pname_lower or pname_lower in proj_name:
+            return proj, 95, f"Product name '{product_name}' matches project '{proj['name']}'"
+
+    # 2) Keyword match
+    for keyword, fragments in _KEYWORD_MAP.items():
+        if keyword in pname_lower:
+            for frag in fragments:
+                for proj in projects:
+                    proj_name = (proj.get("name") or "").lower()
+                    if frag in proj_name:
+                        return proj, 85, f"Keyword '{keyword}' in product '{product_name}' matches project '{proj['name']}'"
+
+    # 3) Amount-based match
+    if product_amount is not None:
+        rounded = round(product_amount)
+        hint = _AMOUNT_PROJECT_HINTS.get(rounded)
+        if hint:
+            for proj in projects:
+                proj_name = (proj.get("name") or "").lower()
+                if hint in proj_name:
+                    return proj, 70, f"Amount ${product_amount} pattern matches project '{proj['name']}'"
+
+    return None, 0, "No match"
+
+
+async def _fetch_all_stripe_products(client: httpx.AsyncClient) -> list[dict]:
+    """Fetch active products from all 4 Stripe accounts."""
+    products = []
+    for label in STRIPE_ACCOUNTS:
+        key = _get_stripe_key(label)
+        if not key:
+            continue
+        cursor = None
+        for _ in range(10):
+            params: dict = {"active": "true", "limit": 100}
+            if cursor:
+                params["starting_after"] = cursor
+            r = await client.get(
+                "https://api.stripe.com/v1/products",
+                params=params, auth=(key, ""),
+            )
+            if r.status_code != 200:
+                logger.warning("smart_match products_error account=%s status=%s", label, r.status_code)
+                break
+            data = r.json()
+            for p in data.get("data", []):
+                products.append({
+                    "id": p["id"],
+                    "name": p.get("name", ""),
+                    "account": label,
+                    "default_price": p.get("default_price"),
+                })
+                cursor = p["id"]
+            if not data.get("has_more"):
+                break
+    return products
+
+
+async def _fetch_unassigned_payment_intents(
+    client: httpx.AsyncClient, days: int
+) -> list[dict]:
+    """Fetch recent succeeded payment_intents from all Stripe accounts."""
+    cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+    all_pis: list[dict] = []
+    for label in STRIPE_ACCOUNTS:
+        key = _get_stripe_key(label)
+        if not key:
+            continue
+        source = f"stripe_{label}"
+        cursor = None
+        for _ in range(50):  # up to 5000 per account
+            params: dict = {"limit": 100, "created[gte]": cutoff}
+            if cursor:
+                params["starting_after"] = cursor
+            r = await client.get(
+                "https://api.stripe.com/v1/payment_intents",
+                params=params, auth=(key, ""),
+            )
+            if r.status_code != 200:
+                logger.warning("smart_match pi_error account=%s status=%s", label, r.status_code)
+                break
+            data = r.json()
+            page_items = data.get("data", [])
+            for pi in page_items:
+                if pi.get("status") != "succeeded":
+                    continue
+                amt = pi["amount"] / 100
+                desc = pi.get("description") or ""
+                dt = datetime.fromtimestamp(pi["created"], tz=timezone.utc)
+                all_pis.append({
+                    "id": pi["id"],
+                    "amount": amt,
+                    "currency": (pi.get("currency") or "usd").upper(),
+                    "description": desc,
+                    "source": source,
+                    "account": label,
+                    "created": dt.isoformat(),
+                    "receipt_email": pi.get("receipt_email") or "",
+                })
+                cursor = pi["id"]
+            if not data.get("has_more"):
+                break
+    return all_pis
+
+
+def _run_smart_match(
+    products: list[dict],
+    projects: list[dict],
+    payment_intents: list[dict],
+    already_assigned: set[str],
+) -> dict:
+    """Core matching logic. Returns suggestions + unmatched stats."""
+    # Group PIs by matched project
+    buckets: dict[str, dict] = {}  # project_id -> bucket
+    unmatched: list[dict] = []
+
+    for pi in payment_intents:
+        if pi["id"] in already_assigned:
+            continue
+
+        desc = pi["description"]
+        amt = pi["amount"]
+        best_proj = None
+        best_conf = 0
+        best_reason = ""
+
+        # Try matching via description text
+        proj, conf, reason = _match_product_to_project(desc, amt, projects)
+        if conf > best_conf:
+            best_proj, best_conf, best_reason = proj, conf, reason
+
+        # Also try amount-only fallback if no description match
+        if best_conf == 0 and amt:
+            rounded = round(amt)
+            hint = _AMOUNT_PROJECT_HINTS.get(rounded)
+            if hint:
+                for p in projects:
+                    pname = (p.get("name") or "").lower()
+                    if hint in pname:
+                        best_proj = p
+                        best_conf = 70
+                        best_reason = f"Amount ${amt} matches project '{p['name']}'"
+                        break
+
+        if best_proj and best_conf > 0:
+            pid = best_proj["id"]
+            if pid not in buckets:
+                buckets[pid] = {
+                    "project_id": pid,
+                    "project_name": best_proj.get("name", ""),
+                    "confidence": best_conf,
+                    "match_reason": best_reason,
+                    "total_usd": 0.0,
+                    "total_mxn": 0.0,
+                    "transaction_ids": [],
+                    "sample_descriptions": [],
+                    "sources": set(),
+                }
+            b = buckets[pid]
+            # Keep highest confidence
+            if best_conf > b["confidence"]:
+                b["confidence"] = best_conf
+                b["match_reason"] = best_reason
+            if pi["currency"] == "MXN":
+                b["total_mxn"] += amt
+            else:
+                b["total_usd"] += amt
+            b["transaction_ids"].append(pi["id"])
+            b["sources"].add(pi["source"])
+            if len(b["sample_descriptions"]) < 5 and desc:
+                if desc not in b["sample_descriptions"]:
+                    b["sample_descriptions"].append(desc)
+        else:
+            unmatched.append(pi)
+
+    # Serialize
+    suggestions = []
+    for b in sorted(buckets.values(), key=lambda x: x["confidence"], reverse=True):
+        suggestions.append({
+            "project_id": b["project_id"],
+            "project_name": b["project_name"],
+            "confidence": b["confidence"],
+            "match_reason": b["match_reason"],
+            "transaction_count": len(b["transaction_ids"]),
+            "total_usd": round(b["total_usd"], 2),
+            "total_mxn": round(b["total_mxn"], 2),
+            "sample_descriptions": b["sample_descriptions"],
+            "transaction_ids": b["transaction_ids"],
+            "sources": sorted(b["sources"]),
+        })
+
+    unmatched_usd = sum(p["amount"] for p in unmatched if p["currency"] != "MXN")
+    return {
+        "suggestions": suggestions,
+        "unmatched_count": len(unmatched),
+        "unmatched_total_usd": round(unmatched_usd, 2),
+        "total_unassigned": len(payment_intents) - len(already_assigned),
+    }
+
+
+async def _get_already_assigned_ids() -> set[str]:
+    """Get external_ids that already have a project_id in financial_transactions."""
+    try:
+        rows = (
+            sb.table("financial_transactions")
+            .select("external_id")
+            .not_.is_("project_id", "null")
+            .execute()
+        )
+        return {r["external_id"] for r in (rows.data or [])}
+    except Exception as e:
+        logger.warning("smart_match_assigned_check_error: %s", str(e)[:100])
+        return set()
+
+
+@router.get("/smart-match")
+async def smart_match(request: Request, days: int = Query(30)):
+    """AI-powered transaction matching: fetch products + projects, fuzzy match, return suggestions."""
+    _require_super_admin(request)
+
+    # 1. Fetch projects from Supabase
+    proj_resp = sb.table("projects").select("*").execute()
+    projects = proj_resp.data or []
+
+    # 2. Get already-assigned transaction IDs
+    already_assigned = await _get_already_assigned_ids()
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        # 3. Fetch Stripe products
+        stripe_products = await _fetch_all_stripe_products(client)
+        # 4. Fetch unassigned payment_intents
+        payment_intents = await _fetch_unassigned_payment_intents(client, days)
+
+    logger.info(
+        "smart_match products=%d projects=%d pis=%d already_assigned=%d",
+        len(stripe_products), len(projects), len(payment_intents), len(already_assigned),
+    )
+
+    # 5. Run matching
+    result = _run_smart_match(stripe_products, projects, payment_intents, already_assigned)
+    result["stripe_products"] = stripe_products
+
+    return {"ok": True, "data": result}
+
+
+@router.post("/smart-match/approve")
+async def smart_match_approve(request: Request):
+    """Approve a suggestion batch: assign transaction_ids to a project."""
+    _require_super_admin(request)
+    body = await request.json()
+
+    project_id = body.get("project_id")
+    transaction_ids = body.get("transaction_ids", [])
+    if not project_id:
+        raise HTTPException(400, "project_id required")
+    if not transaction_ids:
+        raise HTTPException(400, "transaction_ids required")
+
+    # Verify project exists
+    proj = sb.table("projects").select("id,name").eq("id", project_id).limit(1).execute()
+    if not proj.data:
+        raise HTTPException(404, "Project not found")
+
+    assigned = 0
+    skipped = 0
+    for ext_id in transaction_ids:
+        try:
+            # Check if already assigned
+            existing = (
+                sb.table("financial_transactions")
+                .select("id,project_id")
+                .eq("external_id", ext_id)
+                .limit(1)
+                .execute()
+            )
+            if existing.data and existing.data[0].get("project_id"):
+                skipped += 1
+                continue
+
+            if existing.data:
+                # Update existing row
+                sb.table("financial_transactions").update({
+                    "project_id": project_id,
+                    "auto_assigned": True,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("external_id", ext_id).execute()
+            else:
+                # Create new row
+                sb.table("financial_transactions").insert({
+                    "external_id": ext_id,
+                    "source": "stripe",
+                    "type": "sale",
+                    "project_id": project_id,
+                    "auto_assigned": True,
+                    "amount": 0,
+                    "currency": "USD",
+                    "description": f"Smart-matched to {proj.data[0]['name']}",
+                }).execute()
+            assigned += 1
+        except Exception as e:
+            logger.warning("smart_match_approve_error ext_id=%s: %s", ext_id, str(e)[:100])
+
+    return {
+        "ok": True,
+        "assigned": assigned,
+        "skipped": skipped,
+        "project_id": project_id,
+    }
+
+
+@router.post("/smart-match/approve-all")
+async def smart_match_approve_all(request: Request, days: int = Query(30)):
+    """Approve ALL high-confidence suggestions at once."""
+    _require_super_admin(request)
+    body = await request.json()
+    min_confidence = body.get("min_confidence", 85)
+
+    # Run smart-match internally
+    proj_resp = sb.table("projects").select("*").execute()
+    projects = proj_resp.data or []
+    already_assigned = await _get_already_assigned_ids()
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        stripe_products = await _fetch_all_stripe_products(client)
+        payment_intents = await _fetch_unassigned_payment_intents(client, days)
+
+    result = _run_smart_match(stripe_products, projects, payment_intents, already_assigned)
+
+    total_assigned = 0
+    total_skipped = 0
+    approved_projects = []
+
+    for suggestion in result["suggestions"]:
+        if suggestion["confidence"] < min_confidence:
+            continue
+
+        project_id = suggestion["project_id"]
+        assigned = 0
+        skipped = 0
+
+        for ext_id in suggestion["transaction_ids"]:
+            try:
+                existing = (
+                    sb.table("financial_transactions")
+                    .select("id,project_id")
+                    .eq("external_id", ext_id)
+                    .limit(1)
+                    .execute()
+                )
+                if existing.data and existing.data[0].get("project_id"):
+                    skipped += 1
+                    continue
+
+                if existing.data:
+                    sb.table("financial_transactions").update({
+                        "project_id": project_id,
+                        "auto_assigned": True,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("external_id", ext_id).execute()
+                else:
+                    sb.table("financial_transactions").insert({
+                        "external_id": ext_id,
+                        "source": "stripe",
+                        "type": "sale",
+                        "project_id": project_id,
+                        "auto_assigned": True,
+                        "amount": 0,
+                        "currency": "USD",
+                        "description": f"Smart-matched to {suggestion['project_name']}",
+                    }).execute()
+                assigned += 1
+            except Exception as e:
+                logger.warning("approve_all_error ext_id=%s: %s", ext_id, str(e)[:100])
+
+        total_assigned += assigned
+        total_skipped += skipped
+        approved_projects.append({
+            "project_id": project_id,
+            "project_name": suggestion["project_name"],
+            "confidence": suggestion["confidence"],
+            "assigned": assigned,
+            "skipped": skipped,
+        })
+
+    return {
+        "ok": True,
+        "min_confidence": min_confidence,
+        "total_assigned": total_assigned,
+        "total_skipped": total_skipped,
+        "approved_projects": approved_projects,
+    }
