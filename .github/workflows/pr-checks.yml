@@ -1,0 +1,85 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  python-syntax:
+    name: Python Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile all .py files
+        run: python -m py_compile app/main.py && find app -name "*.py" -exec python -m py_compile {} +
+
+  lint-antipatterns:
+    name: Anti-pattern Scanner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No "now()" string literals in DB updates
+        run: |
+          if grep -rn '"now()"' app/ ; then
+            echo "::error::Found 'now()' string literal — use datetime.now(timezone.utc).isoformat()"
+            exit 1
+          fi
+
+      - name: No /v1/responses endpoint
+        run: |
+          if grep -rn '/v1/responses' app/ ; then
+            echo "::error::Found /v1/responses — use /v1/chat/completions"
+            exit 1
+          fi
+
+      - name: No OpenAI 'input' payload key
+        run: |
+          if grep -rn '"input":\s*\[' app/ ; then
+            echo "::error::Found 'input' key in API payload — use 'messages'"
+            exit 1
+          fi
+
+      - name: No max_output_tokens
+        run: |
+          if grep -rn 'max_output_tokens' app/ ; then
+            echo "::error::Found max_output_tokens — use max_tokens"
+            exit 1
+          fi
+
+      - name: No datetime.utcnow()
+        run: |
+          if grep -rn 'utcnow()' app/ ; then
+            echo "::error::Found utcnow() — use datetime.now(timezone.utc)"
+            exit 1
+          fi
+
+      - name: No print() statements
+        run: |
+          if grep -rn 'print(' app/ --include="*.py" | grep -v '# noqa' | grep -v 'test_'; then
+            echo "::error::Found print() — use logger instead"
+            exit 1
+          fi
+
+  security-scan:
+    name: Security Scanner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No hardcoded API keys
+        run: |
+          if grep -rEn '(sk-[a-zA-Z0-9]{20,}|AKIA[A-Z0-9]{16})' app/ ; then
+            echo "::error::Found hardcoded API key"
+            exit 1
+          fi
+
+      - name: No .env files committed
+        run: |
+          if [ -f .env ] || [ -f app/.env ]; then
+            echo "::error::Found .env file — must not be committed"
+            exit 1
+          fi
