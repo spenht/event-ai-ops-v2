@@ -607,6 +607,28 @@ async def bulk_assign_transactions(request: Request):
     }
 
 
+@router.get("/transactions")
+async def list_transactions(request: Request):
+    """List transactions, optionally filtered by assignment status."""
+    _require_super_admin(request)
+    assigned = request.query_params.get("assigned")
+    limit = int(request.query_params.get("limit", "200"))
+    project_id = request.query_params.get("project_id")
+    source = request.query_params.get("source")
+
+    q = sb.table("financial_transactions").select("*").order("txn_date", desc=True).limit(limit)
+    if assigned == "false":
+        q = q.is_("project_id", "null")
+    elif assigned == "true":
+        q = q.not_.is_("project_id", "null")
+    if project_id:
+        q = q.eq("project_id", project_id)
+    if source:
+        q = q.eq("source", source)
+    r = q.execute()
+    return {"ok": True, "data": {"transactions": r.data or [], "count": len(r.data or [])}}
+
+
 @router.post("/search-transactions")
 async def search_transactions(request: Request):
     """
