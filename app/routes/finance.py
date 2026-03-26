@@ -1293,7 +1293,6 @@ async def _fetch_stripe_invoices(
                 "created[gte]": cutoff,
                 "limit": 100,
                 "status": "paid",
-                "expand[]": "data.lines.data.price.product",
             }
             if cursor:
                 params["starting_after"] = cursor
