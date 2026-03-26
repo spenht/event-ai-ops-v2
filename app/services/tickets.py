@@ -557,3 +557,76 @@ def lookup_ticket(ticket_id: str) -> Optional[dict[str, str]]:
         }
     except Exception:
         return None
+
+
+def regenerate_ticket_png(ticket_id: str) -> Optional[str]:
+    """Regenerate a ticket PNG from DB data when the file was lost (deploy/restart).
+
+    Re-fetches lead + campaign data and calls the full generate_ticket_png with
+    a forced ticket_id override so the file lands at the same path.
+    """
+    import logging
+    _log = logging.getLogger("tickets")
+    try:
+        # Get the ticket_created touchpoint
+        r = (
+            sb.table("touchpoints")
+            .select("payload, lead_id, campaign_id")
+            .eq("event_type", "ticket_created")
+            .contains("payload", {"ticket_id": ticket_id})
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        row = (r.data or [None])[0]
+        if not row:
+            return None
+
+        payload = row.get("payload") or {}
+        lead_id = row.get("lead_id") or ""
+        campaign_id = row.get("campaign_id") or ""
+        tier = payload.get("tier", "GENERAL")
+
+        # Get lead data
+        lead = {"name": "Participante", "email": "", "lead_id": lead_id}
+        if lead_id:
+            lr = sb.table("leads").select("*").eq("lead_id", lead_id).limit(1).execute()
+            lead = (lr.data or [lead])[0] or lead
+
+        # Get campaign data
+        campaign = {}
+        if campaign_id:
+            cr = sb.table("campaigns").select("*").eq("id", campaign_id).limit(1).execute()
+            campaign = (cr.data or [{}])[0]
+
+        event_facts = {
+            "event_id": campaign.get("event_id") or campaign.get("id", ""),
+            "event_name": (campaign.get("event_name") or "Evento").strip(),
+            "event_date": (str(campaign.get("event_date") or "")).strip(),
+            "event_place": (campaign.get("event_location") or "").strip(),
+            "event_speakers": (campaign.get("event_speakers") or "").strip(),
+        }
+        ticket_config = campaign.get("ticket_config") if isinstance(campaign.get("ticket_config"), dict) else None
+
+        # Ensure tickets dir exists
+        TICKETS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Generate a fresh ticket (creates new ticket_id, but we rename the file)
+        result = generate_ticket_png(
+            lead=lead, tier=tier, event=event_facts,
+            ticket_config=ticket_config,
+        )
+        new_fp = Path(result.get("file_path") or result.get("file") or "")
+
+        # Rename to the original ticket_id path
+        target_fp = TICKETS_DIR / f"{ticket_id}.png"
+        if new_fp.exists() and new_fp != target_fp:
+            import shutil
+            shutil.copy2(str(new_fp), str(target_fp))
+            _log.info("ticket_regenerated ticket=%s path=%s", ticket_id, target_fp)
+
+        return str(target_fp) if target_fp.exists() else None
+
+    except Exception as exc:
+        _log.error("regenerate_ticket_failed ticket=%s err=%s", ticket_id, str(exc)[:200])
+        return None

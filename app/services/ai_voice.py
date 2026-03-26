@@ -270,10 +270,19 @@ def build_voice_system_prompt(
     Uses campaign.ai_voice_system_prompt if available (and purpose is custom),
     otherwise generates a purpose-specific prompt from templates.
     """
-    # Custom prompt: use campaign's own system prompt verbatim
+    # Custom prompt: use campaign's own system prompt with variable substitution
     if purpose == "custom":
         custom = (campaign.get("ai_voice_system_prompt") or "").strip()
         if custom:
+            lead_name = lead.get("name", "") or "amigo"
+            event_name = event_facts.get("event_name", "el evento")
+            event_date = event_facts.get("event_date", "")
+            event_place = event_facts.get("event_place", "")
+            # Replace template variables
+            custom = custom.replace("{name}", lead_name)
+            custom = custom.replace("{event_name}", event_name)
+            custom = custom.replace("{event_date}", event_date)
+            custom = custom.replace("{event_place}", event_place)
             return custom
 
     character_name = (campaign.get("ai_character_name") or "").strip() or "Ana"
@@ -351,7 +360,7 @@ def build_voice_system_prompt(
         "- check-in → 'chek-in'",
         "- Zoom → 'zum'",
         "- Diamond → 'daimond'",
-        "IMPORTANTE: Cada vez que vayas a decir VIP, recuerda: son tres letras separadas vi-ai-pi.",
+        "IMPORTANTE: Pronuncia VIP como una sola palabra 'vip' (rima con 'chip'). NO deletrees las letras.",
         "",
         "═══ PERSONALIZACIÓN ═══",
         f"- Usa el nombre '{lead_name}' durante la conversación (al menos 3 veces).",
@@ -427,8 +436,18 @@ def build_voice_system_prompt(
     # VIP section — multi-tier pricing from campaign config
     lines.append("")
     lines.append("═══ EXPERIENCIA VI-AI-PI ═══")
-    from ..services.stripe_checkout import get_vip_tiers  # lazy import to avoid circular
-    _vip_tiers = get_vip_tiers(campaign)
+    # Extract VIP tiers from campaign stripe_price_ids
+    _vip_tiers = []
+    _spi = campaign.get("stripe_price_ids")
+    if isinstance(_spi, dict):
+        for k, v in sorted(_spi.items()):
+            if isinstance(v, dict):
+                _vip_tiers.append({
+                    "option": k,
+                    "label": v.get("label", f"VIP opción {k}"),
+                    "display_price": v.get("display_price", ""),
+                    "price_id": v.get("price_id", ""),
+                })
     if _vip_tiers and any(t.get("display_price") for t in _vip_tiers):
         if len(_vip_tiers) == 1:
             _t = _vip_tiers[0]
@@ -613,9 +632,9 @@ class AIVoiceSession:
                 "input_audio_transcription": {"model": "whisper-1"},
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.65,
-                    "prefix_padding_ms": 400,
-                    "silence_duration_ms": 1200,
+                    "threshold": 0.75,
+                    "prefix_padding_ms": 500,
+                    "silence_duration_ms": 1800,
                 },
                 "tools": [
                     {
@@ -884,11 +903,16 @@ class AIVoiceSession:
             except Exception:
                 pass
 
-        try:
-            await self._connect_elevenlabs()
-            logger.info("elevenlabs_reconnected")
-        except Exception as exc:
-            logger.error("elevenlabs_reconnect_failed err=%s", str(exc)[:200])
+        # Retry reconnection up to 3 times with small delay
+        for attempt in range(3):
+            try:
+                await asyncio.sleep(0.3 * (attempt + 1))  # 0.3s, 0.6s, 0.9s
+                await self._connect_elevenlabs()
+                logger.info("elevenlabs_reconnected attempt=%d", attempt + 1)
+                return
+            except Exception as exc:
+                logger.warning("elevenlabs_reconnect_attempt=%d err=%s", attempt + 1, str(exc)[:200])
+        logger.error("elevenlabs_reconnect_failed after 3 attempts")
 
     async def _send_text_to_elevenlabs(self, text: str) -> None:
         """Stream a text chunk to ElevenLabs for TTS conversion."""

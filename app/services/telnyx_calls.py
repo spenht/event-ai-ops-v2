@@ -106,7 +106,16 @@ def _dial_outbound_sync(
         "from": from_number,
     }
     if amd:
-        body["answering_machine_detection"] = amd
+        body["answering_machine_detection"] = "premium"
+        body["answering_machine_detection_config"] = {
+            "total_analysis_time_millis": 3500,
+            "after_greeting_silence_millis": 600,
+            "between_words_silence_millis": 50,
+            "greeting_duration_millis": 2500,
+            "initial_silence_millis": 2500,
+            "maximum_number_of_words": 3,
+            "silence_threshold": 256,
+        }
     if webhook_url:
         body["webhook_url"] = webhook_url
     if record:

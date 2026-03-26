@@ -95,3 +95,44 @@ async def send_whatsapp(
     return await anyio.to_thread.run_sync(
         lambda: _send_whatsapp_sync(url, data, headers, to_value, len(media_list))
     )
+
+
+async def send_whatsapp_template(
+    to: str,
+    content_sid: str,
+    variables: dict,
+    *,
+    account_sid: str = "",
+    auth_token: str = "",
+    whatsapp_from: str = "",
+) -> str:
+    """Send a WhatsApp template message via Twilio Content API.
+
+    Works outside the 24-hour window (no prior user message required).
+    """
+    sid = (account_sid or "").strip() or settings.twilio_account_sid
+    token = (auth_token or "").strip() or settings.twilio_auth_token
+    from_num = (whatsapp_from or "").strip() or settings.twilio_whatsapp_from
+
+    if not sid or not token:
+        raise RuntimeError("Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN")
+
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+    to_value = f"whatsapp:{to}" if not to.startswith("whatsapp:") else to
+
+    # Build ContentVariables JSON string
+    import json
+    content_vars = json.dumps(variables)
+
+    data: list[tuple[str, str]] = [
+        ("From", from_num),
+        ("To", to_value),
+        ("ContentSid", content_sid),
+        ("ContentVariables", content_vars),
+    ]
+
+    headers = {"Authorization": _basic_auth_header(sid, token)}
+
+    return await anyio.to_thread.run_sync(
+        lambda: _send_whatsapp_sync(url, data, headers, to_value, 0)
+    )

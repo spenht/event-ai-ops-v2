@@ -129,11 +129,9 @@ async def generate_reply(
                 return None
             data = resp.json()
 
-        choices = data.get("choices") or []
-        if choices:
-            content = choices[0].get("message", {}).get("content", "")
-            if content.strip():
-                return content.strip()
+        choices = data.get("choices", [])
+        if choices and choices[0].get("message", {}).get("content"):
+            return choices[0]["message"]["content"].strip()
         return None
 
     except Exception as e:

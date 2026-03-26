@@ -1,0 +1,904 @@
+"""Financial dashboard endpoints — Super Admin only."""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import httpx
+from fastapi import APIRouter, HTTPException, Query, Request
+
+from ..deps import sb
+from ..settings import settings
+
+logger = logging.getLogger("finance")
+router = APIRouter(prefix="/v1/finance", tags=["finance"])
+
+# ─── Stripe account map ────────────────────────────────────────────────────
+
+STRIPE_ACCOUNTS = {
+    "uvul": {"name": "Una Vida Un Legado (MX)", "currency": "MXN"},
+    "lba": {"name": "Legacy Business Academy", "currency": "USD"},
+    "oll": {"name": "One Life Legacy", "currency": "USD"},
+    "2clicks": {"name": "2clicks.com", "currency": "USD"},
+}
+
+MERCURY_ACCOUNTS = {
+    "oll": {"name": "One Life Legacy"},
+    "2clicks": {"name": "2clicks.com"},
+    "lba": {"name": "Legacy Business Academy"},
+}
+
+
+def _get_stripe_key(account: str) -> str:
+    key_map = {
+        "uvul": getattr(settings, "stripe_key_uvul", ""),
+        "lba": getattr(settings, "stripe_key_lba", ""),
+        "oll": getattr(settings, "stripe_key_oll", ""),
+        "2clicks": getattr(settings, "stripe_key_2clicks", ""),
+    }
+    return key_map.get(account, "")
+
+
+def _get_mercury_key(account: str) -> str:
+    key_map = {
+        "oll": getattr(settings, "mercury_key_oll", ""),
+        "2clicks": getattr(settings, "mercury_key_2clicks", ""),
+        "lba": getattr(settings, "mercury_key_lba", ""),
+    }
+    return key_map.get(account, "")
+
+
+def _require_super_admin(request: Request):
+    """Only super admin (Spencer) can access global finance data."""
+    token = (request.headers.get("authorization") or "").replace("Bearer ", "").strip()
+    spartans_key = (request.headers.get("x-spartans-key") or "").strip()
+    cron_token = (request.headers.get("x-cron-token") or "").strip()
+
+    if settings.cron_token and cron_token == settings.cron_token:
+        return
+    if spartans_key and settings.spartans_key and spartans_key == settings.spartans_key:
+        return
+
+    # Check JWT from Supabase auth — verify user is org owner
+    if token:
+        try:
+            import jwt as pyjwt
+            decoded = pyjwt.decode(token, options={"verify_signature": False})
+            uid = decoded.get("sub", "")
+            if uid:
+                member = sb.table("org_members").select("role").eq("user_id", uid).eq("role", "owner").limit(1).execute()
+                if member.data:
+                    logger.info("finance_auth_ok user=%s role=owner", uid)
+                    return
+                logger.warning("finance_auth_denied user=%s no_owner_role", uid)
+        except Exception as e:
+            logger.warning("finance_auth_jwt_error err=%s", str(e)[:80])
+
+    # Dev mode fallback
+    if not settings.cron_token:
+        return
+
+    raise HTTPException(status_code=403, detail="Super admin access required")
+
+
+# ─── Projects CRUD ──────────────────────────────────────────────────────────
+
+
+@router.get("/projects")
+async def list_projects(request: Request):
+    _require_super_admin(request)
+    r = sb.table("projects").select("*").order("created_at", desc=True).execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/projects")
+async def create_project(request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    name = body.get("name", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    r = sb.table("projects").insert({
+        "name": name,
+        "description": body.get("description", ""),
+        "stripe_account": body.get("stripe_account", ""),
+        "mercury_account": body.get("mercury_account", ""),
+        "config": body.get("config", {}),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.patch("/projects/{project_id}")
+async def update_project(project_id: str, request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    allowed = {"name", "description", "stripe_account", "mercury_account", "status", "config"}
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if updates:
+        updates["updated_at"] = "now()"
+        r = sb.table("projects").update(updates).eq("id", project_id).execute()
+        return {"ok": True, "data": (r.data or [{}])[0]}
+    return {"ok": True}
+
+
+# ─── Project Clients CRUD ──────────────────────────────────────────────────
+
+
+@router.get("/projects/{project_id}/clients")
+async def list_project_clients(project_id: str, request: Request, status: Optional[str] = None):
+    _require_super_admin(request)
+    q = sb.table("project_clients").select("*").eq("project_id", project_id).order("created_at", desc=True)
+    if status:
+        q = q.eq("status", status)
+    r = q.execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/projects/{project_id}/clients")
+async def create_project_client(project_id: str, request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    if not body.get("name"):
+        raise HTTPException(status_code=400, detail="name is required")
+    r = sb.table("project_clients").insert({
+        "project_id": project_id,
+        "name": body["name"],
+        "email": body.get("email", ""),
+        "phone": body.get("phone", ""),
+        "status": body.get("status", "active"),
+        "total_amount": body.get("total_amount", 0),
+        "paid_amount": body.get("paid_amount", 0),
+        "currency": body.get("currency", "USD"),
+        "payment_plan": body.get("payment_plan", {}),
+        "notes": body.get("notes", ""),
+        "lead_id": body.get("lead_id", ""),
+        "stripe_customer_id": body.get("stripe_customer_id", ""),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.patch("/clients/{client_id}")
+async def update_project_client(client_id: str, request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    allowed = {"name", "email", "phone", "status", "total_amount", "paid_amount",
+               "currency", "payment_plan", "notes", "metadata"}
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        r = sb.table("project_clients").update(updates).eq("id", client_id).execute()
+        return {"ok": True, "data": (r.data or [{}])[0]}
+    return {"ok": True}
+
+
+# ─── Client Payments ──────────────────────────────────────────────────────
+
+
+@router.get("/clients/{client_id}/payments")
+async def list_client_payments(client_id: str, request: Request):
+    _require_super_admin(request)
+    r = sb.table("client_payments").select("*").eq("client_id", client_id).order("txn_date", desc=True).execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/clients/{client_id}/payments")
+async def create_client_payment(client_id: str, request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    # Get client to find project_id
+    client = sb.table("project_clients").select("project_id,paid_amount").eq("id", client_id).limit(1).execute()
+    if not client.data:
+        raise HTTPException(status_code=404, detail="Client not found")
+    project_id = client.data[0]["project_id"]
+    amount = body.get("amount", 0)
+
+    r = sb.table("client_payments").insert({
+        "client_id": client_id,
+        "project_id": project_id,
+        "amount": amount,
+        "currency": body.get("currency", "USD"),
+        "payment_method": body.get("payment_method", "stripe"),
+        "status": body.get("status", "completed"),
+        "txn_date": body.get("txn_date", datetime.now(timezone.utc).isoformat()),
+        "external_id": body.get("external_id", ""),
+        "description": body.get("description", ""),
+    }).execute()
+
+    # Update client paid_amount
+    if body.get("status", "completed") == "completed":
+        new_paid = (client.data[0].get("paid_amount") or 0) + amount
+        sb.table("project_clients").update({
+            "paid_amount": new_paid,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", client_id).execute()
+
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+# ─── Manual Transactions (Zelle, Cash, Wire) ──────────────────────────────
+
+
+@router.get("/manual-transactions")
+async def list_manual_transactions(request: Request, project_id: Optional[str] = None, days: int = Query(30)):
+    _require_super_admin(request)
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    q = sb.table("manual_transactions").select("*, projects(name)").gte("txn_date", since).order("txn_date", desc=True)
+    if project_id:
+        q = q.eq("project_id", project_id)
+    r = q.execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/manual-transactions")
+async def create_manual_transaction(request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    required = ["project_id", "type", "amount", "payment_method"]
+    for f in required:
+        if not body.get(f):
+            raise HTTPException(status_code=400, detail=f"{f} is required")
+    r = sb.table("manual_transactions").insert({
+        "project_id": body["project_id"],
+        "client_id": body.get("client_id"),
+        "type": body["type"],
+        "amount": body["amount"],
+        "currency": body.get("currency", "USD"),
+        "payment_method": body["payment_method"],
+        "counterparty": body.get("counterparty", ""),
+        "description": body.get("description", ""),
+        "txn_date": body.get("txn_date", datetime.now(timezone.utc).isoformat()),
+        "receipt_url": body.get("receipt_url", ""),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+# ─── Project Expense Sources (Mercury cards) ──────────────────────────────
+
+
+@router.get("/projects/{project_id}/expense-sources")
+async def list_expense_sources(project_id: str, request: Request):
+    _require_super_admin(request)
+    r = sb.table("project_expense_sources").select("*").eq("project_id", project_id).execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/projects/{project_id}/expense-sources")
+async def create_expense_source(project_id: str, request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    r = sb.table("project_expense_sources").insert({
+        "project_id": project_id,
+        "source_type": body.get("source_type", "mercury_card"),
+        "identifier": body.get("identifier", ""),
+        "label": body.get("label", ""),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.delete("/expense-sources/{source_id}")
+async def delete_expense_source(source_id: str, request: Request):
+    _require_super_admin(request)
+    sb.table("project_expense_sources").delete().eq("id", source_id).execute()
+    return {"ok": True}
+
+
+# ─── Assignment Rules CRUD ──────────────────────────────────────────────────
+
+
+@router.get("/assignment-rules")
+async def list_assignment_rules(request: Request, project_id: Optional[str] = None):
+    _require_super_admin(request)
+    q = sb.table("transaction_assignment_rules").select("*").order("priority", desc=True)
+    if project_id:
+        q = q.eq("project_id", project_id)
+    r = q.execute()
+    return {"ok": True, "data": r.data or []}
+
+
+@router.post("/assignment-rules")
+async def create_assignment_rule(request: Request):
+    _require_super_admin(request)
+    body = await request.json()
+    required = ["project_id", "field", "value"]
+    for f in required:
+        if not body.get(f):
+            raise HTTPException(status_code=400, detail=f"{f} is required")
+    r = sb.table("transaction_assignment_rules").insert({
+        "project_id": body["project_id"],
+        "field": body["field"],
+        "operator": body.get("operator", "equals"),
+        "value": body["value"],
+        "priority": body.get("priority", 0),
+        "enabled": body.get("enabled", True),
+    }).execute()
+    return {"ok": True, "data": (r.data or [{}])[0]}
+
+
+@router.delete("/assignment-rules/{rule_id}")
+async def delete_assignment_rule(rule_id: str, request: Request):
+    _require_super_admin(request)
+    sb.table("transaction_assignment_rules").delete().eq("id", rule_id).execute()
+    return {"ok": True}
+
+
+# ─── Project Profitability ──────────────────────────────────────────────────
+
+
+@router.get("/profitability")
+async def project_profitability(
+    request: Request,
+    days: int = Query(30),
+    project_id: Optional[str] = None,
+):
+    """Per-project profitability from stored transactions."""
+    _require_super_admin(request)
+
+    # Use the RPC function if stored transactions exist
+    if not project_id:
+        try:
+            r = sb.rpc("fn_project_profitability", {"p_days": days}).execute()
+            if r.data:  # Only return if we have stored data
+                return {"ok": True, "data": r.data}
+        except Exception:
+            pass
+    # Fallback: calculate from live Stripe API data
+
+    # Fallback: calculate from live revenue data
+    # Get revenue by source for the period
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since_ts = int(since.timestamp())
+
+    # Get projects
+    projects_q = sb.table("projects").select("*")
+    if project_id:
+        projects_q = projects_q.eq("id", project_id)
+    projects = (projects_q.execute()).data or []
+
+    # Get revenue per source from Stripe
+    revenue_by_source = {}
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        import asyncio
+
+        async def fetch_stripe_total(acct_id, info):
+            key = _get_stripe_key(acct_id)
+            if not key:
+                return acct_id, 0, 0, 0
+            usd, mxn, count = 0, 0, 0
+            try:
+                has_more, starting_after, pages = True, None, 0
+                while has_more and pages < 20:
+                    params = {"created[gte]": since_ts, "limit": 100}
+                    if starting_after:
+                        params["starting_after"] = starting_after
+                    r = await client.get("https://api.stripe.com/v1/payment_intents",
+                                         params=params, auth=(key, ""))
+                    if r.status_code != 200:
+                        break
+                    data = r.json()
+                    for pi in data.get("data", []):
+                        if pi.get("status") != "succeeded":
+                            continue
+                        amt = pi["amount"] / 100
+                        if pi["currency"].upper() == "USD":
+                            usd += amt
+                        else:
+                            mxn += amt
+                        count += 1
+                    has_more = data.get("has_more", False)
+                    items = data.get("data", [])
+                    if items:
+                        starting_after = items[-1]["id"]
+                    pages += 1
+            except Exception:
+                pass
+            return acct_id, usd, mxn, count
+
+        tasks = [fetch_stripe_total(aid, info) for aid, info in STRIPE_ACCOUNTS.items()]
+        results = await asyncio.gather(*tasks)
+        for acct_id, usd, mxn, count in results:
+            revenue_by_source[acct_id] = {"usd": usd, "mxn": mxn, "count": count}
+
+    # Map projects to their revenue
+    profitability = []
+    for proj in projects:
+        stripe_acct = proj.get("stripe_account", "")
+        rev = revenue_by_source.get(stripe_acct, {"usd": 0, "mxn": 0, "count": 0})
+        profitability.append({
+            "project_id": proj["id"],
+            "project_name": proj["name"],
+            "stripe_account": stripe_acct,
+            "mercury_account": proj.get("mercury_account", ""),
+            "revenue_usd": round(rev["usd"], 2),
+            "revenue_mxn": round(rev["mxn"], 2),
+            "transaction_count": rev["count"],
+            "status": proj.get("status", "active"),
+        })
+
+    profitability.sort(key=lambda x: x["revenue_usd"], reverse=True)
+    return {"ok": True, "data": profitability}
+
+
+# ─── Global Financial Overview ──────────────────────────────────────────────
+
+
+@router.get("/overview")
+async def financial_overview(request: Request):
+    """Global financial overview — all Stripe + Mercury + Whop balances."""
+    _require_super_admin(request)
+
+    result = {"stripe": {}, "mercury": {}, "whop": None, "totals": {}}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Stripe balances
+        for acct_id, info in STRIPE_ACCOUNTS.items():
+            key = _get_stripe_key(acct_id)
+            if not key:
+                continue
+            try:
+                r = await client.get("https://api.stripe.com/v1/balance", auth=(key, ""))
+                if r.status_code == 200:
+                    d = r.json()
+                    available = sum(b["amount"] for b in d.get("available", [])) / 100
+                    pending = sum(b["amount"] for b in d.get("pending", [])) / 100
+                    currency = d["available"][0]["currency"].upper() if d.get("available") else info["currency"]
+                    result["stripe"][acct_id] = {
+                        "name": info["name"],
+                        "available": available,
+                        "pending": pending,
+                        "currency": currency,
+                    }
+            except Exception as e:
+                logger.warning("stripe_balance_error acct=%s err=%s", acct_id, str(e)[:80])
+
+        # Mercury balances
+        for acct_id, info in MERCURY_ACCOUNTS.items():
+            key = _get_mercury_key(acct_id)
+            if not key:
+                continue
+            try:
+                r = await client.get("https://api.mercury.com/api/v1/accounts",
+                                     headers={"Authorization": f"Bearer {key}"})
+                if r.status_code == 200:
+                    accounts = r.json().get("accounts", r.json()) if isinstance(r.json(), dict) else r.json()
+                    total = sum(a.get("currentBalance", 0) for a in accounts if isinstance(a, dict))
+                    result["mercury"][acct_id] = {
+                        "name": info["name"],
+                        "balance": total,
+                        "currency": "USD",
+                        "accounts": [{"name": a.get("name", ""), "balance": a.get("currentBalance", 0)}
+                                     for a in accounts if isinstance(a, dict)],
+                    }
+            except Exception as e:
+                logger.warning("mercury_balance_error acct=%s err=%s", acct_id, str(e)[:80])
+
+        # Whop — get company info + balance + recent revenue
+        whop_key = getattr(settings, "whop_api_key", "")
+        if whop_key:
+            try:
+                headers_whop = {"Authorization": f"Bearer {whop_key}"}
+                whop_data: dict = {"name": "Whop", "connected": True, "balance": None, "revenue_30d": 0, "payments_30d": 0, "currency": "USD"}
+
+                # Company info + get company ID for balance
+                company_id = None
+                r = await client.get("https://api.whop.com/api/v5/company", headers=headers_whop)
+                if r.status_code == 200:
+                    company_data = r.json()
+                    whop_data["name"] = company_data.get("title", "Whop")
+                    company_id = company_data.get("id", "")
+
+                # Fetch balance via ledger_accounts endpoint (correct API)
+                if company_id:
+                    try:
+                        ledger_url = f"https://api.whop.com/api/v1/ledger_accounts/{company_id}"
+                        br = await client.get(ledger_url, headers=headers_whop)
+                        logger.info("whop_balance url=%s status=%s", ledger_url, br.status_code)
+                        if br.status_code == 200:
+                            bdata = br.json()
+                            for bal_entry in bdata.get("balances", []):
+                                curr = (bal_entry.get("currency", "usd") or "usd").lower()
+                                if curr == "usd":
+                                    available_bal = bal_entry.get("balance", 0) or 0
+                                    pending_bal = bal_entry.get("pending_balance", 0) or 0
+                                    reserve_bal = bal_entry.get("reserve_balance", 0) or 0
+                                    if available_bal > 1000000:
+                                        available_bal /= 100
+                                        pending_bal /= 100
+                                        reserve_bal /= 100
+                                    total_bal = available_bal + pending_bal + reserve_bal
+                                    whop_data["balance"] = {
+                                        "available": round(available_bal, 2),
+                                        "pending": round(pending_bal, 2),
+                                        "reserved": round(reserve_bal, 2),
+                                        "total": round(total_bal, 2),
+                                    }
+                                    break
+                    except Exception as e:
+                        logger.warning("whop_balance_error err=%s", str(e)[:100])
+
+                # Get recent payments to calculate revenue (last 30 days)
+                total_rev = 0
+                total_count = 0
+                thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+                for page in range(1, 15):
+                    pr = await client.get(
+                        f"https://api.whop.com/api/v5/company/payments?per=100&page={page}&status=paid",
+                        headers=headers_whop,
+                    )
+                    if pr.status_code != 200:
+                        break
+                    payments = pr.json().get("data", [])
+                    for p in payments:
+                        created = p.get("created_at") or p.get("paid_at") or 0
+                        if isinstance(created, (int, float)) and created > 0:
+                            dt = datetime.fromtimestamp(int(created), tz=timezone.utc)
+                            if dt < thirty_days_ago:
+                                continue  # skip but don't break — order not guaranteed
+                        else:
+                            continue
+                        subtotal = p.get("subtotal", 0) or 0
+                        if subtotal > 0:
+                            total_rev += subtotal  # already in dollars
+                            total_count += 1
+                    if not payments or not pr.json().get("pagination", {}).get("next_page"):
+                        break
+
+                whop_data["revenue_30d"] = round(total_rev, 2)
+                whop_data["payments_30d"] = total_count
+                result["whop"] = whop_data
+            except Exception as e:
+                logger.warning("whop_error err=%s", str(e)[:80])
+
+    # Calculate totals
+    total_usd = 0
+    total_mxn = 0
+    for acct in result["stripe"].values():
+        if acct["currency"] == "USD":
+            total_usd += acct["available"] + acct["pending"]
+        elif acct["currency"] == "MXN":
+            total_mxn += acct["available"] + acct["pending"]
+    for acct in result["mercury"].values():
+        total_usd += acct["balance"]
+    whop_balance = (result.get("whop") or {}).get("balance") or {}
+    if whop_balance.get("total"):
+        total_usd += whop_balance["total"]
+    result["totals"] = {"usd": total_usd, "mxn": total_mxn}
+
+    return {"ok": True, "data": result}
+
+
+# ─── Debug Whop ──────────────────────────────────────────────────────────
+
+
+@router.get("/debug-whop")
+async def debug_whop(request: Request):
+    """Temporary debug endpoint for Whop payments."""
+    _require_super_admin(request)
+    whop_key = getattr(settings, "whop_api_key", "")
+    result = {"key_exists": bool(whop_key), "key_len": len(whop_key)}
+    if not whop_key:
+        return {"ok": False, "data": result}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        headers_whop = {"Authorization": f"Bearer {whop_key}"}
+        pr = await client.get(
+            "https://api.whop.com/api/v5/company/payments?per=3&page=1&status=paid",
+            headers=headers_whop,
+        )
+        result["status"] = pr.status_code
+        if pr.status_code == 200:
+            data = pr.json()
+            result["pagination"] = data.get("pagination", {})
+            result["count"] = len(data.get("data", []))
+            result["sample_payments"] = []
+            for p in data.get("data", [])[:3]:
+                result["sample_payments"].append({
+                    "subtotal": p.get("subtotal"),
+                    "final_amount": p.get("final_amount"),
+                    "amount": p.get("amount"),
+                    "created_at": p.get("created_at"),
+                    "product_name": p.get("product_name"),
+                    "status": p.get("status"),
+                    "currency": p.get("currency"),
+                    "keys": list(p.keys())[:20],
+                })
+        else:
+            result["body"] = pr.text[:500]
+
+    return {"ok": True, "data": result}
+
+
+# ─── Revenue by period ──────────────────────────────────────────────────────
+
+
+@router.get("/revenue")
+async def revenue_by_period(
+    request: Request,
+    period: str = Query("day", description="day|week|month"),
+    days: int = Query(30, description="lookback days"),
+    project_id: Optional[str] = None,
+):
+    """Revenue from Stripe charges, grouped by period."""
+    _require_super_admin(request)
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since_ts = int(since.timestamp())
+
+    revenue = []
+
+    async def _fetch_stripe_account(client, acct_id, info, since_ts):
+        """Fetch all payment_intents for one Stripe account with pagination."""
+        key = _get_stripe_key(acct_id)
+        if not key:
+            return []
+        results = []
+        try:
+            has_more = True
+            starting_after = None
+            page_count = 0
+            while has_more and page_count < 20:
+                params = {"created[gte]": since_ts, "limit": 100}
+                if starting_after:
+                    params["starting_after"] = starting_after
+                r = await client.get("https://api.stripe.com/v1/payment_intents",
+                                     params=params, auth=(key, ""))
+                if r.status_code != 200:
+                    break
+                data = r.json()
+                items = data.get("data", [])
+                for pi in items:
+                    if pi.get("status") != "succeeded":
+                        continue
+                    meta = pi.get("metadata") or {}
+                    results.append({
+                        "source": f"stripe_{acct_id}",
+                        "source_name": info["name"],
+                        "amount": pi["amount"] / 100,
+                        "currency": pi["currency"].upper(),
+                        "date": datetime.fromtimestamp(pi["created"], tz=timezone.utc).isoformat(),
+                        "campaign_id": meta.get("campaign_id", ""),
+                        "lead_id": meta.get("lead_id", ""),
+                        "description": pi.get("description", ""),
+                    })
+                has_more = data.get("has_more", False)
+                if items:
+                    starting_after = items[-1]["id"]
+                page_count += 1
+        except Exception as e:
+            logger.warning("stripe_revenue_error acct=%s err=%s", acct_id, str(e)[:80])
+        return results
+
+    async def _fetch_whop_payments(client, since):
+        """Fetch Whop payments within date range."""
+        whop_key = getattr(settings, "whop_api_key", "")
+        if not whop_key:
+            return []
+        results = []
+        try:
+            headers_whop = {"Authorization": f"Bearer {whop_key}"}
+            for page in range(1, 15):
+                pr = await client.get(
+                    f"https://api.whop.com/api/v5/company/payments?per=100&page={page}&status=paid",
+                    headers=headers_whop,
+                )
+                if pr.status_code != 200:
+                    break
+                payments = pr.json().get("data", [])
+                for p in payments:
+                    created = p.get("created_at") or p.get("paid_at") or 0
+                    if not created:
+                        continue
+                    try:
+                        dt = datetime.fromtimestamp(int(created), tz=timezone.utc) if isinstance(created, (int, float)) else datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+                    if dt < since:
+                        continue
+                    subtotal = p.get("subtotal", 0) or 0
+                    if subtotal > 0:
+                        results.append({
+                            "source": "stripe_lba",
+                            "source_name": "Legacy Business Academy",
+                            "amount": subtotal,
+                            "currency": "USD",
+                            "date": dt.isoformat(),
+                            "campaign_id": "",
+                            "lead_id": "",
+                            "description": f"Whop: {p.get('product_name') or p.get('plan_id') or 'Payment'}",
+                        })
+                if not payments or not pr.json().get("pagination", {}).get("next_page"):
+                    break
+        except Exception as e:
+            logger.warning("whop_revenue_error err=%s", str(e)[:100])
+        return results
+
+    # Fetch ALL sources in PARALLEL for speed
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        import asyncio
+        tasks = []
+        for acct_id, info in STRIPE_ACCOUNTS.items():
+            tasks.append(_fetch_stripe_account(client, acct_id, info, since_ts))
+        tasks.append(_fetch_whop_payments(client, since))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, list):
+                revenue.extend(r)
+            elif isinstance(r, Exception):
+                logger.warning("revenue_task_error err=%s", str(r)[:100])
+
+        # Whop is now fetched in parallel above
+
+    # Group by period
+    grouped = {}
+    for item in revenue:
+        dt = datetime.fromisoformat(item["date"])
+        if period == "day":
+            key = dt.strftime("%Y-%m-%d")
+        elif period == "week":
+            key = f"{dt.year}-W{dt.isocalendar()[1]:02d}"
+        else:
+            key = dt.strftime("%Y-%m")
+
+        if key not in grouped:
+            grouped[key] = {"period": key, "total_usd": 0, "total_mxn": 0, "count": 0, "by_source": {}}
+        if item["currency"] == "USD":
+            grouped[key]["total_usd"] += item["amount"]
+        elif item["currency"] == "MXN":
+            grouped[key]["total_mxn"] += item["amount"]
+        grouped[key]["count"] += 1
+
+        # Key by source + currency so MXN and USD from same source stay separate
+        src = f"{item['source']}_{item['currency']}"
+        if src not in grouped[key]["by_source"]:
+            grouped[key]["by_source"][src] = {"name": item["source_name"], "amount": 0, "currency": item["currency"]}
+        grouped[key]["by_source"][src]["amount"] += item["amount"]
+
+    periods = sorted(grouped.values(), key=lambda x: x["period"], reverse=True)
+    total_usd = sum(t["amount"] for t in revenue if t["currency"] == "USD")
+    total_mxn = sum(t["amount"] for t in revenue if t["currency"] == "MXN")
+    return {"ok": True, "data": {
+        "periods": periods,
+        "transactions": revenue,
+        "summary": {"total_usd": total_usd, "total_mxn": total_mxn, "count": len(revenue)},
+    }}
+
+
+# ─── Mercury transactions ──────────────────────────────────────────────────
+
+
+@router.get("/expenses")
+async def expenses(
+    request: Request,
+    days: int = Query(30),
+    account: Optional[str] = None,
+):
+    """Mercury transactions (expenses/income) for cost tracking."""
+    _require_super_admin(request)
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    transactions = []
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for acct_id, info in MERCURY_ACCOUNTS.items():
+            if account and acct_id != account:
+                continue
+            key = _get_mercury_key(acct_id)
+            if not key:
+                continue
+            try:
+                # Get Mercury accounts first
+                r = await client.get("https://api.mercury.com/api/v1/accounts",
+                                     headers={"Authorization": f"Bearer {key}"})
+                if r.status_code != 200:
+                    continue
+                merc_accounts = r.json().get("accounts", r.json()) if isinstance(r.json(), dict) else r.json()
+
+                for ma in merc_accounts:
+                    if not isinstance(ma, dict):
+                        continue
+                    ma_id = ma.get("id", "")
+                    if not ma_id:
+                        continue
+                    # Get transactions
+                    tr = await client.get(
+                        f"https://api.mercury.com/api/v1/account/{ma_id}/transactions",
+                        params={"start": since, "limit": 500},
+                        headers={"Authorization": f"Bearer {key}"},
+                    )
+                    if tr.status_code == 200:
+                        txns = tr.json().get("transactions", tr.json()) if isinstance(tr.json(), dict) else tr.json()
+                        for t in (txns if isinstance(txns, list) else []):
+                            transactions.append({
+                                "source": f"mercury_{acct_id}",
+                                "source_name": info["name"],
+                                "account_name": ma.get("name", ""),
+                                "amount": t.get("amount", 0),
+                                "date": t.get("postedDate", t.get("createdAt", "")),
+                                "description": t.get("bankDescription", t.get("note", "")),
+                                "counterparty": t.get("counterpartyName", ""),
+                                "type": "income" if t.get("amount", 0) > 0 else "expense",
+                                "category": t.get("details", {}).get("category", ""),
+                            })
+            except Exception as e:
+                logger.warning("mercury_txn_error acct=%s err=%s", acct_id, str(e)[:80])
+
+    # Sort by date
+    transactions.sort(key=lambda x: x.get("date", ""), reverse=True)
+
+    # Summary
+    total_income = sum(t["amount"] for t in transactions if t["amount"] > 0)
+    total_expense = sum(abs(t["amount"]) for t in transactions if t["amount"] < 0)
+
+    return {
+        "ok": True,
+        "data": {
+            "transactions": transactions,
+            "summary": {
+                "total_income": total_income,
+                "total_expense": total_expense,
+                "net": total_income - total_expense,
+            },
+        },
+    }
+
+
+# ─── Commission config per profile ─────────────────────────────────────────
+
+
+@router.get("/commission-rules")
+async def get_commission_rules(request: Request, campaign_id: str = Query(...)):
+    """Get all commission rules for a campaign, grouped by profile."""
+    _require_super_admin(request)
+    configs = sb.table("commission_configs").select("*").eq("campaign_id", campaign_id).execute()
+    tiers_by_config = {}
+    for cfg in (configs.data or []):
+        t = sb.table("commission_tiers").select("*").eq("config_id", cfg["id"]).order("min_sales").execute()
+        tiers_by_config[cfg["id"]] = t.data or []
+    result = []
+    for cfg in (configs.data or []):
+        result.append({**cfg, "tiers": tiers_by_config.get(cfg["id"], [])})
+    return {"ok": True, "data": result}
+
+
+@router.post("/commission-rules")
+async def upsert_commission_rule(request: Request):
+    """Create or update a commission rule for a campaign + profile + tier."""
+    _require_super_admin(request)
+    body = await request.json()
+    campaign_id = body.get("campaign_id", "")
+    profile_type = body.get("profile_type", "confirmador")
+    tier = body.get("tier", "VIP")
+    commission_type = body.get("commission_type", "percentage")
+    commission_value = body.get("commission_value", 0)
+
+    if not campaign_id:
+        raise HTTPException(status_code=400, detail="campaign_id required")
+
+    # Check if exists
+    existing = (
+        sb.table("commission_configs")
+        .select("id")
+        .eq("campaign_id", campaign_id)
+        .eq("profile_type", profile_type)
+        .eq("tier", tier)
+        .limit(1)
+        .execute()
+    )
+
+    if existing.data:
+        r = sb.table("commission_configs").update({
+            "commission_type": commission_type,
+            "commission_value": commission_value,
+            "updated_at": "now()",
+        }).eq("id", existing.data[0]["id"]).execute()
+    else:
+        r = sb.table("commission_configs").insert({
+            "campaign_id": campaign_id,
+            "profile_type": profile_type,
+            "tier": tier,
+            "commission_type": commission_type,
+            "commission_value": commission_value,
+        }).execute()
+
+    return {"ok": True, "data": (r.data or [{}])[0]}

@@ -30,11 +30,17 @@ router = APIRouter(prefix="/v1/calls/webrtc", tags=["webrtc"])
 
 
 def _normalize_phone_for_voice(phone: str) -> str:
-    """Normalize phone number for Telnyx voice calls.
+    """Normalize phone number for Telnyx voice calls (must be +E.164).
 
-    Mexican WhatsApp numbers use +521XXXXXXXXXX but Telnyx voice
-    requires +52XXXXXXXXXX (without the extra 1 after country code).
+    - Adds + prefix if missing
+    - Mexican WhatsApp numbers: +521XXXXXXXXXX → +52XXXXXXXXXX
+    - Strips whitespace and hyphens
     """
+    phone = phone.strip().replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
+    if phone.startswith("whatsapp:"):
+        phone = phone[len("whatsapp:"):]
+    if not phone.startswith("+") and len(phone) >= 10:
+        phone = "+" + phone
     if phone.startswith("+521") and len(phone) == 14:
         return "+52" + phone[4:]
     return phone
@@ -666,7 +672,7 @@ async def webrtc_ai_call(request: Request, body: AICallRequest):
         else ""
     )
 
-    # Dial outbound via Telnyx (AMD disabled for AI calls — prevents false hangups)
+    # Dial outbound via Telnyx with AMD to detect voicemail
     try:
         dial_result = await dial_outbound(
             to_number=phone,
@@ -675,7 +681,7 @@ async def webrtc_ai_call(request: Request, body: AICallRequest):
             telnyx_api_key=telnyx_api_key,
             webhook_url=webhook_url,
             client_state=client_state,
-            amd="",
+            amd="detect",
         )
     except Exception as exc:
         logger.error(

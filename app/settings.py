@@ -32,6 +32,7 @@ class Settings:
 
     # OpenAI
     openai_api_key: str = _env("OPENAI_API_KEY", "")
+    anthropic_api_key: str = _env("ANTHROPIC_API_KEY", "")
     openai_model: str = _env("OPENAI_MODEL", "gpt-4o-mini")
     whatsapp_system_prompt_path: str = _env(
         "WHATSAPP_SYSTEM_PROMPT_PATH", "app/prompts/whatsapp_system_prompt.txt"
@@ -97,6 +98,20 @@ class Settings:
 
     # Supabase service role (direct DB access)
     supabase_service_role_key: str = _env("SUPABASE_SERVICE_ROLE_KEY", "")
+
+    # Multi-Stripe accounts
+    stripe_key_uvul: str = _env("STRIPE_KEY_UVUL", "")
+    stripe_key_lba: str = _env("STRIPE_KEY_LBA", "")
+    stripe_key_oll: str = _env("STRIPE_KEY_OLL", "")
+    stripe_key_2clicks: str = _env("STRIPE_KEY_2CLICKS", "")
+
+    # Mercury accounts
+    mercury_key_oll: str = _env("MERCURY_KEY_OLL", "")
+    mercury_key_2clicks: str = _env("MERCURY_KEY_2CLICKS", "")
+    mercury_key_lba: str = _env("MERCURY_KEY_LBA", "")
+
+    # Whop
+    whop_api_key: str = _env("WHOP_API_KEY", "")
 
 
 settings = Settings()

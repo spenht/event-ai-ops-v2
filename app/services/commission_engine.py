@@ -12,7 +12,7 @@ logger = logging.getLogger("commission_engine")
 # ─── Attribute a sale to a spartan ──────────────────────────────────────────
 
 
-async def attribute_sale(lead_id: str, campaign_id: str) -> dict | None:
+async def attribute_sale(lead_id: str, campaign_id: str, profile_type: str = "confirmador") -> dict | None:
     """Find which spartan last called this lead and create a commission record.
     Returns the commission dict or None if no spartan attribution found."""
     try:
@@ -46,13 +46,37 @@ async def attribute_sale(lead_id: str, campaign_id: str) -> dict | None:
         agent_id = call.data[0]["caller_id"]
         call_record_id = call.data[0]["id"]
 
-        # 3. Get commission config for this campaign
+        # 2b. Auto-detect agent's profile_type from agent_profiles table
+        if profile_type == "confirmador":
+            agent_profile = (
+                sb.table("agent_profiles")
+                .select("profile_type")
+                .eq("campaign_id", campaign_id)
+                .eq("user_id", agent_id)
+                .eq("is_active", True)
+                .limit(1)
+                .execute()
+            )
+            if agent_profile.data:
+                profile_type = agent_profile.data[0]["profile_type"]
+                logger.info("auto_detected_profile agent=%s profile=%s", agent_id, profile_type)
+
+        # 3. Get commission config for this campaign (prefer profile-specific)
         config = (
             sb.table("commission_configs")
             .select("*")
             .eq("campaign_id", campaign_id)
+            .eq("profile_type", profile_type)
             .execute()
         )
+        # Fallback: if no profile-specific config, try without profile filter
+        if not config.data:
+            config = (
+                sb.table("commission_configs")
+                .select("*")
+                .eq("campaign_id", campaign_id)
+                .execute()
+            )
 
         # 4. Determine tier from lead
         lead = (
@@ -116,6 +140,7 @@ async def attribute_sale(lead_id: str, campaign_id: str) -> dict | None:
             "commission_pct": commission_pct,
             "commission_amount": commission_amount,
             "status": "pending",
+            "profile_type": profile_type,
         }
         r = sb.table("commissions").insert(record).execute()
         logger.info(

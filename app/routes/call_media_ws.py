@@ -602,8 +602,8 @@ async def media_stream(websocket: WebSocket, call_control_id: str):
                     tier=tier.upper(),
                     event=ticket_event_facts,
                     ticket_config=ticket_config,
-                    campaign_id=campaign_id,
                 )
+                logger.info("send_ticket_generated ok ticket_id=%s", ticket.get("ticket_id", ""))
             except Exception as exc:
                 logger.error("send_ticket_gen_failed err=%s", str(exc)[:200])
                 return {"status": "error", "message": f"Error al generar boleto: {str(exc)[:80]}"}
@@ -623,13 +623,37 @@ async def media_stream(websocket: WebSocket, call_control_id: str):
                 f"Guardalo y presentalo en la entrada."
             )
 
+            _wa_creds = {
+                "account_sid": campaign.get("twilio_account_sid", ""),
+                "auth_token": campaign.get("twilio_auth_token", ""),
+                "whatsapp_from": campaign.get("twilio_whatsapp_from", ""),
+            }
+            sent = False
+
+            # 1. Try WhatsApp template (APPROVED — works outside 24h window, cheap)
             try:
-                await send_whatsapp(
-                    wa_number, msg, media_urls=[media_url],
-                    account_sid=campaign.get("twilio_account_sid", ""),
-                    auth_token=campaign.get("twilio_auth_token", ""),
-                    whatsapp_from=campaign.get("twilio_whatsapp_from", ""),
+                from ..services.twilio_whatsapp import send_whatsapp_template
+                event_name = (campaign.get("event_name") or "Evento").strip()
+                event_date = (str(campaign.get("event_date") or "")).strip()[:10]
+                await send_whatsapp_template(
+                    to=wa_number,
+                    content_sid="HX5b3eab4955f93d3d4699478a07c51351",
+                    variables={"1": lead.get("name", ""), "2": event_name, "3": event_date, "4": media_url},
+                    **_wa_creds,
                 )
+                sent = True
+                logger.info("send_ticket_wa_template_ok lead=%s tier=%s", lead_id, tier)
+            except Exception as exc_wa:
+                logger.warning("send_ticket_wa_template_failed err=%s — trying direct WA", str(exc_wa)[:200])
+                # 2. Fallback: direct WhatsApp (works if within 24h window)
+                try:
+                    await send_whatsapp(wa_number, msg, media_urls=[media_url], **_wa_creds)
+                    sent = True
+                    logger.info("send_ticket_wa_direct_ok lead=%s tier=%s", lead_id, tier)
+                except Exception:
+                    logger.warning("send_ticket_wa_direct_also_failed lead=%s", lead_id)
+
+            if sent:
                 try:
                     sb.table("touchpoints").insert({
                         "lead_id": lead_id,
@@ -640,10 +664,21 @@ async def media_stream(websocket: WebSocket, call_control_id: str):
                     }).execute()
                 except Exception:
                     pass
-                return {"status": "sent", "message": f"Boleto {tier.upper()} enviado por WhatsApp"}
-            except Exception as exc:
-                logger.error("send_ticket_wa_failed err=%s", str(exc)[:200])
-                return {"status": "error", "message": "Error al enviar boleto por WhatsApp"}
+                # Enqueue lead to spartan queue for VIP upsell follow-up
+                try:
+                    from ..services.call_queue import enqueue_call
+                    enqueue_call(
+                        campaign_id=campaign_id,
+                        lead_id=lead_id,
+                        call_type="spartan",
+                        priority=5,
+                    )
+                    logger.info("send_ticket_enqueued_for_upsell lead=%s campaign=%s", lead_id, campaign_id)
+                except Exception as eq_exc:
+                    logger.warning("send_ticket_enqueue_failed lead=%s err=%s", lead_id, str(eq_exc)[:100])
+                return {"status": "sent", "message": f"Boleto {tier.upper()} enviado exitosamente"}
+            else:
+                return {"status": "error", "message": "No se pudo enviar el boleto. Revisa tu WhatsApp o contáctanos."}
 
         session.on_send_ticket = _on_send_ticket
 

@@ -306,6 +306,16 @@ async def _handle_call_answered(
         # Start recording
         asyncio.create_task(start_recording(call_control_id, telnyx_api_key=api_key))
 
+    # For spartan calls: start recording only (no streaming)
+    elif caller_type == "spartan":
+        try:
+            campaign = _resolve_campaign_by_id(campaign_id) if campaign_id else None
+            telnyx_creds = _campaign_telnyx(campaign)
+            api_key = telnyx_creds.get("telnyx_api_key", "")
+            asyncio.create_task(start_recording(call_control_id, telnyx_api_key=api_key))
+        except Exception as exc:
+            logger.warning("spartan_recording_start_failed call=%s err=%s", call_control_id, str(exc)[:200])
+
     # Log touchpoint
     if lead_id:
         _log_touchpoint(

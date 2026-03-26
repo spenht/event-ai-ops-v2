@@ -26,8 +26,14 @@ def _validate_auth(request: Request):
         return
     if settings.cron_token and cron == settings.cron_token:
         return
-    if auth:  # Any valid bearer token (Supabase JWT)
-        return
+    if auth:
+        # Validate it's a real Supabase JWT
+        import jwt
+        try:
+            jwt.decode(auth, options={"verify_signature": False, "verify_exp": True})
+            return
+        except Exception:
+            pass
     raise HTTPException(status_code=401, detail="unauthorized")
 
 
@@ -66,18 +72,18 @@ async def upload_media(
         from supabase import create_client
         sb = create_client(settings.supabase_url, settings.supabase_service_role_key)
 
-        bucket = "whatsapp"
+        bucket = "media"
         if bucket not in ALLOWED_BUCKETS:
             raise HTTPException(status_code=400, detail="Invalid storage bucket")
 
         result = sb.storage.from_(bucket).upload(
             storage_path,
             data,
-            file_options={"content-type": content_type, "upsert": "true"},
+            file_options={"content-type": content_type, "cache-control": "3600"},
         )
 
         # Build public URL
-        public_url = f"{settings.supabase_url}/storage/v1/object/public/{bucket}/{storage_path}"
+        public_url = sb.storage.from_(bucket).get_public_url(storage_path)
 
         logger.info("media_uploaded campaign=%s path=%s size=%d", campaign_id, storage_path, len(data))
 

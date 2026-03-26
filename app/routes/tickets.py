@@ -29,6 +29,15 @@ def get_ticket_png(ticket_id: str, t: str = Query(default="", description="acces
 
     fp = Path(rec.get("file") or "")
     if not fp.exists() or not fp.is_file():
+        # File was lost (deploy/restart) — regenerate from DB data
+        try:
+            from ..services.tickets import regenerate_ticket_png
+            new_fp = regenerate_ticket_png(ticket_id)
+            if new_fp:
+                fp = Path(new_fp)
+        except Exception:
+            pass
+    if not fp.exists() or not fp.is_file():
         raise HTTPException(status_code=404, detail="file missing")
 
     # Twilio reads content-type to classify media.

@@ -53,6 +53,7 @@ def enqueue_call(
     priority: int = 0,
     scheduled_for: Optional[str] = None,
     preferred_agent: Optional[str] = None,
+    target_profile: str = "confirmador",
 ) -> Optional[dict[str, Any]]:
     """Insert a new entry into call_queue. Returns the created row or None."""
     cfg = _get_campaign_retry_config(campaign_id)
@@ -69,6 +70,7 @@ def enqueue_call(
         "max_attempts": max_attempts,
         "cycle_count": 0,
         "max_cycles": max_cycles,
+        "target_profile": target_profile,
     }
     if scheduled_for:
         row["scheduled_for"] = scheduled_for
@@ -302,7 +304,7 @@ def _pick_best(candidates: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
 
 
 def get_next_call(
-    campaign_id: str, *, agent_id: Optional[str] = None,
+    campaign_id: str, *, agent_id: Optional[str] = None, profile_type: str = "",
 ) -> Optional[dict[str, Any]]:
     """
     Get the highest-priority pending call that is ready to be dialed.
@@ -315,27 +317,41 @@ def get_next_call(
     """
     now = datetime.now(timezone.utc).isoformat()
 
+    # Build base profile filter if provided
+    profile_filter: dict[str, Any] | None = (
+        {"target_profile": profile_type} if profile_type else None
+    )
+
     try:
         if agent_id:
             # 1. Calls preferred for this agent
+            ef: dict[str, Any] = {"preferred_agent": agent_id}
+            if profile_filter:
+                ef.update(profile_filter)
             preferred = _fetch_pending_candidates(
-                campaign_id, now, extra_filters={"preferred_agent": agent_id}
+                campaign_id, now, extra_filters=ef
             )
+            logger.info("get_next preferred=%d campaign=%s agent=%s", len(preferred), campaign_id, agent_id)
             best = _pick_best(preferred)
             if best:
                 return best
 
             # 2. Unassigned calls (preferred_agent IS NULL)
+            ef2: dict[str, Any] = {"preferred_agent": None}
+            if profile_filter:
+                ef2.update(profile_filter)
             unassigned = _fetch_pending_candidates(
-                campaign_id, now, extra_filters={"preferred_agent": None}
+                campaign_id, now, extra_filters=ef2
             )
+            logger.info("get_next unassigned=%d campaign=%s", len(unassigned), campaign_id)
             best = _pick_best(unassigned)
             if best:
                 return best
 
             # 3. Fall back to any pending call (original behavior)
 
-        candidates = _fetch_pending_candidates(campaign_id, now)
+        candidates = _fetch_pending_candidates(campaign_id, now, extra_filters=profile_filter)
+        logger.info("get_next fallback=%d campaign=%s", len(candidates), campaign_id)
         return _pick_best(candidates)
 
     except Exception as exc:
@@ -392,6 +408,8 @@ def create_call_record(
     from_number: str = "",
     to_number: str = "",
     status: str = "initiated",
+    notes: str = "",
+    purpose: str = "",
 ) -> Optional[dict[str, Any]]:
     """Create a new call record entry."""
     row: dict[str, Any] = {
@@ -406,6 +424,10 @@ def create_call_record(
         row["queue_id"] = queue_id
     if caller_id:
         row["caller_id"] = caller_id
+    if notes:
+        row["notes"] = notes
+    if purpose:
+        row["notes"] = f"purpose:{purpose}" + (f"|{notes}" if notes else "")
 
     try:
         r = sb.table("call_records").insert(row).execute()
@@ -452,7 +474,7 @@ def update_call_record(
 # ─── Spartan Sessions ───────────────────────────────────────────────────────
 
 def start_session(
-    campaign_id: str, user_id: str
+    campaign_id: str, user_id: str, profile_type: str = "confirmador",
 ) -> Optional[dict[str, Any]]:
     """Start a new spartan calling session."""
     now = datetime.now(timezone.utc).isoformat()
@@ -464,6 +486,7 @@ def start_session(
         "talk_time_today_seconds": 0,
         "started_at": now,
         "last_heartbeat_at": now,
+        "profile_type": profile_type,
     }
     try:
         r = sb.table("spartan_sessions").insert(row).execute()
