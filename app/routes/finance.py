@@ -506,14 +506,17 @@ async def bulk_assign_transactions(request: Request):
                     params=params, auth=(key, ""),
                 )
                 if r.status_code != 200:
+                    logger.warning("bulk_assign stripe_error source=%s status=%s", source, r.status_code)
                     break
                 data = r.json()
-                for pi in data.get("data", []):
+                page_items = data.get("data", [])
+                logger.info("bulk_assign page source=%s items=%d", source, len(page_items))
+                for pi in page_items:
                     amt = pi["amount"] / 100
                     curr = (pi.get("currency") or "usd").upper()
 
-                    # Filter by amounts
-                    if amounts and amt not in amounts:
+                    # Filter by amounts (use rounding for float comparison)
+                    if amounts and round(amt, 2) not in [round(float(a), 2) for a in amounts]:
                         continue
                     # Filter by currency
                     if currencies and curr not in currencies:
@@ -544,6 +547,9 @@ async def bulk_assign_transactions(request: Request):
 
                 if not data.get("has_more"):
                     break
+
+    logger.info("bulk_assign_result matched=%d total=%.2f dry_run=%s",
+                len(matched), sum(t["amount"] for t in matched), dry_run)
 
     if dry_run:
         return {
