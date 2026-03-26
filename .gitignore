@@ -19,6 +19,9 @@ __pycache__/
 .claude/*
 !.claude/rules/
 !.claude/commands/
+!.claude/memory/
+!.claude/agents/
+!.claude/settings.json
 
 # Fly.io
 .fly/
