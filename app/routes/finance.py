@@ -647,8 +647,14 @@ async def list_transactions(request: Request):
     limit = int(request.query_params.get("limit", "200"))
     project_id = request.query_params.get("project_id")
     source = request.query_params.get("source")
+    days = request.query_params.get("days")
+    min_amount = request.query_params.get("min_amount")
+    max_amount = request.query_params.get("max_amount")
+    currency = request.query_params.get("currency")
+    search = request.query_params.get("search")
+    offset = int(request.query_params.get("offset", "0"))
 
-    q = sb.table("financial_transactions").select("*").order("txn_date", desc=True).limit(limit)
+    q = sb.table("financial_transactions").select("*", count="exact").order("txn_date", desc=True)
     if assigned == "false":
         q = q.is_("project_id", "null")
     elif assigned == "true":
@@ -657,8 +663,20 @@ async def list_transactions(request: Request):
         q = q.eq("project_id", project_id)
     if source:
         q = q.eq("source", source)
+    if days:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days))).isoformat()
+        q = q.gte("txn_date", cutoff)
+    if min_amount:
+        q = q.gte("amount", float(min_amount))
+    if max_amount:
+        q = q.lte("amount", float(max_amount))
+    if currency:
+        q = q.eq("currency", currency.upper())
+    if search:
+        q = q.or_(f"description.ilike.%{search}%,counterparty.ilike.%{search}%")
+    q = q.range(offset, offset + limit - 1)
     r = q.execute()
-    return {"ok": True, "data": {"transactions": r.data or [], "count": len(r.data or [])}}
+    return {"ok": True, "data": {"transactions": r.data or [], "count": r.count or 0, "offset": offset, "limit": limit}}
 
 
 @router.post("/search-transactions")
