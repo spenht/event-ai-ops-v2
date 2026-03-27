@@ -118,10 +118,19 @@ def _upsert_transactions(txns: list[dict]) -> int:
     """Upsert a batch of transactions. Returns count upserted."""
     if not txns:
         return 0
+    # Deduplicate within the batch — Stripe can return multiple charges
+    # for the same payment_intent. Keep the latest one.
+    seen: dict[str, dict] = {}
+    for t in txns:
+        key = f"{t['external_id']}|{t['source']}"
+        seen[key] = t  # Last one wins
+    deduped = list(seen.values())
+    logger.info("upsert_dedup original=%d deduped=%d", len(txns), len(deduped))
+
     count = 0
-    # Upsert in batches of 500
-    for i in range(0, len(txns), 500):
-        batch = txns[i:i + 500]
+    # Upsert in batches of 200 (smaller to avoid payload limits)
+    for i in range(0, len(deduped), 200):
+        batch = deduped[i:i + 200]
         try:
             sb.table("financial_transactions").upsert(
                 batch, on_conflict="external_id,source"
@@ -129,6 +138,15 @@ def _upsert_transactions(txns: list[dict]) -> int:
             count += len(batch)
         except Exception as e:
             logger.warning("upsert_error batch=%d err=%s", i, str(e)[:120])
+            # Try one-by-one as fallback
+            for row in batch:
+                try:
+                    sb.table("financial_transactions").upsert(
+                        [row], on_conflict="external_id,source"
+                    ).execute()
+                    count += 1
+                except Exception:
+                    pass  # Skip truly broken rows
     return count
 
 
