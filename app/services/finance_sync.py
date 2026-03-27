@@ -402,16 +402,22 @@ async def sync_whop(days: int = 365, full: bool = False) -> dict:
             body = pr.json()
             payments = body.get("data", [])
             for p in payments:
-                amt = p.get("final_amount", p.get("subtotal", 0)) or 0
-                if amt > 10000:
-                    amt = amt / 100
-                created = p.get("created_at", p.get("updated_at", ""))
+                # Whop: final_amount is often 0, subtotal has the real amount
+                amt = p.get("subtotal", 0) or 0
+                if amt == 0:
+                    amt = p.get("final_amount", 0) or 0
+                if amt == 0:
+                    amt = p.get("calculated_amount", 0) or 0
+                created = p.get("created_at") or p.get("paid_at") or p.get("updated_at")
                 if created:
                     try:
-                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        if isinstance(created, (int, float)):
+                            dt = datetime.fromtimestamp(created, tz=timezone.utc)
+                        else:
+                            dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
                         if dt > latest_dt:
                             latest_dt = dt
-                    except (ValueError, AttributeError):
+                    except (ValueError, AttributeError, OSError):
                         dt = datetime.now(timezone.utc)
                 else:
                     dt = datetime.now(timezone.utc)
