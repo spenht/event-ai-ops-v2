@@ -1289,7 +1289,8 @@ _PROJECT_KEYWORDS = {
     "2clicks.com": [
         "2clicks", "2 clicks", "auto-recharge", "manual recharge",
         "sub-account", "viva2clicks", "2clicks4friends",
-        "todoen2clicks", "mireto100m",
+        "todoen2clicks", "mireto100m", "subscription update",
+        "subscription creation",
     ],
 }
 
@@ -1356,146 +1357,128 @@ def _match_text_to_project(
     return None, 0, "No match"
 
 
-async def _fetch_stripe_invoices(
-    client: httpx.AsyncClient, days: int
+# ─── Smart-match hint tables ─────────────────────────────────────────────
+
+# Currency → likely project (non-ambiguous currencies)
+_CURRENCY_HINTS: dict[str, str] = {
+    "PEN": "Beyond Wealth Lima",
+    "CRC": "Beyond Wealth CR",
+    "COP": "",  # Colombia — no project yet
+}
+
+# Source account → default project (when no other signal)
+_SOURCE_PROJECT_DEFAULT: dict[str, str] = {
+    "stripe_2clicks": "2clicks.com",
+    "mercury_2clicks": "2clicks.com",
+}
+
+# Source account → likely project candidates (when description is empty)
+# This is for accounts that primarily serve one set of projects
+_SOURCE_PROJECT_CANDIDATES: dict[str, list[str]] = {
+    "stripe_uvul": ["Beyond Wealth CDMX", "Escuela de Amor Consciente"],
+    "stripe_oll": ["Mentorías Especiales"],
+}
+
+# Known price points (amount in local-currency units) → project name fragments
+_AMOUNT_HINTS: dict[float, list[str]] = {
+    19: ["Contexto Millonario"],
+    29: ["Contexto Millonario", "Cashflow Master"],
+    49: ["Cashflow Master", "Sprint"],
+    79: ["Beyond Wealth"],
+    97: ["Beyond Wealth"],
+    197: ["Beyond Wealth", "2clicks"],
+    297: ["2clicks"],
+    397: ["Mentorías"],
+    497: ["Mentorías", "2clicks"],
+    597: ["Mentorías"],
+    997: ["Mentorías"],
+    1997: ["Mentorías"],
+    2999: ["Mentorías"],
+    3497: ["Beyond Wealth"],
+    6600: ["Beyond Wealth"],
+    6995: ["Beyond Wealth"],
+}
+
+# MXN amounts that are known Beyond Wealth CDMX prices (in MXN pesos)
+_MXN_AMOUNT_HINTS: dict[float, str] = {
+    3497: "Beyond Wealth CDMX",
+    6995: "Beyond Wealth CDMX",
+    14158: "Beyond Wealth CDMX",
+    17217: "Beyond Wealth CDMX",
+    1997: "Beyond Wealth CDMX",
+    4997: "Beyond Wealth CDMX",
+}
+
+
+async def _fetch_stripe_charges_for_account(
+    client: httpx.AsyncClient, label: str, cutoff: int
 ) -> list[dict]:
-    """Fetch paid invoices with expanded line items from all Stripe accounts."""
-    cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
-    all_items: list[dict] = []
+    """Fetch succeeded charges for ONE Stripe account. Returns normalized dicts."""
+    key = _get_stripe_key(label)
+    if not key:
+        return []
+    source = f"stripe_{label}"
+    items: list[dict] = []
+    cursor = None
+    for _ in range(10):  # max 10 pages = 1000 charges per account
+        params: dict = {
+            "created[gte]": cutoff,
+            "limit": 100,
+        }
+        if cursor:
+            params["starting_after"] = cursor
+        r = await client.get(
+            "https://api.stripe.com/v1/charges",
+            params=params, auth=(key, ""),
+        )
+        if r.status_code != 200:
+            logger.warning("smart_match charges_error account=%s status=%s", label, r.status_code)
+            break
+        data = r.json()
+        page_items = data.get("data", [])
+        for ch in page_items:
+            if ch.get("status") != "succeeded":
+                continue
+            amt = ch["amount"] / 100
+            if amt <= 0:
+                continue  # skip $0 charges
+            currency = (ch.get("currency") or "usd").upper()
+            desc = ch.get("description") or ""
+            stmt = ch.get("statement_descriptor") or ""
+            meta = ch.get("metadata") or {}
+            pi_id = ch.get("payment_intent") or ch["id"]
+            dt = datetime.fromtimestamp(ch["created"], tz=timezone.utc)
 
-    for label in STRIPE_ACCOUNTS:
-        key = _get_stripe_key(label)
-        if not key:
-            continue
-        source = f"stripe_{label}"
-        cursor = None
-        for _ in range(50):
-            params: dict = {
-                "created[gte]": cutoff,
-                "limit": 100,
-                "status": "paid",
-            }
-            if cursor:
-                params["starting_after"] = cursor
-            r = await client.get(
-                "https://api.stripe.com/v1/invoices",
-                params=params, auth=(key, ""),
-            )
-            if r.status_code != 200:
-                logger.warning("smart_match invoice_error account=%s status=%s", label, r.status_code)
-                break
-            data = r.json()
-            page_items = data.get("data", [])
-            for inv in page_items:
-                inv_id = inv["id"]
-                inv_total = (inv.get("amount_paid") or inv.get("total") or 0) / 100
-                inv_currency = (inv.get("currency") or "usd").upper()
-                dt = datetime.fromtimestamp(inv["created"], tz=timezone.utc)
-                email = inv.get("customer_email") or ""
+            # Build product_names from description, metadata, statement_descriptor
+            product_names: list[str] = []
+            if desc:
+                product_names.append(desc)
+            if stmt and stmt != desc:
+                product_names.append(stmt)
+            # Some checkouts put product name in metadata
+            for mkey in ("product", "product_name", "plan", "campaign"):
+                mval = meta.get(mkey, "")
+                if mval and mval not in product_names:
+                    product_names.append(mval)
 
-                # Extract product names from line items
-                lines = (inv.get("lines") or {}).get("data", [])
-                product_names = []
-                for line in lines:
-                    # Try expanded product object first
-                    price_obj = line.get("price") or {}
-                    product_obj = price_obj.get("product")
-                    if isinstance(product_obj, dict):
-                        pname = product_obj.get("name") or ""
-                    elif isinstance(product_obj, str):
-                        pname = ""  # product not expanded, just an ID
-                    else:
-                        pname = ""
-                    # Fallback to line description
-                    if not pname:
-                        pname = line.get("description") or ""
-                    if pname and pname not in product_names:
-                        product_names.append(pname)
-
-                # Use the combined product name or invoice description
-                description = " | ".join(product_names) if product_names else (inv.get("description") or f"Invoice {inv_id}")
-
-                all_items.append({
-                    "id": inv_id,
-                    "amount": inv_total,
-                    "currency": inv_currency,
-                    "description": description,
-                    "product_names": product_names,
-                    "source": source,
-                    "account": label,
-                    "created": dt.isoformat(),
-                    "receipt_email": email,
-                    "type": "invoice",
-                })
-                cursor = inv_id
-            if not data.get("has_more"):
-                break
-    return all_items
-
-
-async def _fetch_noninvoice_payment_intents(
-    client: httpx.AsyncClient, days: int, invoice_pi_ids: set[str]
-) -> list[dict]:
-    """Fetch one-time payment_intents that don't have invoices."""
-    cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
-    all_pis: list[dict] = []
-
-    for label in STRIPE_ACCOUNTS:
-        key = _get_stripe_key(label)
-        if not key:
-            continue
-        source = f"stripe_{label}"
-        cursor = None
-        for _ in range(50):
-            params: dict = {
-                "limit": 100,
-                "created[gte]": cutoff,
-                "expand[]": "data.latest_charge",
-            }
-            if cursor:
-                params["starting_after"] = cursor
-            r = await client.get(
-                "https://api.stripe.com/v1/payment_intents",
-                params=params, auth=(key, ""),
-            )
-            if r.status_code != 200:
-                logger.warning("smart_match pi_error account=%s status=%s", label, r.status_code)
-                break
-            data = r.json()
-            page_items = data.get("data", [])
-            for pi in page_items:
-                if pi.get("status") != "succeeded":
-                    continue
-                # Skip if this PI was already captured via an invoice
-                if pi.get("invoice"):
-                    continue
-                amt = pi["amount"] / 100
-                # Get description from charge if available
-                charge = pi.get("latest_charge")
-                if isinstance(charge, dict):
-                    desc = charge.get("description") or pi.get("description") or ""
-                    stmt = charge.get("statement_descriptor") or ""
-                    if not desc and stmt:
-                        desc = stmt
-                else:
-                    desc = pi.get("description") or ""
-                dt = datetime.fromtimestamp(pi["created"], tz=timezone.utc)
-                all_pis.append({
-                    "id": pi["id"],
-                    "amount": amt,
-                    "currency": (pi.get("currency") or "usd").upper(),
-                    "description": desc,
-                    "product_names": [desc] if desc else [],
-                    "source": source,
-                    "account": label,
-                    "created": dt.isoformat(),
-                    "receipt_email": pi.get("receipt_email") or "",
-                    "type": "payment_intent",
-                })
-                cursor = pi["id"]
-            if not data.get("has_more"):
-                break
-    return all_pis
+            items.append({
+                "id": pi_id,
+                "charge_id": ch["id"],
+                "amount": amt,
+                "currency": currency,
+                "description": desc or stmt or "",
+                "product_names": product_names,
+                "source": source,
+                "account": label,
+                "created": dt.isoformat(),
+                "receipt_email": ch.get("receipt_email") or "",
+                "metadata": meta,
+                "type": "charge",
+            })
+            cursor = ch["id"]
+        if not data.get("has_more"):
+            break
+    return items
 
 
 def _clean_suggested_name(raw: str) -> str:
@@ -1651,12 +1634,93 @@ def _build_new_project_suggestions(
     return suggestions
 
 
+def _score_txn_vs_project(txn: dict, proj: dict, text_match_conf: int, text_match_reason: str) -> tuple[int, str]:
+    """Score a transaction against a single project using multiple signals.
+
+    Returns (score 0-100, reason_string).
+    """
+    score = 0
+    reasons: list[str] = []
+    proj_name = (proj.get("name") or "").lower()
+
+    # ── Signal A: Text/keyword match (from _match_text_to_project) ──
+    if text_match_conf > 0:
+        # Scale: 95% text match → 30 pts, 85% → 25 pts
+        text_pts = 30 if text_match_conf >= 90 else (25 if text_match_conf >= 80 else 15)
+        score += text_pts
+        reasons.append(text_match_reason)
+
+    # ── Signal B: Currency → project hint ──
+    currency = txn.get("currency", "USD")
+    currency_hint_name = _CURRENCY_HINTS.get(currency, "")
+    if currency_hint_name and currency_hint_name.lower() in proj_name:
+        score += 40
+        reasons.append(f"Currency {currency}")
+
+    # ── Signal C: Source account affinity ──
+    source = txn.get("source", "")
+    default_proj_for_source = _SOURCE_PROJECT_DEFAULT.get(source, "")
+    if default_proj_for_source and default_proj_for_source.lower() in proj_name:
+        score += 30
+        reasons.append(f"Source: {source}")
+    else:
+        # Check source → candidate projects list
+        candidates = _SOURCE_PROJECT_CANDIDATES.get(source, [])
+        for cand in candidates:
+            if cand.lower() in proj_name or proj_name in cand.lower():
+                score += 25
+                reasons.append(f"Source affinity: {source}")
+                break
+        else:
+            # Softer source match: stripe_lba → projects with stripe_account=lba
+            proj_stripe = (proj.get("stripe_account") or "").lower()
+            if proj_stripe and source == f"stripe_{proj_stripe}":
+                score += 5  # Very weak signal since most projects share lba
+                reasons.append(f"Stripe account: {proj_stripe}")
+
+    # ── Signal D: Amount hints (USD) ──
+    amt = txn.get("amount", 0)
+    amt_rounded = round(amt)
+    hint_names = _AMOUNT_HINTS.get(float(amt_rounded), [])
+    for hint in hint_names:
+        if hint.lower() in proj_name:
+            score += 20
+            reasons.append(f"Amount ${amt_rounded}")
+            break
+
+    # ── Signal E: MXN amount → specific project (very high signal) ──
+    if currency == "MXN":
+        mxn_hint = _MXN_AMOUNT_HINTS.get(float(amt_rounded), "")
+        if mxn_hint and mxn_hint.lower() in proj_name:
+            score += 35
+            reasons.append(f"MXN amount ${amt_rounded}")
+
+    # ── Signal F: UVUL source + MXN currency → Beyond Wealth CDMX (strong combo) ──
+    if source == "stripe_uvul" and currency == "MXN" and "cdmx" in proj_name:
+        score += 30
+        reasons.append("UVUL+MXN→CDMX")
+
+    # ── Signal G: UVUL source + USD → likely Beyond Wealth CDMX USD tier ──
+    if source == "stripe_uvul" and currency == "USD" and "cdmx" in proj_name:
+        # USD from UVUL is usually CDMX international tickets
+        score += 15
+        reasons.append("UVUL+USD→CDMX")
+
+    return min(score, 100), " + ".join(reasons) if reasons else "No signals"
+
+
 def _run_smart_match(
     projects: list[dict],
     transactions: list[dict],
     already_assigned: set[str],
 ) -> dict:
-    """Core matching logic using invoice line-item product names.
+    """Multi-signal scoring engine.
+
+    For each transaction, scores against ALL projects using:
+    - Text/keyword match (description, product names)
+    - Currency → country → project hints
+    - Source account affinity
+    - Amount → product type hints
 
     Groups by project_id so each project gets ONE suggestion card.
     Returns suggestions + unmatched stats.
@@ -1670,58 +1734,97 @@ def _run_smart_match(
             continue
 
         product_names = txn.get("product_names") or []
-        desc = txn["description"]
+        desc = txn.get("description", "")
         amt = txn["amount"]
 
         best_proj = None
-        best_conf = 0
+        best_score = 0
         best_reason = ""
-        best_product = desc  # label for the bucket
 
-        # Try each product name from invoice line items
-        for pname in product_names:
-            proj, conf, reason = _match_text_to_project(pname, projects)
-            if conf > best_conf:
-                best_proj, best_conf, best_reason = proj, conf, reason
-                best_product = pname
+        for proj in projects:
+            # Get text-match signal for this project
+            text_conf = 0
+            text_reason = ""
 
-        # If no match from product names, try the full description
-        if best_conf == 0 and desc:
-            proj, conf, reason = _match_text_to_project(desc, projects)
-            if conf > best_conf:
-                best_proj, best_conf, best_reason = proj, conf, reason
-                best_product = desc
+            # Try each product name
+            for pname in product_names:
+                p, c, r = _match_text_to_project(pname, [proj])
+                if p and c > text_conf:
+                    text_conf, text_reason = c, r
 
-        # Amount-only fallback for generic descriptions (low confidence)
-        if best_conf == 0 and amt:
-            best_product = desc or f"${amt} payment"
-            best_conf = 0  # leave unmatched — amount guessing was too inaccurate
+            # Try full description
+            if text_conf == 0 and desc:
+                p, c, r = _match_text_to_project(desc, [proj])
+                if p and c > text_conf:
+                    text_conf, text_reason = c, r
 
-        if best_proj and best_conf > 0:
+            # Also try keyword map directly against proj name
+            if text_conf == 0:
+                proj_name_lower = (proj.get("name") or "").lower()
+                for proj_label, keywords in _PROJECT_KEYWORDS.items():
+                    # Check if this proj matches the label
+                    label_words = [w for w in proj_label.lower().split() if len(w) > 2]
+                    if not all(w in proj_name_lower for w in label_words):
+                        continue
+                    for kw in keywords:
+                        for pname in product_names:
+                            if kw in pname.lower():
+                                text_conf = 85 if len(kw) > 10 else 75
+                                text_reason = f"Keyword: '{kw}'"
+                                break
+                        if text_conf > 0:
+                            break
+                    if text_conf > 0:
+                        break
+
+            # Compute composite score
+            score, reason = _score_txn_vs_project(txn, proj, text_conf, text_reason)
+
+            if score > best_score:
+                best_score = score
+                best_proj = proj
+                best_reason = reason
+
+        # Map composite score → confidence percentage
+        if best_score >= 80:
+            confidence = 95
+        elif best_score >= 60:
+            confidence = 85
+        elif best_score >= 40:
+            confidence = 70
+        else:
+            confidence = 0  # unmatched
+
+        if best_proj and confidence > 0:
             pid = best_proj["id"]
-            bucket_key = pid
-            if bucket_key not in buckets:
-                buckets[bucket_key] = {
+            if pid not in buckets:
+                buckets[pid] = {
                     "project_id": pid,
                     "project_name": best_proj.get("name", ""),
-                    "confidence": best_conf,
+                    "confidence": confidence,
                     "match_reason": best_reason,
+                    "score": best_score,
                     "total_usd": 0.0,
                     "total_mxn": 0.0,
                     "transaction_ids": [],
                     "sample_descriptions": [],
                     "sources": set(),
+                    "amounts": {},
                 }
-            b = buckets[bucket_key]
-            if best_conf > b["confidence"]:
-                b["confidence"] = best_conf
+            b = buckets[pid]
+            if confidence > b["confidence"]:
+                b["confidence"] = confidence
                 b["match_reason"] = best_reason
+                b["score"] = best_score
             if txn["currency"] == "MXN":
                 b["total_mxn"] += amt
             else:
                 b["total_usd"] += amt
             b["transaction_ids"].append(txn["id"])
             b["sources"].add(txn["source"])
+            # Track amounts for grouping display
+            amt_key = f"{amt:.2f}_{txn['currency']}"
+            b["amounts"][amt_key] = b["amounts"].get(amt_key, 0) + 1
             if len(b["sample_descriptions"]) < 5 and desc:
                 if desc not in b["sample_descriptions"]:
                     b["sample_descriptions"].append(desc)
@@ -1731,6 +1834,12 @@ def _run_smart_match(
     # Serialize
     suggestions = []
     for b in sorted(buckets.values(), key=lambda x: (-x["confidence"], -x["total_usd"])):
+        # Build amount breakdown for display
+        amount_breakdown = []
+        for amt_key, count in sorted(b["amounts"].items(), key=lambda x: -x[1]):
+            parts = amt_key.split("_")
+            amount_breakdown.append(f"{count}x ${parts[0]} {parts[1]}")
+
         suggestions.append({
             "project_id": b["project_id"],
             "project_name": b["project_name"],
@@ -1742,6 +1851,7 @@ def _run_smart_match(
             "sample_descriptions": b["sample_descriptions"],
             "transaction_ids": b["transaction_ids"],
             "sources": sorted(b["sources"]),
+            "amount_breakdown": amount_breakdown[:10],
         })
 
     unmatched_usd = sum(t["amount"] for t in unmatched if t["currency"] != "MXN")
@@ -1753,7 +1863,7 @@ def _run_smart_match(
     unmatched_samples = []
     seen_descs: set = set()
     for t in sorted(unmatched, key=lambda x: -x["amount"])[:50]:
-        desc = t["description"][:100]
+        desc = t.get("description", "")[:100]
         if desc not in seen_descs:
             seen_descs.add(desc)
             unmatched_samples.append({
@@ -1789,15 +1899,31 @@ async def _get_already_assigned_ids() -> set[str]:
 
 
 async def _fetch_smart_match_transactions(client: httpx.AsyncClient, days: int) -> tuple[list[dict], list[dict]]:
-    """Fetch invoices + non-invoice PIs for smart matching. Returns (all_transactions, stripe_products)."""
-    # Fetch invoices with product details
-    invoices = await _fetch_stripe_invoices(client, days)
+    """Fetch charges from ALL Stripe accounts in parallel. Returns (all_transactions, stripe_products)."""
+    import asyncio
+    cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
 
-    # Fetch one-time payment_intents (those without invoices)
-    invoice_pi_ids: set[str] = set()  # invoices don't have PI ids directly, we skip by checking pi.invoice
-    one_time_pis = await _fetch_noninvoice_payment_intents(client, days, invoice_pi_ids)
+    tasks = [
+        _fetch_stripe_charges_for_account(client, label, cutoff)
+        for label in STRIPE_ACCOUNTS
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    all_transactions = invoices + one_time_pis
+    all_transactions: list[dict] = []
+    for r in results:
+        if isinstance(r, list):
+            all_transactions.extend(r)
+        elif isinstance(r, Exception):
+            logger.warning("smart_match fetch_error: %s", str(r)[:100])
+
+    # Deduplicate by payment_intent ID (charges and PIs can share the same pi_id)
+    seen_ids: set[str] = set()
+    deduped: list[dict] = []
+    for txn in all_transactions:
+        if txn["id"] not in seen_ids:
+            seen_ids.add(txn["id"])
+            deduped.append(txn)
+    all_transactions = deduped
 
     # Build a simple products list from what we found
     seen_products: dict[str, dict] = {}
@@ -1816,7 +1942,7 @@ async def _fetch_smart_match_transactions(client: httpx.AsyncClient, days: int) 
 
 @router.get("/smart-match")
 async def smart_match(request: Request, days: int = Query(30)):
-    """Smart transaction matching using invoice line-item product names."""
+    """Smart transaction matching using multi-signal scoring (charges, currency, amount, source)."""
     _require_super_admin(request)
 
     # 1. Fetch projects from Supabase
@@ -1826,13 +1952,13 @@ async def smart_match(request: Request, days: int = Query(30)):
     # 2. Get already-assigned transaction IDs
     already_assigned = await _get_already_assigned_ids()
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        # 3. Fetch invoices + one-time PIs with product details
+    async with httpx.AsyncClient(timeout=90) as client:
+        # 3. Fetch charges from all Stripe accounts in parallel
         all_transactions, stripe_products = await _fetch_smart_match_transactions(client, days)
 
     logger.info(
-        "smart_match invoices+pis=%d projects=%d already_assigned=%d products=%d",
-        len(all_transactions), len(projects), len(already_assigned), len(stripe_products),
+        "smart_match charges=%d projects=%d already_assigned=%d products=%d days=%d",
+        len(all_transactions), len(projects), len(already_assigned), len(stripe_products), days,
     )
 
     # 4. Run matching
@@ -1919,7 +2045,7 @@ async def smart_match_approve_all(request: Request, days: int = Query(30)):
     projects = proj_resp.data or []
     already_assigned = await _get_already_assigned_ids()
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         all_transactions, _products = await _fetch_smart_match_transactions(client, days)
 
     result = _run_smart_match(projects, all_transactions, already_assigned)
