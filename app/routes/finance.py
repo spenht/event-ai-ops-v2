@@ -1577,6 +1577,37 @@ def _build_new_project_suggestions(
         if desc and len(g["sample_descriptions"]) < 5 and desc not in g["sample_descriptions"]:
             g["sample_descriptions"].append(desc)
 
+    # Also group blank-description transactions by amount + source
+    for txn in unmatched:
+        product_names = txn.get("product_names") or []
+        label = product_names[0] if product_names else (txn.get("description") or "")
+        if label and label.strip():
+            continue  # already grouped above
+        # Group by amount + source
+        amt = txn.get("amount", 0)
+        source = txn.get("source", "unknown")
+        currency = txn.get("currency", "USD")
+        norm = f"${amt:.2f}_{currency}_{source}"
+        display = f"${amt:,.2f} {currency} payments via {source}"
+        if norm not in groups:
+            groups[norm] = {
+                "raw_name": display,
+                "product_names": set(),
+                "transaction_ids": [],
+                "total_usd": 0.0,
+                "total_mxn": 0.0,
+                "sources": set(),
+                "sample_descriptions": [],
+            }
+        g = groups[norm]
+        g["product_names"].add(display)
+        g["transaction_ids"].append(txn["id"])
+        g["sources"].add(source)
+        if currency == "MXN":
+            g["total_mxn"] += amt
+        else:
+            g["total_usd"] += amt
+
     # Build suggestions for groups with 2+ transactions
     suggestions = []
     for _norm, g in groups.items():
