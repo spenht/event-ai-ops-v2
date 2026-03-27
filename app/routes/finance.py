@@ -1325,7 +1325,7 @@ _PROJECT_KEYWORDS = {
     "Mentorías Especiales": [
         "mentoría", "mentoria", "mentorías", "panda",
         "aportación legacy", "apartado legacy", "legacy mentorship",
-        "owner", "legacy business", "one life legacy",
+        "business leader vip",
     ],
     "Viajes": ["viaje", "dubai", "trip", "apartado viaje"],
     "Podcast": ["podcast"],
