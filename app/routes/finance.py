@@ -1442,75 +1442,7 @@ _MXN_AMOUNT_HINTS: dict[float, str] = {
 }
 
 
-async def _fetch_stripe_charges_for_account(
-    client: httpx.AsyncClient, label: str, cutoff: int
-) -> list[dict]:
-    """Fetch succeeded charges for ONE Stripe account. Returns normalized dicts."""
-    key = _get_stripe_key(label)
-    if not key:
-        return []
-    source = f"stripe_{label}"
-    items: list[dict] = []
-    cursor = None
-    for _ in range(10):  # max 10 pages = 1000 charges per account
-        params: dict = {
-            "created[gte]": cutoff,
-            "limit": 100,
-        }
-        if cursor:
-            params["starting_after"] = cursor
-        r = await client.get(
-            "https://api.stripe.com/v1/charges",
-            params=params, auth=(key, ""),
-        )
-        if r.status_code != 200:
-            logger.warning("smart_match charges_error account=%s status=%s", label, r.status_code)
-            break
-        data = r.json()
-        page_items = data.get("data", [])
-        for ch in page_items:
-            if ch.get("status") != "succeeded":
-                continue
-            amt = ch["amount"] / 100
-            if amt <= 0:
-                continue  # skip $0 charges
-            currency = (ch.get("currency") or "usd").upper()
-            desc = ch.get("description") or ""
-            stmt = ch.get("statement_descriptor") or ""
-            meta = ch.get("metadata") or {}
-            pi_id = ch.get("payment_intent") or ch["id"]
-            dt = datetime.fromtimestamp(ch["created"], tz=timezone.utc)
-
-            # Build product_names from description, metadata, statement_descriptor
-            product_names: list[str] = []
-            if desc:
-                product_names.append(desc)
-            if stmt and stmt != desc:
-                product_names.append(stmt)
-            # Some checkouts put product name in metadata
-            for mkey in ("product", "product_name", "plan", "campaign"):
-                mval = meta.get(mkey, "")
-                if mval and mval not in product_names:
-                    product_names.append(mval)
-
-            items.append({
-                "id": pi_id,
-                "charge_id": ch["id"],
-                "amount": amt,
-                "currency": currency,
-                "description": desc or stmt or "",
-                "product_names": product_names,
-                "source": source,
-                "account": label,
-                "created": dt.isoformat(),
-                "receipt_email": ch.get("receipt_email") or "",
-                "metadata": meta,
-                "type": "charge",
-            })
-            cursor = ch["id"]
-        if not data.get("has_more"):
-            break
-    return items
+# _fetch_stripe_charges_for_account removed — smart-match now reads from Supabase
 
 
 def _clean_suggested_name(raw: str) -> str:
@@ -1915,61 +1847,77 @@ def _run_smart_match(
     }
 
 
-async def _get_already_assigned_ids() -> set[str]:
-    """Get external_ids that already have a project_id in financial_transactions."""
-    try:
-        rows = (
+# _get_already_assigned_ids removed — _fetch_smart_match_transactions only returns unassigned txns
+
+
+async def _fetch_smart_match_transactions(days: int) -> tuple[list[dict], list[dict]]:
+    """Fetch unassigned transactions from Supabase (instant, no Stripe API calls)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    # Paginate — Supabase limits to 1000 per request
+    all_rows: list[dict] = []
+    offset = 0
+    while True:
+        r = (
             sb.table("financial_transactions")
-            .select("external_id")
-            .not_.is_("project_id", "null")
+            .select("*")
+            .is_("project_id", "null")
+            .gte("txn_date", cutoff)
+            .order("txn_date", desc=True)
+            .range(offset, offset + 999)
             .execute()
         )
-        return {r["external_id"] for r in (rows.data or [])}
-    except Exception as e:
-        logger.warning("smart_match_assigned_check_error: %s", str(e)[:100])
-        return set()
+        batch = r.data or []
+        all_rows.extend(batch)
+        if len(batch) < 1000:
+            break
+        offset += 1000
 
+    # Transform to the format the matcher expects
+    txns: list[dict] = []
+    for t in all_rows:
+        desc = t.get("description") or ""
+        counterparty = t.get("counterparty") or ""
+        meta = t.get("metadata") or {}
 
-async def _fetch_smart_match_transactions(client: httpx.AsyncClient, days: int) -> tuple[list[dict], list[dict]]:
-    """Fetch charges from ALL Stripe accounts in parallel. Returns (all_transactions, stripe_products)."""
-    import asyncio
-    cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        # Build product_names from description + metadata (same signals as before)
+        product_names: list[str] = []
+        if desc:
+            product_names.append(desc)
+        for mkey in ("product", "product_name", "plan", "campaign"):
+            mval = meta.get(mkey, "")
+            if mval and mval not in product_names:
+                product_names.append(mval)
 
-    tasks = [
-        _fetch_stripe_charges_for_account(client, label, cutoff)
-        for label in STRIPE_ACCOUNTS
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+        txns.append({
+            "id": t["id"],  # Supabase UUID — used for approve
+            "external_id": t.get("external_id", ""),
+            "source": t.get("source", ""),
+            "account": (t.get("source") or "").replace("stripe_", "").replace("mercury_", "").replace("whop", "whop"),
+            "amount": float(t.get("amount", 0)),
+            "currency": (t.get("currency") or "USD").upper(),
+            "description": desc,
+            "counterparty": counterparty,
+            "product_names": product_names,
+            "txn_date": t.get("txn_date", ""),
+            "created": t.get("txn_date", ""),
+            "metadata": meta,
+            "type": t.get("type", "sale"),
+        })
 
-    all_transactions: list[dict] = []
-    for r in results:
-        if isinstance(r, list):
-            all_transactions.extend(r)
-        elif isinstance(r, Exception):
-            logger.warning("smart_match fetch_error: %s", str(r)[:100])
-
-    # Deduplicate by payment_intent ID (charges and PIs can share the same pi_id)
-    seen_ids: set[str] = set()
-    deduped: list[dict] = []
-    for txn in all_transactions:
-        if txn["id"] not in seen_ids:
-            seen_ids.add(txn["id"])
-            deduped.append(txn)
-    all_transactions = deduped
-
-    # Build a simple products list from what we found
+    # Build products list from unique descriptions
     seen_products: dict[str, dict] = {}
-    for txn in all_transactions:
-        for pname in txn.get("product_names", []):
+    for t in txns:
+        for pname in t.get("product_names", []):
             if pname and pname not in seen_products:
                 seen_products[pname] = {
                     "id": pname,
                     "name": pname,
-                    "account": txn["account"],
+                    "account": t["account"],
                 }
-    stripe_products = list(seen_products.values())
+    products = list(seen_products.values())
 
-    return all_transactions, stripe_products
+    return txns, products
 
 
 @router.get("/smart-match")
@@ -1981,28 +1929,30 @@ async def smart_match(request: Request, days: int = Query(30)):
     proj_resp = sb.table("projects").select("*").execute()
     projects = proj_resp.data or []
 
-    # 2. Get already-assigned transaction IDs
-    already_assigned = await _get_already_assigned_ids()
+    # 2. Fetch unassigned transactions from Supabase (instant)
+    all_transactions, products = await _fetch_smart_match_transactions(days)
 
-    async with httpx.AsyncClient(timeout=90) as client:
-        # 3. Fetch charges from all Stripe accounts in parallel
-        all_transactions, stripe_products = await _fetch_smart_match_transactions(client, days)
+    # already_assigned is empty set — we only fetched unassigned txns
+    already_assigned: set[str] = set()
 
     logger.info(
-        "smart_match charges=%d projects=%d already_assigned=%d products=%d days=%d",
-        len(all_transactions), len(projects), len(already_assigned), len(stripe_products), days,
+        "smart_match txns=%d projects=%d products=%d days=%d",
+        len(all_transactions), len(projects), len(products), days,
     )
 
-    # 4. Run matching
+    # 3. Run matching
     result = _run_smart_match(projects, all_transactions, already_assigned)
-    result["stripe_products"] = stripe_products
+    result["stripe_products"] = products
 
     return {"ok": True, "data": result}
 
 
 @router.post("/smart-match/approve")
 async def smart_match_approve(request: Request):
-    """Approve a suggestion batch: assign transaction_ids to a project."""
+    """Approve a suggestion batch: assign transaction_ids to a project.
+
+    transaction_ids can be Supabase UUIDs (preferred) or external_ids (pi_xxx).
+    """
     _require_super_admin(request)
     body = await request.json()
 
@@ -2020,42 +1970,43 @@ async def smart_match_approve(request: Request):
 
     assigned = 0
     skipped = 0
-    for ext_id in transaction_ids:
+    for tid in transaction_ids:
         try:
-            # Check if already assigned
-            existing = (
+            # Try as Supabase UUID first (new flow)
+            r = (
                 sb.table("financial_transactions")
-                .select("id,project_id")
-                .eq("external_id", ext_id)
-                .limit(1)
-                .execute()
-            )
-            if existing.data and existing.data[0].get("project_id"):
-                skipped += 1
-                continue
-
-            if existing.data:
-                # Update existing row
-                sb.table("financial_transactions").update({
+                .update({
                     "project_id": project_id,
                     "auto_assigned": True,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
-                }).eq("external_id", ext_id).execute()
-            else:
-                # Create new row
-                sb.table("financial_transactions").insert({
-                    "external_id": ext_id,
-                    "source": "stripe",
-                    "type": "sale",
+                })
+                .eq("id", tid)
+                .is_("project_id", "null")
+                .execute()
+            )
+            if r.data:
+                assigned += len(r.data)
+                continue
+
+            # Fallback: try as external_id (legacy flow)
+            r = (
+                sb.table("financial_transactions")
+                .update({
                     "project_id": project_id,
                     "auto_assigned": True,
-                    "amount": 0,
-                    "currency": "USD",
-                    "description": f"Smart-matched to {proj.data[0]['name']}",
-                }).execute()
-            assigned += 1
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
+                .eq("external_id", tid)
+                .is_("project_id", "null")
+                .execute()
+            )
+            if r.data:
+                assigned += len(r.data)
+            else:
+                skipped += 1
         except Exception as e:
-            logger.warning("smart_match_approve_error ext_id=%s: %s", ext_id, str(e)[:100])
+            logger.warning("smart_match_approve_error tid=%s: %s", tid, str(e)[:100])
+            skipped += 1
 
     return {
         "ok": True,
@@ -2072,13 +2023,12 @@ async def smart_match_approve_all(request: Request, days: int = Query(30)):
     body = await request.json()
     min_confidence = body.get("min_confidence", 85)
 
-    # Run smart-match internally
+    # Run smart-match internally (reads from Supabase)
     proj_resp = sb.table("projects").select("*").execute()
     projects = proj_resp.data or []
-    already_assigned = await _get_already_assigned_ids()
 
-    async with httpx.AsyncClient(timeout=90) as client:
-        all_transactions, _products = await _fetch_smart_match_transactions(client, days)
+    all_transactions, _products = await _fetch_smart_match_transactions(days)
+    already_assigned: set[str] = set()
 
     result = _run_smart_match(projects, all_transactions, already_assigned)
 
@@ -2094,39 +2044,26 @@ async def smart_match_approve_all(request: Request, days: int = Query(30)):
         assigned = 0
         skipped = 0
 
-        for ext_id in suggestion["transaction_ids"]:
+        for tid in suggestion["transaction_ids"]:
             try:
-                existing = (
+                # tid is a Supabase UUID — update directly
+                r = (
                     sb.table("financial_transactions")
-                    .select("id,project_id")
-                    .eq("external_id", ext_id)
-                    .limit(1)
-                    .execute()
-                )
-                if existing.data and existing.data[0].get("project_id"):
-                    skipped += 1
-                    continue
-
-                if existing.data:
-                    sb.table("financial_transactions").update({
+                    .update({
                         "project_id": project_id,
                         "auto_assigned": True,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("external_id", ext_id).execute()
+                    })
+                    .eq("id", tid)
+                    .is_("project_id", "null")
+                    .execute()
+                )
+                if r.data:
+                    assigned += len(r.data)
                 else:
-                    sb.table("financial_transactions").insert({
-                        "external_id": ext_id,
-                        "source": "stripe",
-                        "type": "sale",
-                        "project_id": project_id,
-                        "auto_assigned": True,
-                        "amount": 0,
-                        "currency": "USD",
-                        "description": f"Smart-matched to {suggestion['project_name']}",
-                    }).execute()
-                assigned += 1
+                    skipped += 1
             except Exception as e:
-                logger.warning("approve_all_error ext_id=%s: %s", ext_id, str(e)[:100])
+                logger.warning("approve_all_error tid=%s: %s", tid, str(e)[:100])
 
         total_assigned += assigned
         total_skipped += skipped
@@ -2145,3 +2082,11 @@ async def smart_match_approve_all(request: Request, days: int = Query(30)):
         "total_skipped": total_skipped,
         "approved_projects": approved_projects,
     }
+
+
+@router.get("/unassigned-count")
+async def get_unassigned_count(request: Request):
+    """Return count of unassigned transactions (for sidebar badge)."""
+    _require_super_admin(request)
+    r = sb.table("financial_transactions").select("id", count="exact").is_("project_id", "null").execute()
+    return {"ok": True, "count": r.count or 0}
