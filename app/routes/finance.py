@@ -82,6 +82,38 @@ def _require_super_admin(request: Request):
     raise HTTPException(status_code=403, detail="Super admin access required")
 
 
+# ─── Sync endpoint ─────────────────────────────────────────────────────────
+
+
+@router.post("/sync")
+async def trigger_sync(request: Request):
+    """Trigger a full sync of all financial sources into Supabase.
+
+    Body params (JSON):
+        days   (int, default 365) — how far back to sync
+        source (str, optional)   — sync only one source, e.g. "stripe_lba", "mercury_oll", "whop"
+        full   (bool, default false) — if true, ignore cursors and re-sync everything
+    """
+    _require_super_admin(request)
+
+    body = {}
+    if request.headers.get("content-type", "").startswith("application/json"):
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+
+    days = int(body.get("days", 365))
+    source = body.get("source")
+    full = bool(body.get("full", False))
+
+    from ..services.finance_sync import run_full_sync
+
+    results = await run_full_sync(days=days, source=source, full=full)
+
+    return {"ok": True, "data": results}
+
+
 # ─── Projects CRUD ──────────────────────────────────────────────────────────
 
 

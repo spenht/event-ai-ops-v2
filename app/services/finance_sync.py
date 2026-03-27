@@ -2,6 +2,7 @@
 and persists them in financial_transactions table with project linking."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -118,9 +119,9 @@ def _upsert_transactions(txns: list[dict]) -> int:
     if not txns:
         return 0
     count = 0
-    # Upsert in batches of 50
-    for i in range(0, len(txns), 50):
-        batch = txns[i:i + 50]
+    # Upsert in batches of 500
+    for i in range(0, len(txns), 500):
+        batch = txns[i:i + 500]
         try:
             sb.table("financial_transactions").upsert(
                 batch, on_conflict="external_id,source"
@@ -133,7 +134,7 @@ def _upsert_transactions(txns: list[dict]) -> int:
 
 # ─── Stripe sync ───────────────────────────────────────────────────────────
 
-async def sync_stripe(acct_id: str) -> dict:
+async def sync_stripe(acct_id: str, days: int = 365, full: bool = False) -> dict:
     """Sync payment_intents from one Stripe account."""
     source = f"stripe_{acct_id}"
     info = STRIPE_ACCOUNTS.get(acct_id)
@@ -144,10 +145,13 @@ async def sync_stripe(acct_id: str) -> dict:
     if not key:
         return {"source": source, "error": "no API key"}
 
-    # Get cursor — default to 1 year ago
-    cursor_dt = _get_cursor(source)
-    if not cursor_dt:
-        cursor_dt = datetime.now(timezone.utc) - timedelta(days=365)
+    # If full=True, ignore cursor and go back `days` days
+    if full:
+        cursor_dt = datetime.now(timezone.utc) - timedelta(days=days)
+    else:
+        cursor_dt = _get_cursor(source)
+        if not cursor_dt:
+            cursor_dt = datetime.now(timezone.utc) - timedelta(days=days)
     since_ts = int(cursor_dt.timestamp())
 
     rules = _load_rules()
@@ -156,7 +160,7 @@ async def sync_stripe(acct_id: str) -> dict:
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         starting_after = None
-        for _ in range(50):  # max 5000 transactions
+        for _ in range(100):  # max 10,000 transactions
             params = {"created[gte]": since_ts, "limit": 100}
             if starting_after:
                 params["starting_after"] = starting_after
@@ -248,7 +252,7 @@ async def sync_stripe(acct_id: str) -> dict:
 
 # ─── Mercury sync ──────────────────────────────────────────────────────────
 
-async def sync_mercury(acct_id: str) -> dict:
+async def sync_mercury(acct_id: str, days: int = 365, full: bool = False) -> dict:
     """Sync transactions from one Mercury account."""
     source = f"mercury_{acct_id}"
     info = MERCURY_ACCOUNTS.get(acct_id)
@@ -259,9 +263,12 @@ async def sync_mercury(acct_id: str) -> dict:
     if not key:
         return {"source": source, "error": "no API key"}
 
-    cursor_dt = _get_cursor(source)
-    if not cursor_dt:
-        cursor_dt = datetime.now(timezone.utc) - timedelta(days=365)
+    if full:
+        cursor_dt = datetime.now(timezone.utc) - timedelta(days=days)
+    else:
+        cursor_dt = _get_cursor(source)
+        if not cursor_dt:
+            cursor_dt = datetime.now(timezone.utc) - timedelta(days=days)
     since_str = cursor_dt.strftime("%Y-%m-%d")
 
     # Detect own Mercury account names for transfer detection
@@ -342,16 +349,19 @@ async def sync_mercury(acct_id: str) -> dict:
 
 # ─── Whop sync ─────────────────────────────────────────────────────────────
 
-async def sync_whop() -> dict:
+async def sync_whop(days: int = 365, full: bool = False) -> dict:
     """Sync payments from Whop."""
     source = "whop"
     whop_key = getattr(settings, "whop_api_key", "")
     if not whop_key:
         return {"source": source, "error": "no API key"}
 
-    cursor_dt = _get_cursor(source)
-    if not cursor_dt:
-        cursor_dt = datetime.now(timezone.utc) - timedelta(days=365)
+    if full:
+        cursor_dt = datetime.now(timezone.utc) - timedelta(days=days)
+    else:
+        cursor_dt = _get_cursor(source)
+        if not cursor_dt:
+            cursor_dt = datetime.now(timezone.utc) - timedelta(days=days)
 
     rules = _load_rules()
     txns = []
@@ -457,40 +467,55 @@ def apply_rules_to_unassigned() -> dict:
 # ─── Orchestrator ──────────────────────────────────────────────────────────
 
 async def sync_all() -> dict:
-    """Sync all sources and apply assignment rules."""
+    """Sync all sources and apply assignment rules (incremental)."""
+    return await run_full_sync(days=365, source=None, full=False)
+
+
+async def run_full_sync(days: int = 365, source: Optional[str] = None, full: bool = False) -> dict:
+    """Run sync for all sources or a specific one.
+
+    Args:
+        days: How far back to sync (default 365).
+        source: Optional source filter, e.g. "stripe_lba", "mercury_oll", "whop".
+        full: If True, ignore cursors and re-sync from scratch.
+    """
     results = []
     errors = []
 
-    # Stripe
-    for acct_id in STRIPE_ACCOUNTS:
-        try:
-            r = await sync_stripe(acct_id)
+    # ── Stripe ──
+    if source is None or source.startswith("stripe"):
+        tasks = []
+        for acct_id in STRIPE_ACCOUNTS:
+            if source and source != f"stripe_{acct_id}":
+                continue
+            tasks.append(_safe_sync(sync_stripe(acct_id, days=days, full=full), f"stripe_{acct_id}"))
+        batch = await asyncio.gather(*tasks, return_exceptions=False)
+        for r in batch:
             results.append(r)
             if "error" in r:
                 errors.append(r)
-        except Exception as e:
-            errors.append({"source": f"stripe_{acct_id}", "error": str(e)[:120]})
 
-    # Mercury
-    for acct_id in MERCURY_ACCOUNTS:
-        try:
-            r = await sync_mercury(acct_id)
+    # ── Mercury ──
+    if source is None or source.startswith("mercury"):
+        tasks = []
+        for acct_id in MERCURY_ACCOUNTS:
+            if source and source != f"mercury_{acct_id}":
+                continue
+            tasks.append(_safe_sync(sync_mercury(acct_id, days=days, full=full), f"mercury_{acct_id}"))
+        batch = await asyncio.gather(*tasks, return_exceptions=False)
+        for r in batch:
             results.append(r)
             if "error" in r:
                 errors.append(r)
-        except Exception as e:
-            errors.append({"source": f"mercury_{acct_id}", "error": str(e)[:120]})
 
-    # Whop
-    try:
-        r = await sync_whop()
+    # ── Whop ──
+    if source is None or source == "whop":
+        r = await _safe_sync(sync_whop(days=days, full=full), "whop")
         results.append(r)
         if "error" in r:
             errors.append(r)
-    except Exception as e:
-        errors.append({"source": "whop", "error": str(e)[:120]})
 
-    # Apply rules
+    # Apply assignment rules
     rules_result = apply_rules_to_unassigned()
 
     total_synced = sum(r.get("synced", 0) for r in results)
@@ -500,3 +525,12 @@ async def sync_all() -> dict:
         "rules_applied": rules_result,
         "errors": errors,
     }
+
+
+async def _safe_sync(coro, source_label: str) -> dict:
+    """Wrap a sync coroutine so exceptions don't crash the batch."""
+    try:
+        return await coro
+    except Exception as e:
+        logger.error("sync_error source=%s err=%s", source_label, str(e)[:200])
+        return {"source": source_label, "error": str(e)[:200]}
