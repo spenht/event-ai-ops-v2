@@ -102,15 +102,18 @@ async def get_terminal_config(request: Request):
             pass
 
         configs.append({
+            "id": project_id,
             "project_id": project_id,
+            "name": project.get("name", ""),
             "project_name": project.get("name", ""),
+            "commission_pct": project.get("_commission_rate", 0) if not is_admin else 0,
             "commission_rate": project.get("_commission_rate", 0) if not is_admin else 0,
             "role": project.get("_role", "admin") if not is_admin else "admin",
             "gateways": gw_data,
             "campaigns": campaign_ids,
         })
 
-    return {"ok": True, "data": configs}
+    return {"ok": True, "data": {"projects": configs}}
 
 
 # ── 2. Create charge ────────────────────────────────────────────
