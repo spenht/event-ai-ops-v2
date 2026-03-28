@@ -24,6 +24,11 @@ _STRIPE_KEY_MAP = {
     "stripe_uvul": "STRIPE_KEY_UVUL",
     "stripe_oll": "STRIPE_KEY_OLL",
     "stripe_2clicks": "STRIPE_KEY_2CLICKS",
+    # Also support short keys (gateway_key values from DB)
+    "lba": "STRIPE_KEY_LBA",
+    "uvul": "STRIPE_KEY_UVUL",
+    "oll": "STRIPE_KEY_OLL",
+    "2clicks": "STRIPE_KEY_2CLICKS",
 }
 
 
@@ -66,15 +71,16 @@ async def get_terminal_config(request: Request):
         if not project_id:
             continue
 
-        # Payment gateways enabled for this project
-        gateways = (
+        # Payment gateways enabled for this project (only enabled ones for agents)
+        gw_query = (
             sb.table("project_payment_gateways")
             .select("*")
             .eq("project_id", project_id)
-            .execute()
         )
+        if not is_admin:
+            gw_query = gw_query.eq("enabled", True)
+        gateways = gw_query.execute()
 
-        # If no gateways configured, show default Stripe accounts based on project's stripe_account
         gw_data = gateways.data or []
         if not gw_data:
             stripe_acct = project.get("stripe_account", "")
@@ -558,53 +564,93 @@ async def admin_terminal_settings(request: Request):
 
     # All projects with gateways
     projects = sb.table("projects").select("id, name, slug").execute()
-    project_list = []
-    for proj in projects.data or []:
-        gateways = (
-            sb.table("project_payment_gateways")
-            .select("*")
-            .eq("project_id", proj["id"])
-            .execute()
-        )
-        project_list.append({
-            **proj,
-            "gateways": gateways.data or [],
-        })
 
-    # All agents with their assignments and commission rates
+    # Count agents per project
     agents_raw = (
         sb.table("project_agents")
         .select("*, projects(name)")
         .execute()
     )
-    agents_by_user: dict[str, dict] = {}
+    agent_count_by_project: dict[str, int] = defaultdict(int)
     for pa in agents_raw.data or []:
-        uid = pa["user_id"]
-        if uid not in agents_by_user:
-            agents_by_user[uid] = {
-                "user_id": uid,
-                "assignments": [],
+        agent_count_by_project[pa["project_id"]] += 1
+
+    # Commission tiers by project
+    try:
+        tiers = sb.table("commission_tiers").select("*").execute()
+        tier_projects = {t["project_id"] for t in (tiers.data or [])}
+    except Exception:
+        tiers = type("X", (), {"data": []})()
+        tier_projects = set()
+
+    project_list = []
+    for proj in projects.data or []:
+        pid = proj["id"]
+        gateways = (
+            sb.table("project_payment_gateways")
+            .select("*")
+            .eq("project_id", pid)
+            .execute()
+        )
+        gw_list = [
+            {
+                "id": gw["id"],
+                "label": gw.get("label", gw.get("gateway_key", "")),
+                "enabled": gw.get("enabled", True),
             }
-        agents_by_user[uid]["assignments"].append({
-            "project_id": pa["project_id"],
-            "project_name": (pa.get("projects") or {}).get("name", ""),
-            "commission_rate": pa.get("commission_rate", 0),
-            "role": pa.get("role", "agent"),
-            "enabled": pa.get("enabled", True),
-            "gateway_ids": pa.get("gateway_ids", []),
+            for gw in (gateways.data or [])
+        ]
+        project_list.append({
+            "id": pid,
+            "name": proj["name"],
+            "gateways": gw_list,
+            "commission_pct": 0,
+            "tier_enabled": pid in tier_projects,
+            "agent_count": agent_count_by_project.get(pid, 0),
         })
 
-    # Commission tiers
-    tiers = sb.table("commission_tiers").select("*").execute()
+    # Agents list for the table
+    agents_list = []
+    for pa in agents_raw.data or []:
+        agents_list.append({
+            "id": pa["user_id"],
+            "name": pa.get("agent_name", pa["user_id"]),
+            "email": pa.get("agent_email", ""),
+            "project_id": pa["project_id"],
+            "project_name": (pa.get("projects") or {}).get("name", ""),
+            "commission_pct": pa.get("commission_rate", 0),
+            "sales_30d": 0,
+            "status": "active" if pa.get("enabled", True) else "inactive",
+        })
 
     return {
         "ok": True,
         "data": {
             "projects": project_list,
-            "agents": list(agents_by_user.values()),
+            "agents": agents_list,
             "commission_tiers": tiers.data or [],
         },
     }
+
+
+@router.put("/admin/gateway-toggle")
+async def admin_toggle_gateway(request: Request):
+    """Enable or disable a gateway for a project."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    body = await request.json()
+    gateway_id = body.get("gateway_id")
+    enabled = body.get("enabled")
+
+    if not gateway_id or enabled is None:
+        return JSONResponse({"ok": False, "error": "gateway_id and enabled are required"}, 400)
+
+    sb.table("project_payment_gateways").update(
+        {"enabled": enabled}
+    ).eq("id", gateway_id).execute()
+
+    return {"ok": True, "message": f"Gateway {'enabled' if enabled else 'disabled'}"}
 
 
 @router.put("/admin/agent-access")
