@@ -563,7 +563,7 @@ async def admin_terminal_settings(request: Request):
         return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
 
     # All projects with gateways
-    projects = sb.table("projects").select("id, name, slug").execute()
+    projects = sb.table("projects").select("id, name").execute()
 
     # Count agents per project
     agents_raw = (
