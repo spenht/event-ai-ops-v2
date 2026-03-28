@@ -37,21 +37,34 @@ def _stripe_key_for(gateway_key: str) -> str:
 async def get_terminal_config(request: Request):
     """Return projects, gateways, and commission rates for the logged-in agent."""
     user_id = request.headers.get("x-user-id")
-    if not user_id:
+    is_admin = bool(request.headers.get("x-spartans-key"))
+    if not user_id and not is_admin:
         raise HTTPException(status_code=401, detail="Missing user ID")
 
-    # Projects this agent is assigned to
-    agent_projects = (
-        sb.table("project_agents")
-        .select("*, projects(*)")
-        .eq("user_id", user_id)
-        .execute()
-    )
+    # Check if admin/owner — they can access ALL projects
+    if is_admin:
+        all_projects = sb.table("projects").select("*").eq("status", "active").execute()
+        project_list = all_projects.data or []
+    else:
+        # Regular agent — only assigned projects
+        agent_projects = (
+            sb.table("project_agents")
+            .select("*, projects(*)")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        project_list = []
+        for pa in agent_projects.data or []:
+            proj = pa.get("projects") or {}
+            proj["_commission_rate"] = pa.get("commission_rate", 0)
+            proj["_role"] = pa.get("role", "agent")
+            project_list.append(proj)
 
     configs = []
-    for pa in agent_projects.data or []:
-        project = pa.get("projects") or {}
-        project_id = pa["project_id"]
+    for project in project_list:
+        project_id = project.get("id", "")
+        if not project_id:
+            continue
 
         # Payment gateways enabled for this project
         gateways = (
@@ -60,6 +73,20 @@ async def get_terminal_config(request: Request):
             .eq("project_id", project_id)
             .execute()
         )
+
+        # If no gateways configured, show default Stripe accounts based on project's stripe_account
+        gw_data = gateways.data or []
+        if not gw_data:
+            stripe_acct = project.get("stripe_account", "")
+            if stripe_acct:
+                gw_data = [{
+                    "id": f"default_{stripe_acct}",
+                    "project_id": project_id,
+                    "gateway_type": "stripe",
+                    "gateway_key": stripe_acct,
+                    "label": f"Stripe {stripe_acct.upper()}",
+                    "is_primary": True,
+                }]
 
         # Campaigns linked to this project
         campaigns = (
@@ -72,9 +99,9 @@ async def get_terminal_config(request: Request):
         configs.append({
             "project_id": project_id,
             "project_name": project.get("name", ""),
-            "commission_rate": pa.get("commission_rate", 0),
-            "role": pa.get("role", "agent"),
-            "gateways": gateways.data or [],
+            "commission_rate": project.get("_commission_rate", 0) if not is_admin else 0,
+            "role": project.get("_role", "admin") if not is_admin else "admin",
+            "gateways": gw_data,
             "campaigns": [c["campaign_id"] for c in (campaigns.data or [])],
         })
 
