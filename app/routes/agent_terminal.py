@@ -88,13 +88,18 @@ async def get_terminal_config(request: Request):
                     "is_primary": True,
                 }]
 
-        # Campaigns linked to this project
-        campaigns = (
-            sb.table("campaign_projects")
-            .select("campaign_id")
-            .eq("project_id", project_id)
-            .execute()
-        )
+        # Campaigns linked to this project (table may not exist yet)
+        campaign_ids = []
+        try:
+            campaigns = (
+                sb.table("campaign_projects")
+                .select("campaign_id")
+                .eq("project_id", project_id)
+                .execute()
+            )
+            campaign_ids = [c["campaign_id"] for c in (campaigns.data or [])]
+        except Exception:
+            pass
 
         configs.append({
             "project_id": project_id,
@@ -102,7 +107,7 @@ async def get_terminal_config(request: Request):
             "commission_rate": project.get("_commission_rate", 0) if not is_admin else 0,
             "role": project.get("_role", "admin") if not is_admin else "admin",
             "gateways": gw_data,
-            "campaigns": [c["campaign_id"] for c in (campaigns.data or [])],
+            "campaigns": campaign_ids,
         })
 
     return {"ok": True, "data": configs}
