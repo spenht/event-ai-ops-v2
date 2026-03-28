@@ -710,8 +710,12 @@ async def admin_all_sales(request: Request):
 
     project_id = request.query_params.get("project_id")
     agent_id = request.query_params.get("agent_id")
-    days = int(request.query_params.get("days", "30"))
     min_amount = request.query_params.get("min_amount")
+
+    # Support both "days=30" and "period=30d" formats
+    period = request.query_params.get("period", "")
+    days_map = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
+    days = days_map.get(period, int(request.query_params.get("days", "30")))
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
@@ -746,9 +750,29 @@ async def admin_all_sales(request: Request):
         elif t.get("currency") == "MXN":
             agent_totals[aid]["mxn"] += float(t["amount"])
 
+    # Build top performers list sorted by USD amount
+    ranked = sorted(agent_totals.items(), key=lambda x: x[1]["usd"], reverse=True)
+    top_performers = [
+        {
+            "rank": i + 1,
+            "name": aid,
+            "amount": round(stats["usd"], 2),
+            "project": "",
+        }
+        for i, (aid, stats) in enumerate(ranked[:10])
+    ]
+
+    total_sales = round(total_usd + total_mxn, 2)
+    active_agents = len(agent_totals)
+
     return {
         "ok": True,
         "data": {
+            "total_sales": total_sales,
+            "total_commissions": 0,
+            "active_agents": active_agents,
+            "avg_per_agent": round(total_sales / active_agents, 2) if active_agents else 0,
+            "top_performers": top_performers,
             "transactions": txns,
             "totals": {
                 "count": len(txns),
