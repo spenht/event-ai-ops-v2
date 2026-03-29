@@ -111,6 +111,44 @@ async def get_terminal_config(request: Request):
         except Exception:
             pass
 
+        # Products for this project
+        products_list = []
+        try:
+            products_q = (
+                sb.table("project_products")
+                .select("*")
+                .eq("project_id", project_id)
+                .eq("is_active", True)
+                .order("sort_order")
+            )
+            products_result = products_q.execute()
+            all_products = products_result.data or []
+
+            if not is_admin and user_id:
+                # Filter to products this agent has access to
+                access = (
+                    sb.table("agent_product_access")
+                    .select("product_id, custom_commission_pct")
+                    .eq("agent_id", user_id)
+                    .execute()
+                )
+                access_map = {a["product_id"]: a.get("custom_commission_pct") for a in (access.data or [])}
+                if access_map:
+                    for p in all_products:
+                        if p["id"] in access_map:
+                            custom = access_map[p["id"]]
+                            products_list.append({
+                                **p,
+                                "commission_pct": custom if custom is not None else p.get("commission_pct", 0),
+                            })
+                else:
+                    # No specific access rules → agent sees all products
+                    products_list = all_products
+            else:
+                products_list = all_products
+        except Exception:
+            pass
+
         configs.append({
             "id": project_id,
             "project_id": project_id,
@@ -120,6 +158,7 @@ async def get_terminal_config(request: Request):
             "commission_rate": project.get("_commission_rate", 0) if not is_admin else 0,
             "role": project.get("_role", "admin") if not is_admin else "admin",
             "gateways": gw_data,
+            "products": products_list,
             "campaigns": campaign_ids,
         })
 
@@ -136,6 +175,7 @@ async def create_terminal_charge(request: Request):
         raise HTTPException(status_code=401, detail="Missing user ID")
 
     project_id = body.get("project_id")
+    product_id = body.get("product_id")  # optional — if set, use product commission
     amount = body.get("amount")  # dollars, e.g. 79.00
     currency = body.get("currency", "USD")
     gateway_id = body.get("gateway_id")
@@ -185,6 +225,37 @@ async def create_terminal_charge(request: Request):
 
     now_iso = datetime.now(timezone.utc).isoformat()
     commission_rate = pa_data[0].get("commission_rate", 0) or 0
+
+    # Override commission from product if specified
+    product_name = ""
+    if product_id:
+        try:
+            prod = sb.table("project_products").select("*").eq("id", product_id).execute()
+            if prod.data:
+                product_name = prod.data[0].get("name", "")
+                product_commission = prod.data[0].get("commission_pct")
+                if product_commission is not None and product_commission > 0:
+                    commission_rate = float(product_commission)
+                # Check for agent-specific override
+                if user_id and not is_admin:
+                    access = (
+                        sb.table("agent_product_access")
+                        .select("custom_commission_pct")
+                        .eq("agent_id", user_id)
+                        .eq("product_id", product_id)
+                        .execute()
+                    )
+                    if access.data and access.data[0].get("custom_commission_pct") is not None:
+                        commission_rate = float(access.data[0]["custom_commission_pct"])
+                if not description:
+                    description = product_name
+                if not amount or float(amount) == 0:
+                    default_price = prod.data[0].get("default_price", 0)
+                    if default_price:
+                        amount = default_price
+                        currency = prod.data[0].get("currency", currency)
+        except Exception as e:
+            logger.warning("product lookup failed: %s", e)
 
     if gateway_type == "whop":
         # ── Whop checkout flow ──────────────────────────────────
@@ -1095,3 +1166,107 @@ async def admin_set_payout_frequency(request: Request):
     ).eq("user_id", user_id).execute()
 
     return {"ok": True, "message": f"Payout frequency set to {frequency}"}
+
+
+# ── 10. Product Management ──────────────────────────────────────
+
+@router.get("/admin/products")
+async def admin_list_products(request: Request):
+    """List all products for a project."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    project_id = request.query_params.get("project_id")
+    if not project_id:
+        return JSONResponse({"ok": False, "error": "project_id required"}, 400)
+
+    products = (
+        sb.table("project_products")
+        .select("*")
+        .eq("project_id", project_id)
+        .order("sort_order")
+        .execute()
+    )
+    return {"ok": True, "data": products.data or []}
+
+
+@router.post("/admin/products")
+async def admin_create_product(request: Request):
+    """Create a product for a project."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    body = await request.json()
+    project_id = body.get("project_id")
+    name = body.get("name", "")
+    if not project_id or not name:
+        return JSONResponse({"ok": False, "error": "project_id and name required"}, 400)
+
+    row = {
+        "project_id": project_id,
+        "name": name,
+        "description": body.get("description", ""),
+        "default_price": body.get("default_price", 0),
+        "currency": body.get("currency", "USD"),
+        "commission_pct": body.get("commission_pct", 0),
+        "is_active": body.get("is_active", True),
+        "sort_order": body.get("sort_order", 0),
+    }
+    result = sb.table("project_products").insert(row).execute()
+    return {"ok": True, "data": result.data[0] if result.data else row}
+
+
+@router.put("/admin/products/{product_id}")
+async def admin_update_product(product_id: str, request: Request):
+    """Update a product."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    body = await request.json()
+    update = {}
+    for field in ["name", "description", "default_price", "currency", "commission_pct", "is_active", "sort_order"]:
+        if field in body:
+            update[field] = body[field]
+
+    if not update:
+        return JSONResponse({"ok": False, "error": "No fields to update"}, 400)
+
+    sb.table("project_products").update(update).eq("id", product_id).execute()
+    return {"ok": True, "message": "Product updated"}
+
+
+@router.delete("/admin/products/{product_id}")
+async def admin_delete_product(product_id: str, request: Request):
+    """Delete a product."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    sb.table("project_products").delete().eq("id", product_id).execute()
+    return {"ok": True, "message": "Product deleted"}
+
+
+@router.post("/admin/product-access")
+async def admin_set_product_access(request: Request):
+    """Assign/remove agent access to a product."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    body = await request.json()
+    agent_id = body.get("agent_id")
+    product_id = body.get("product_id")
+    action = body.get("action", "add")  # add or remove
+
+    if not agent_id or not product_id:
+        return JSONResponse({"ok": False, "error": "agent_id and product_id required"}, 400)
+
+    if action == "remove":
+        sb.table("agent_product_access").delete().eq("agent_id", agent_id).eq("product_id", product_id).execute()
+        return {"ok": True, "message": "Access removed"}
+
+    custom_pct = body.get("custom_commission_pct")
+    sb.table("agent_product_access").upsert({
+        "agent_id": agent_id,
+        "product_id": product_id,
+        "custom_commission_pct": custom_pct,
+    }, on_conflict="agent_id,product_id").execute()
+    return {"ok": True, "message": "Access granted"}
