@@ -812,15 +812,18 @@ async def admin_terminal_settings(request: Request):
     # All projects with gateways
     projects = sb.table("projects").select("id, name").execute()
 
-    # Count agents per project
-    agents_raw = (
-        sb.table("project_agents")
-        .select("*, projects(name)")
-        .execute()
-    )
+    # Get all agents from org_members (role=agent) + campaign_members for assignments
+    org_agents = sb.table("org_members").select("user_id, role").eq("role", "agent").execute()
+    agent_campaigns = sb.table("campaign_members").select("user_id, campaign_id, campaigns(name)").execute()
+
+    # Build agent-to-campaigns map
+    agent_campaign_map: dict[str, list[str]] = defaultdict(list)
+    for ac in agent_campaigns.data or []:
+        cname = (ac.get("campaigns") or {}).get("name", "")
+        if cname:
+            agent_campaign_map[ac["user_id"]].append(cname)
+
     agent_count_by_project: dict[str, int] = defaultdict(int)
-    for pa in agents_raw.data or []:
-        agent_count_by_project[pa["project_id"]] += 1
 
     # Commission tiers by project
     try:
@@ -856,18 +859,43 @@ async def admin_terminal_settings(request: Request):
             "agent_count": agent_count_by_project.get(pid, 0),
         })
 
-    # Agents list for the table
+    # Agents list — pull from org_members (role=agent) + auth emails
+    # Fetch auth user emails via Supabase Admin API
+    email_map: dict[str, str] = {}
+    name_map: dict[str, str] = {}
+    try:
+        import httpx as _httpx
+        auth_url = f"{os.getenv('SUPABASE_URL', '')}/auth/v1/admin/users?per_page=500"
+        auth_headers = {
+            "apikey": os.getenv("SUPABASE_KEY", ""),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_KEY', '')}",
+        }
+        with _httpx.Client(timeout=10) as hc:
+            auth_r = hc.get(auth_url, headers=auth_headers)
+            if auth_r.status_code == 200:
+                auth_data = auth_r.json()
+                for u in auth_data.get("users", []):
+                    email_map[u["id"]] = u.get("email", "")
+                    meta = u.get("user_metadata") or {}
+                    name_map[u["id"]] = meta.get("full_name", meta.get("name", ""))
+    except Exception as e:
+        logger.warning("Failed to fetch auth users: %s", e)
+
     agents_list = []
-    for pa in agents_raw.data or []:
+    for oa in org_agents.data or []:
+        uid = oa["user_id"]
+        campaigns = agent_campaign_map.get(uid, [])
+        email = email_map.get(uid, "")
+        name = name_map.get(uid, "") or email.split("@")[0] if email else uid[:12]
         agents_list.append({
-            "id": pa["user_id"],
-            "name": pa.get("agent_name", pa["user_id"]),
-            "email": pa.get("agent_email", ""),
-            "project_id": pa["project_id"],
-            "project_name": (pa.get("projects") or {}).get("name", ""),
-            "commission_pct": pa.get("commission_rate", 0),
+            "id": uid,
+            "name": name,
+            "email": email,
+            "project_id": "",
+            "project_name": ", ".join(campaigns[:2]) if campaigns else "Unassigned",
+            "commission_pct": 0,
             "sales_30d": 0,
-            "status": "active" if pa.get("enabled", True) else "inactive",
+            "status": "active",
         })
 
     return {
