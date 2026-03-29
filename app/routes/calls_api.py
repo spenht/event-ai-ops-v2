@@ -581,21 +581,23 @@ async def reorder_queue(request: Request, body: ReorderRequest):
 async def list_records(
     request: Request,
     campaign_id: str,
+    user_id: str = "",
     limit: int = 50,
     offset: int = 0,
 ):
-    """List call records (history) for a campaign."""
+    """List call records (history) for a campaign, optionally filtered by agent."""
     _validate_auth(request, campaign_id)
 
     try:
-        r = (
+        q = (
             sb.table("call_records")
             .select("*")
             .eq("campaign_id", campaign_id)
             .order("created_at", desc=True)
-            .range(offset, offset + limit - 1)
-            .execute()
         )
+        if user_id:
+            q = q.eq("user_id", user_id)
+        r = q.range(offset, offset + limit - 1).execute()
         return {"data": r.data or [], "count": len(r.data or [])}
     except Exception as exc:
         logger.error("list_records_failed err=%s", str(exc)[:300])
