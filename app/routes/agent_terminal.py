@@ -228,12 +228,15 @@ async def create_terminal_charge(request: Request):
 
     # Override commission from product if specified
     product_name = ""
+    product_stripe_price_id = ""
+    product_whop_plan_id = ""
     if product_id:
         try:
             prod = sb.table("project_products").select("*").eq("id", product_id).execute()
             if prod.data:
-                product_name = prod.data[0].get("name", "")
-                product_commission = prod.data[0].get("commission_pct")
+                prow = prod.data[0]
+                product_name = prow.get("name", "")
+                product_commission = prow.get("commission_pct")
                 if product_commission is not None and product_commission > 0:
                     commission_rate = float(product_commission)
                 # Check for agent-specific override
@@ -250,10 +253,16 @@ async def create_terminal_charge(request: Request):
                 if not description:
                     description = product_name
                 if not amount or float(amount) == 0:
-                    default_price = prod.data[0].get("default_price", 0)
+                    default_price = prow.get("default_price", 0)
                     if default_price:
                         amount = default_price
-                        currency = prod.data[0].get("currency", currency)
+                        currency = prow.get("currency", currency)
+                # Get Stripe/Whop IDs for this gateway
+                gw_key = gateway.get("gateway_key", "")
+                stripe_price_ids = prow.get("stripe_price_ids") or {}
+                if isinstance(stripe_price_ids, dict):
+                    product_stripe_price_id = stripe_price_ids.get(gw_key, "")
+                product_whop_plan_id = prow.get("whop_plan_id", "") or ""
         except Exception as e:
             logger.warning("product lookup failed: %s", e)
 
@@ -333,21 +342,28 @@ async def create_terminal_charge(request: Request):
         }
 
     # ── Stripe checkout flow (default) ──────────────────────────
+    # ── Stripe checkout flow (default) ──────────────────────────
     async with httpx.AsyncClient() as client:
+        stripe_data: dict[str, str | None] = {
+            "amount": str(int(float(amount) * 100)),
+            "currency": currency.lower(),
+            "description": description or f"Sale by agent {user_id} - {customer_name}",
+            "receipt_email": customer_email or None,
+            "metadata[agent_id]": user_id,
+            "metadata[project_id]": project_id,
+            "metadata[gateway_id]": gateway_id,
+            "metadata[source]": "agent_terminal",
+            "automatic_payment_methods[enabled]": "true",
+        }
+        if product_id:
+            stripe_data["metadata[product_id]"] = product_id
+        if product_name:
+            stripe_data["metadata[product_name]"] = product_name
+
         r = await client.post(
             "https://api.stripe.com/v1/payment_intents",
             auth=(api_key, ""),
-            data={
-                "amount": int(float(amount) * 100),
-                "currency": currency.lower(),
-                "description": description or f"Sale by agent {user_id} - {customer_name}",
-                "receipt_email": customer_email or None,
-                "metadata[agent_id]": user_id,
-                "metadata[project_id]": project_id,
-                "metadata[gateway_id]": gateway_id,
-                "metadata[source]": "agent_terminal",
-                "automatic_payment_methods[enabled]": "true",
-            },
+            data=stripe_data,
         )
         if r.status_code != 200:
             logger.error("Stripe error: %s", r.text[:300])
@@ -369,9 +385,12 @@ async def create_terminal_charge(request: Request):
         "metadata": {
             "agent_id": user_id,
             "gateway_id": gateway_id,
+            "gateway_key": gateway.get("gateway_key", ""),
             "customer_email": customer_email,
             "source": "agent_terminal",
             "payment_intent_id": pi["id"],
+            "product_id": product_id or "",
+            "product_name": product_name or "",
         },
     }
     sb.table("financial_transactions").upsert(txn, on_conflict="external_id,source").execute()
@@ -1192,7 +1211,7 @@ async def admin_list_products(request: Request):
 
 @router.post("/admin/products")
 async def admin_create_product(request: Request):
-    """Create a product for a project."""
+    """Create a product and sync to Stripe/Whop."""
     if not _check_admin(request):
         return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
 
@@ -1202,18 +1221,116 @@ async def admin_create_product(request: Request):
     if not project_id or not name:
         return JSONResponse({"ok": False, "error": "project_id and name required"}, 400)
 
+    default_price = body.get("default_price", 0)
+    currency = body.get("currency", "USD").lower()
+    description = body.get("description", "")
+
+    # Get enabled gateways for this project
+    gateways = (
+        sb.table("project_payment_gateways")
+        .select("*")
+        .eq("project_id", project_id)
+        .eq("enabled", True)
+        .execute()
+    )
+
+    stripe_product_ids: dict[str, str] = {}
+    stripe_price_ids: dict[str, str] = {}
+    whop_plan_id = None
+    sync_errors: list[str] = []
+
+    async with httpx.AsyncClient() as client:
+        for gw in gateways.data or []:
+            gw_type = gw.get("gateway_type", "stripe")
+            gw_key_name = gw.get("gateway_key", "")
+            api_key = _gateway_key_for(gw_key_name)
+            if not api_key:
+                continue
+
+            if gw_type == "stripe":
+                try:
+                    # Create Stripe Product
+                    prod_r = await client.post(
+                        "https://api.stripe.com/v1/products",
+                        auth=(api_key, ""),
+                        data={
+                            "name": name,
+                            "description": description or name,
+                            "metadata[project_id]": project_id,
+                            "metadata[source]": "agent_terminal",
+                        },
+                    )
+                    if prod_r.status_code == 200:
+                        sp_id = prod_r.json()["id"]
+                        stripe_product_ids[gw_key_name] = sp_id
+
+                        # Create Stripe Price (if default_price > 0)
+                        if default_price and float(default_price) > 0:
+                            price_r = await client.post(
+                                "https://api.stripe.com/v1/prices",
+                                auth=(api_key, ""),
+                                data={
+                                    "product": sp_id,
+                                    "unit_amount": int(float(default_price) * 100),
+                                    "currency": currency,
+                                },
+                            )
+                            if price_r.status_code == 200:
+                                stripe_price_ids[gw_key_name] = price_r.json()["id"]
+                    else:
+                        sync_errors.append(f"Stripe {gw_key_name}: {prod_r.text[:100]}")
+                except Exception as e:
+                    sync_errors.append(f"Stripe {gw_key_name}: {e}")
+
+            elif gw_type == "whop" and not whop_plan_id:
+                try:
+                    # Create Whop plan via checkout configuration (one-time)
+                    r = await client.post(
+                        "https://api.whop.com/api/v1/checkout_configurations",
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "plan": {
+                                "company_id": WHOP_COMPANY_ID,
+                                "currency": currency,
+                                "initial_price": float(default_price) if default_price else 0,
+                                "plan_type": "one_time",
+                            },
+                            "metadata": {
+                                "product_name": name,
+                                "project_id": project_id,
+                                "source": "agent_terminal",
+                            },
+                        },
+                    )
+                    if r.status_code < 400:
+                        checkout = r.json().get("data", r.json())
+                        whop_plan_id = checkout.get("id", "")
+                    else:
+                        sync_errors.append(f"Whop: {r.text[:100]}")
+                except Exception as e:
+                    sync_errors.append(f"Whop: {e}")
+
     row = {
         "project_id": project_id,
         "name": name,
-        "description": body.get("description", ""),
-        "default_price": body.get("default_price", 0),
-        "currency": body.get("currency", "USD"),
+        "description": description,
+        "default_price": default_price,
+        "currency": currency.upper(),
         "commission_pct": body.get("commission_pct", 0),
         "is_active": body.get("is_active", True),
         "sort_order": body.get("sort_order", 0),
+        "stripe_product_ids": stripe_product_ids,
+        "stripe_price_ids": stripe_price_ids,
+        "whop_plan_id": whop_plan_id,
     }
     result = sb.table("project_products").insert(row).execute()
-    return {"ok": True, "data": result.data[0] if result.data else row}
+
+    data = result.data[0] if result.data else row
+    data["sync_errors"] = sync_errors
+    return {"ok": True, "data": data}
 
 
 @router.put("/admin/products/{product_id}")
