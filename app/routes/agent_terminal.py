@@ -146,16 +146,22 @@ async def create_terminal_charge(request: Request):
     if not project_id or not amount or not gateway_id:
         raise HTTPException(status_code=400, detail="project_id, amount, and gateway_id are required")
 
-    # 1. Verify agent is assigned to this project
-    pa = (
-        sb.table("project_agents")
-        .select("*")
-        .eq("project_id", project_id)
-        .eq("user_id", user_id)
-        .execute()
-    )
-    if not pa.data:
-        raise HTTPException(status_code=403, detail="Agent not assigned to this project")
+    # 1. Verify agent is assigned to this project (admins bypass)
+    is_admin = bool(request.headers.get("x-spartans-key"))
+    pa_data: list[dict] = []
+    if not is_admin:
+        pa = (
+            sb.table("project_agents")
+            .select("*")
+            .eq("project_id", project_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        if not pa.data:
+            raise HTTPException(status_code=403, detail="Agent not assigned to this project")
+        pa_data = pa.data
+    else:
+        pa_data = [{"commission_rate": 0}]
 
     # 2. Get the payment gateway config
     gw = (
@@ -178,7 +184,7 @@ async def create_terminal_charge(request: Request):
         )
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    commission_rate = pa.data[0].get("commission_rate", 0) or 0
+    commission_rate = pa_data[0].get("commission_rate", 0) or 0
 
     if gateway_type == "whop":
         # ── Whop checkout flow ──────────────────────────────────
@@ -466,18 +472,20 @@ async def create_payment_link(request: Request):
     if not project_id or not gateway_id or not amount:
         return JSONResponse({"ok": False, "error": "project_id, gateway_id, and amount are required"}, 400)
 
-    # Verify agent is assigned to this project
-    pa = (
-        sb.table("project_agents")
-        .select("*")
-        .eq("project_id", project_id)
-        .eq("user_id", user_id)
-        .execute()
-    )
-    if not pa.data:
-        return JSONResponse({"ok": False, "error": "Agent not assigned to this project"}, 403)
+    # Verify agent is assigned to this project (admins bypass)
+    is_admin = bool(request.headers.get("x-spartans-key"))
+    if not is_admin:
+        pa = (
+            sb.table("project_agents")
+            .select("*")
+            .eq("project_id", project_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        if not pa.data:
+            return JSONResponse({"ok": False, "error": "Agent not assigned to this project"}, 403)
 
-    # Get the gateway's Stripe key
+    # Get the gateway config
     gw = (
         sb.table("project_payment_gateways")
         .select("*")
