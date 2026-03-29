@@ -1,4 +1,4 @@
-"""Agent Payment Terminal — lets agents create charges from their dashboard."""
+"""Agent Payment Terminal — lets agents create charges + commission payouts."""
 from __future__ import annotations
 
 import logging
@@ -978,3 +978,120 @@ async def admin_set_commission_tiers(request: Request):
         "message": f"Set {len(rows)} commission tiers for project {project_id}",
         "data": rows,
     }
+
+
+# ── 8. Agent Connect Onboarding ───────────────────────────────
+@router.post("/connect-account")
+async def agent_connect_account(request: Request):
+    """Create/resume Stripe Express onboarding for an agent."""
+    from ..services.agent_payouts import create_agent_connect_account
+
+    user_id = request.headers.get("x-user-id")
+    if not user_id:
+        return JSONResponse({"ok": False, "error": "Missing x-user-id"}, 401)
+
+    body = await request.json()
+    email = body.get("email", "")
+    name = body.get("name", "")
+    country = body.get("country", "US")
+
+    if not email:
+        return JSONResponse({"ok": False, "error": "email is required"}, 400)
+
+    try:
+        result = create_agent_connect_account(
+            user_id=user_id, email=email, name=name, country=country,
+        )
+        return {"ok": True, "data": result}
+    except Exception as e:
+        logger.error("Connect account creation failed: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, 500)
+
+
+@router.get("/connect-status")
+async def agent_connect_status(request: Request):
+    """Check agent's Stripe Connect onboarding status."""
+    from ..services.agent_payouts import get_agent_connect_status
+
+    user_id = request.headers.get("x-user-id")
+    if not user_id:
+        return JSONResponse({"ok": False, "error": "Missing x-user-id"}, 401)
+
+    result = get_agent_connect_status(user_id)
+    return {"ok": True, "data": result}
+
+
+@router.get("/payout-history")
+async def agent_payout_history(request: Request):
+    """Return agent's payout history."""
+    from ..services.agent_payouts import get_agent_payout_history
+
+    user_id = request.headers.get("x-user-id")
+    if not user_id:
+        return JSONResponse({"ok": False, "error": "Missing x-user-id"}, 401)
+
+    history = get_agent_payout_history(user_id)
+    return {"ok": True, "data": history}
+
+
+# ── 9. Admin Payout Management ───────────────────────────────
+@router.get("/admin/pending-payouts")
+async def admin_pending_payouts(request: Request):
+    """Preview pending payouts without executing them."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    from ..services.agent_payouts import calculate_pending_payouts
+
+    batches = calculate_pending_payouts(force=True)
+    summary = [
+        {
+            "agent_id": b["agent_id"],
+            "source": b["source_stripe_account"],
+            "amount": round(b["total_amount"], 2),
+            "commission_count": len(b["commissions"]),
+            "currency": b.get("currency", "USD"),
+        }
+        for b in batches
+    ]
+    return {"ok": True, "data": summary, "total_batches": len(batches)}
+
+
+@router.post("/admin/run-payouts")
+async def admin_run_payouts(request: Request):
+    """Execute all pending commission payouts."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    from ..services.agent_payouts import execute_all_payouts
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    force = body.get("force", False)
+
+    result = execute_all_payouts(force=force)
+    return {"ok": True, "data": result}
+
+
+@router.put("/admin/payout-frequency")
+async def admin_set_payout_frequency(request: Request):
+    """Set payout frequency for an agent (daily/weekly/biweekly/monthly/manual)."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    body = await request.json()
+    user_id = body.get("user_id")
+    frequency = body.get("frequency")
+
+    valid = {"daily", "weekly", "biweekly", "monthly", "manual"}
+    if not user_id or frequency not in valid:
+        return JSONResponse({"ok": False, "error": f"user_id required, frequency must be one of {valid}"}, 400)
+
+    sb.table("agent_payout_profiles").update(
+        {"payout_frequency": frequency}
+    ).eq("user_id", user_id).execute()
+
+    return {"ok": True, "message": f"Payout frequency set to {frequency}"}
