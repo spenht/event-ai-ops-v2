@@ -1077,6 +1077,7 @@ async def admin_set_commission_tiers(request: Request):
             "max_sales": body.get("max_sales"),
             "commission_pct": body.get("commission_pct", 0),
             "sort_order": body.get("sort_order", 0),
+            "tier_mode": body.get("tier_mode", "flat"),
         }
         result = sb.table("project_commission_tiers").insert(row).execute()
         return {"ok": True, "data": result.data[0] if result.data else row}
@@ -1086,7 +1087,7 @@ async def admin_set_commission_tiers(request: Request):
         if not tier_id:
             return JSONResponse({"ok": False, "error": "tier_id required for update"}, 400)
         update = {}
-        for f in ["min_sales", "max_sales", "commission_pct", "sort_order"]:
+        for f in ["min_sales", "max_sales", "commission_pct", "sort_order", "tier_mode"]:
             if f in body:
                 update[f] = body[f]
         sb.table("project_commission_tiers").update(update).eq("id", tier_id).execute()
