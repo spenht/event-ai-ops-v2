@@ -18,22 +18,26 @@ logger = logging.getLogger("agent_terminal")
 router = APIRouter(prefix="/v1/agent-terminal", tags=["agent-terminal"])
 
 
-# ── Stripe key lookup ────────────────────────────────────────────
-_STRIPE_KEY_MAP = {
+# ── Gateway key lookup ────────────────────────────────────────────
+_GATEWAY_KEY_MAP = {
     "stripe_lba": "STRIPE_KEY_LBA",
     "stripe_uvul": "STRIPE_KEY_UVUL",
     "stripe_oll": "STRIPE_KEY_OLL",
     "stripe_2clicks": "STRIPE_KEY_2CLICKS",
-    # Also support short keys (gateway_key values from DB)
+    # Short keys (gateway_key values from DB)
     "lba": "STRIPE_KEY_LBA",
     "uvul": "STRIPE_KEY_UVUL",
     "oll": "STRIPE_KEY_OLL",
     "2clicks": "STRIPE_KEY_2CLICKS",
+    # Whop
+    "whop": "WHOP_API_KEY",
 }
 
+WHOP_COMPANY_ID = "biz_y0O8hypYRi8ZVv"
 
-def _stripe_key_for(gateway_key: str) -> str:
-    env_var = _STRIPE_KEY_MAP.get(gateway_key, "")
+
+def _gateway_key_for(gateway_key: str) -> str:
+    env_var = _GATEWAY_KEY_MAP.get(gateway_key, "")
     return os.getenv(env_var, "") if env_var else ""
 
 
@@ -165,18 +169,97 @@ async def create_terminal_charge(request: Request):
         raise HTTPException(status_code=404, detail="Payment gateway not found")
 
     gateway = gw.data[0]
-    stripe_key = _stripe_key_for(gateway.get("gateway_key", ""))
-    if not stripe_key:
+    gateway_type = gateway.get("gateway_type", "stripe")
+    api_key = _gateway_key_for(gateway.get("gateway_key", ""))
+    if not api_key:
         raise HTTPException(
             status_code=400,
-            detail=f"No Stripe key configured for gateway: {gateway.get('gateway_key')}",
+            detail=f"No API key configured for gateway: {gateway.get('gateway_key')}",
         )
 
-    # 3. Create Stripe PaymentIntent
+    now_iso = datetime.now(timezone.utc).isoformat()
+    commission_rate = pa.data[0].get("commission_rate", 0) or 0
+
+    if gateway_type == "whop":
+        # ── Whop checkout flow ──────────────────────────────────
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "https://api.whop.com/api/v1/checkout_configurations",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "plan": {
+                        "company_id": WHOP_COMPANY_ID,
+                        "currency": currency.lower(),
+                        "initial_price": float(amount),
+                        "plan_type": "one_time",
+                    },
+                    "metadata": {
+                        "agent_id": user_id,
+                        "project_id": project_id,
+                        "customer_email": customer_email,
+                        "customer_name": customer_name,
+                        "source": "agent_terminal",
+                    },
+                    "redirect_url": "https://legacybusinessacademy.com/gracias",
+                },
+            )
+            if r.status_code >= 400:
+                logger.error("Whop error: %s", r.text[:300])
+                raise HTTPException(status_code=400, detail=f"Whop error: {r.text[:200]}")
+            checkout = r.json().get("data", r.json())
+
+        checkout_url = checkout.get("purchase_url", "")
+        checkout_id = checkout.get("id", "")
+
+        # Record in financial_transactions
+        txn = {
+            "external_id": f"whop_{checkout_id}",
+            "source": "whop",
+            "type": "sale",
+            "amount": float(amount),
+            "currency": currency.upper(),
+            "txn_date": now_iso,
+            "description": description or f"Whop checkout - {customer_name}",
+            "counterparty": customer_name or customer_email,
+            "project_id": project_id,
+            "auto_assigned": True,
+            "metadata": {
+                "agent_id": user_id,
+                "gateway_id": gateway_id,
+                "customer_email": customer_email,
+                "checkout_url": checkout_url,
+                "checkout_id": checkout_id,
+                "status": "pending",
+                "source": "agent_terminal",
+            },
+        }
+        sb.table("financial_transactions").upsert(txn, on_conflict="external_id,source").execute()
+
+        # Commission
+        commission_amount = 0.0
+        if commission_rate > 0:
+            commission_amount = round(float(amount) * (commission_rate / 100), 2)
+
+        return {
+            "ok": True,
+            "data": {
+                "gateway_type": "whop",
+                "checkout_url": checkout_url,
+                "checkout_id": checkout_id,
+                "amount": float(amount),
+                "currency": currency,
+                "commission": {"rate": commission_rate, "amount": commission_amount},
+            },
+        }
+
+    # ── Stripe checkout flow (default) ──────────────────────────
     async with httpx.AsyncClient() as client:
         r = await client.post(
             "https://api.stripe.com/v1/payment_intents",
-            auth=(stripe_key, ""),
+            auth=(api_key, ""),
             data={
                 "amount": int(float(amount) * 100),
                 "currency": currency.lower(),
@@ -194,8 +277,7 @@ async def create_terminal_charge(request: Request):
             raise HTTPException(status_code=400, detail=f"Stripe error: {r.text[:200]}")
         pi = r.json()
 
-    # 4. Record in financial_transactions
-    now_iso = datetime.now(timezone.utc).isoformat()
+    # Record in financial_transactions
     txn = {
         "external_id": pi["id"],
         "source": gateway.get("gateway_key", "agent_terminal"),
@@ -217,8 +299,7 @@ async def create_terminal_charge(request: Request):
     }
     sb.table("financial_transactions").upsert(txn, on_conflict="external_id,source").execute()
 
-    # 5. Calculate and record commission
-    commission_rate = pa.data[0].get("commission_rate", 0) or 0
+    # Commission
     commission_amount = 0.0
     if commission_rate > 0:
         commission_amount = round(float(amount) * (commission_rate / 100), 2)
@@ -239,6 +320,7 @@ async def create_terminal_charge(request: Request):
     return {
         "ok": True,
         "data": {
+            "gateway_type": "stripe",
             "payment_intent_id": pi["id"],
             "client_secret": pi["client_secret"],
             "amount": float(amount),
@@ -407,23 +489,92 @@ async def create_payment_link(request: Request):
         return JSONResponse({"ok": False, "error": "Gateway not found"}, 404)
 
     gateway = gw.data[0]
-    stripe_key = _stripe_key_for(gateway.get("gateway_key", ""))
-    if not stripe_key:
-        return JSONResponse({"ok": False, "error": f"Stripe key not configured for gateway: {gateway.get('gateway_key')}"}, 400)
+    gateway_type = gateway.get("gateway_type", "stripe")
+    api_key = _gateway_key_for(gateway.get("gateway_key", ""))
+    if not api_key:
+        return JSONResponse({"ok": False, "error": f"API key not configured for gateway: {gateway.get('gateway_key')}"}, 400)
 
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # ── Whop payment link ─────────────────────────────────────
+    if gateway_type == "whop":
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "https://api.whop.com/api/v1/checkout_configurations",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "plan": {
+                        "company_id": WHOP_COMPANY_ID,
+                        "currency": currency,
+                        "initial_price": float(amount),
+                        "plan_type": "one_time",
+                    },
+                    "metadata": {
+                        "agent_id": user_id,
+                        "project_id": project_id,
+                        "customer_email": customer_email,
+                        "customer_name": customer_name,
+                        "description": description,
+                        "source": "agent_terminal_link",
+                    },
+                    "redirect_url": "https://legacybusinessacademy.com/gracias",
+                },
+            )
+            if r.status_code >= 400:
+                logger.error("Whop payment link error: %s", r.text[:300])
+                return JSONResponse({"ok": False, "error": f"Whop error: {r.text[:200]}"}, 400)
+
+            checkout = r.json().get("data", r.json())
+            checkout_url = checkout.get("purchase_url", "")
+            checkout_id = checkout.get("id", "")
+
+        sb.table("financial_transactions").insert({
+            "external_id": f"pl_whop_{checkout_id}",
+            "source": "whop",
+            "type": "sale",
+            "amount": float(amount),
+            "currency": currency.upper(),
+            "txn_date": now_iso,
+            "description": f"Payment Link: {description}",
+            "counterparty": customer_name or customer_email,
+            "project_id": project_id,
+            "metadata": {
+                "agent_id": user_id,
+                "payment_link_url": checkout_url,
+                "checkout_id": checkout_id,
+                "status": "pending",
+                "customer_email": customer_email,
+                "customer_name": customer_name,
+                "source": "agent_terminal_link",
+            },
+        }).execute()
+
+        return {
+            "ok": True,
+            "data": {
+                "gateway_type": "whop",
+                "payment_link_url": checkout_url,
+                "payment_link_id": checkout_id,
+                "amount": float(amount),
+                "currency": currency.upper(),
+            },
+        }
+
+    # ── Stripe payment link (default) ─────────────────────────
     async with httpx.AsyncClient() as client:
-        # Create a Stripe Product
         prod_r = await client.post(
             "https://api.stripe.com/v1/products",
             data={"name": description},
-            auth=(stripe_key, ""),
+            auth=(api_key, ""),
         )
         if prod_r.status_code != 200:
             logger.error("Stripe product creation error: %s", prod_r.text[:300])
             return JSONResponse({"ok": False, "error": "Failed to create Stripe product"}, 400)
         product_id = prod_r.json()["id"]
 
-        # Create a Price
         price_r = await client.post(
             "https://api.stripe.com/v1/prices",
             data={
@@ -431,14 +582,13 @@ async def create_payment_link(request: Request):
                 "unit_amount": int(float(amount) * 100),
                 "currency": currency,
             },
-            auth=(stripe_key, ""),
+            auth=(api_key, ""),
         )
         if price_r.status_code != 200:
             logger.error("Stripe price creation error: %s", price_r.text[:300])
             return JSONResponse({"ok": False, "error": "Failed to create Stripe price"}, 400)
         price_id = price_r.json()["id"]
 
-        # Create Payment Link
         link_data = {
             "line_items[0][price]": price_id,
             "line_items[0][quantity]": 1,
@@ -456,7 +606,7 @@ async def create_payment_link(request: Request):
         link_r = await client.post(
             "https://api.stripe.com/v1/payment_links",
             data=link_data,
-            auth=(stripe_key, ""),
+            auth=(api_key, ""),
         )
 
         if link_r.status_code != 200:
@@ -466,8 +616,6 @@ async def create_payment_link(request: Request):
 
         link = link_r.json()
 
-        # Save the payment link record
-        now_iso = datetime.now(timezone.utc).isoformat()
         sb.table("financial_transactions").insert({
             "external_id": f"pl_{link['id']}",
             "source": gateway.get("gateway_key", "agent_terminal"),
@@ -492,6 +640,7 @@ async def create_payment_link(request: Request):
         return {
             "ok": True,
             "data": {
+                "gateway_type": "stripe",
                 "payment_link_url": link["url"],
                 "payment_link_id": link["id"],
                 "amount": float(amount),
