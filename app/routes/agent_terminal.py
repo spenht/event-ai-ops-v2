@@ -824,7 +824,7 @@ async def admin_terminal_settings(request: Request):
 
     # Commission tiers by project
     try:
-        tiers = sb.table("commission_tiers").select("*").execute()
+        tiers = sb.table("project_commission_tiers").select("*").execute()
         tier_projects = {t["project_id"] for t in (tiers.data or [])}
     except Exception:
         tiers = type("X", (), {"data": []})()
@@ -1034,40 +1034,91 @@ async def admin_all_sales(request: Request):
     }
 
 
+@router.get("/admin/commission-tiers")
+async def admin_get_commission_tiers(request: Request):
+    """Get commission tiers for a project."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    project_id = request.query_params.get("project_id")
+    if not project_id:
+        return JSONResponse({"ok": False, "error": "project_id required"}, 400)
+
+    try:
+        tiers = (
+            sb.table("project_commission_tiers")
+            .select("*")
+            .eq("project_id", project_id)
+            .order("sort_order")
+            .execute()
+        )
+        return {"ok": True, "data": tiers.data or []}
+    except Exception:
+        return {"ok": True, "data": []}
+
+
 @router.post("/admin/commission-tiers")
 async def admin_set_commission_tiers(request: Request):
-    """Create/update commission tiers for a project."""
+    """Create/update/delete commission tiers for a project."""
     if not _check_admin(request):
         return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
 
     body = await request.json()
     project_id = body.get("project_id")
-    tiers = body.get("tiers", [])
+    action = body.get("action", "bulk")  # create, update, delete, or bulk
 
     if not project_id:
         return JSONResponse({"ok": False, "error": "project_id is required"}, 400)
-    if not tiers:
-        return JSONResponse({"ok": False, "error": "tiers array is required"}, 400)
 
-    # Delete existing tiers for this project
-    sb.table("commission_tiers").delete().eq("project_id", project_id).execute()
-
-    # Insert new tiers
-    rows = []
-    for tier in tiers:
-        rows.append({
+    if action == "create":
+        row = {
             "project_id": project_id,
-            "min_sales": tier.get("min_sales", 0),
-            "max_sales": tier.get("max_sales"),
-            "rate": tier["rate"],
-        })
-    sb.table("commission_tiers").insert(rows).execute()
+            "min_sales": body.get("min_sales", 0),
+            "max_sales": body.get("max_sales"),
+            "commission_pct": body.get("commission_pct", 0),
+            "sort_order": body.get("sort_order", 0),
+        }
+        result = sb.table("project_commission_tiers").insert(row).execute()
+        return {"ok": True, "data": result.data[0] if result.data else row}
 
-    return {
-        "ok": True,
-        "message": f"Set {len(rows)} commission tiers for project {project_id}",
-        "data": rows,
-    }
+    elif action == "update":
+        tier_id = body.get("tier_id")
+        if not tier_id:
+            return JSONResponse({"ok": False, "error": "tier_id required for update"}, 400)
+        update = {}
+        for f in ["min_sales", "max_sales", "commission_pct", "sort_order"]:
+            if f in body:
+                update[f] = body[f]
+        sb.table("project_commission_tiers").update(update).eq("id", tier_id).execute()
+        return {"ok": True, "message": "Tier updated"}
+
+    elif action == "delete":
+        tier_id = body.get("tier_id")
+        if not tier_id:
+            return JSONResponse({"ok": False, "error": "tier_id required for delete"}, 400)
+        sb.table("project_commission_tiers").delete().eq("id", tier_id).execute()
+        return {"ok": True, "message": "Tier deleted"}
+
+    else:
+        # Bulk replace
+        tiers = body.get("tiers", [])
+        if not tiers:
+            return JSONResponse({"ok": False, "error": "tiers array required"}, 400)
+        try:
+            sb.table("project_commission_tiers").delete().eq("project_id", project_id).execute()
+        except Exception:
+            pass
+        rows = []
+        for i, tier in enumerate(tiers):
+            rows.append({
+                "project_id": project_id,
+                "min_sales": tier.get("min_sales", 0),
+                "max_sales": tier.get("max_sales"),
+                "commission_pct": tier.get("rate", tier.get("commission_pct", 0)),
+                "sort_order": i,
+            })
+        sb.table("project_commission_tiers").insert(rows).execute()
+        return {"ok": True, "message": f"Set {len(rows)} tiers", "data": rows}
 
 
 # ── 8. Agent Connect Onboarding ───────────────────────────────
