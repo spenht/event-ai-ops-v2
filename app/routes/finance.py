@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -2108,3 +2109,286 @@ async def get_unassigned_count(request: Request):
     _require_super_admin(request)
     r = sb.table("financial_transactions").select("id", count="exact").is_("project_id", "null").execute()
     return {"ok": True, "count": r.count or 0}
+
+
+# ─── AI Financial Advisor ─────────────────────────────────────────────────
+
+
+@router.get("/advisor/analyze")
+async def financial_advisor_analyze(request: Request, days: int = Query(30)):
+    """Analyze financial data and return actionable insights & recommendations."""
+    _require_super_admin(request)
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    prev_cutoff = (datetime.now(timezone.utc) - timedelta(days=days * 2)).isoformat()
+
+    # Current period transactions
+    current = sb.table("financial_transactions").select("*").gte("txn_date", cutoff).execute()
+    # Previous period for comparison
+    previous = (
+        sb.table("financial_transactions")
+        .select("amount,currency,type")
+        .gte("txn_date", prev_cutoff)
+        .lt("txn_date", cutoff)
+        .execute()
+    )
+
+    txns = current.data or []
+    prev_txns = previous.data or []
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    revenue = sum(float(t["amount"]) for t in txns if t.get("type") in ("sale", "income") and t.get("currency") == "USD")
+    expenses = sum(abs(float(t["amount"])) for t in txns if t.get("type") == "expense" and t.get("currency") == "USD")
+    prev_revenue = sum(float(t["amount"]) for t in prev_txns if t.get("type") in ("sale", "income") and t.get("currency") == "USD")
+
+    # ── Recurring / ant expenses ──────────────────────────────────────────
+    expense_txns = [t for t in txns if t.get("type") == "expense"]
+    counterparty_totals: dict = defaultdict(lambda: {"count": 0, "total": 0.0, "amounts": []})
+    for t in expense_txns:
+        cp = t.get("counterparty") or t.get("description", "Unknown")
+        counterparty_totals[cp]["count"] += 1
+        counterparty_totals[cp]["total"] += abs(float(t["amount"]))
+        counterparty_totals[cp]["amounts"].append(abs(float(t["amount"])))
+
+    recurring = [
+        {
+            "name": cp,
+            "total": round(d["total"], 2),
+            "count": d["count"],
+            "avg_amount": round(d["total"] / d["count"], 2),
+        }
+        for cp, d in counterparty_totals.items()
+        if d["count"] >= 2
+    ]
+    recurring.sort(key=lambda x: x["total"], reverse=True)
+
+    # ── Anomalies (transactions > 3x the median expense) ─────────────────
+    anomalies = []
+    if expense_txns:
+        amounts = sorted(abs(float(t["amount"])) for t in expense_txns)
+        median_amt = amounts[len(amounts) // 2] if amounts else 0
+        threshold = max(median_amt * 3, 1000)
+        for t in expense_txns:
+            if abs(float(t["amount"])) > threshold:
+                anomalies.append({
+                    "description": t.get("description", ""),
+                    "counterparty": t.get("counterparty", ""),
+                    "amount": abs(float(t["amount"])),
+                    "date": t.get("txn_date", ""),
+                })
+        anomalies.sort(key=lambda x: x["amount"], reverse=True)
+
+    # ── Profitability per project ─────────────────────────────────────────
+    project_stats: dict = defaultdict(lambda: {"revenue": 0.0, "expenses": 0.0})
+    for t in txns:
+        pid = t.get("project_id")
+        if not pid:
+            continue
+        amt = float(t["amount"])
+        if t.get("type") in ("sale", "income"):
+            project_stats[pid]["revenue"] += amt
+        elif t.get("type") == "expense":
+            project_stats[pid]["expenses"] += abs(amt)
+
+    project_profitability = []
+    for pid, s in project_stats.items():
+        margin = ((s["revenue"] - s["expenses"]) / s["revenue"] * 100) if s["revenue"] > 0 else 0
+        project_profitability.append({
+            "project_id": pid,
+            "revenue": round(s["revenue"], 2),
+            "expenses": round(s["expenses"], 2),
+            "profit": round(s["revenue"] - s["expenses"], 2),
+            "margin_pct": round(margin, 1),
+        })
+    project_profitability.sort(key=lambda x: x["profit"], reverse=True)
+
+    # ── Unassigned count ──────────────────────────────────────────────────
+    unassigned = sb.table("financial_transactions").select("id", count="exact").is_("project_id", "null").execute()
+    unassigned_count = unassigned.count or 0
+
+    # ── Build insights ────────────────────────────────────────────────────
+    insights = []
+
+    if recurring:
+        total_recurring = sum(r["total"] for r in recurring[:20])
+        insights.append({
+            "type": "ant_expense",
+            "severity": "warning",
+            "title": f"{len(recurring)} recurring expenses detected (${total_recurring:,.0f} in {days}d)",
+            "description": "Review if all recurring payments are still needed.",
+            "items": recurring[:10],
+        })
+
+    if prev_revenue > 0:
+        growth = ((revenue - prev_revenue) / prev_revenue) * 100
+        insights.append({
+            "type": "revenue_trend",
+            "severity": "positive" if growth > 0 else "negative",
+            "title": f"Revenue {'up' if growth > 0 else 'down'} {abs(growth):.0f}% vs previous period",
+            "description": f"Revenue went from ${prev_revenue:,.0f} to ${revenue:,.0f}.",
+        })
+
+    if unassigned_count > 100:
+        insights.append({
+            "type": "unassigned",
+            "severity": "warning",
+            "title": f"{unassigned_count:,} transactions without project",
+            "description": "Assign these to projects for complete profitability analysis.",
+        })
+
+    top_expenses = sorted(recurring, key=lambda x: x["total"], reverse=True)[:5]
+    if top_expenses:
+        top = top_expenses[0]
+        insights.append({
+            "type": "top_expense",
+            "severity": "info",
+            "title": f"\"{top['name']}\" is your largest recurring expense (${top['total']:,.0f})",
+            "description": f"This expense occurred {top['count']} times in the last {days} days.",
+        })
+
+    if anomalies:
+        insights.append({
+            "type": "anomaly",
+            "severity": "warning",
+            "title": f"{len(anomalies)} unusually large expenses detected",
+            "description": "These transactions are significantly above your median expense.",
+            "items": anomalies[:5],
+        })
+
+    if project_profitability:
+        best = project_profitability[0]
+        if best["margin_pct"] > 0:
+            insights.append({
+                "type": "profitability",
+                "severity": "positive",
+                "title": f"Top project margin: {best['margin_pct']}% (${best['profit']:,.0f} profit)",
+                "description": f"Project {best['project_id']} has the highest margin — consider scaling.",
+            })
+
+    # ── Recommendations ───────────────────────────────────────────────────
+    margin = ((revenue - expenses) / revenue * 100) if revenue > 0 else 0
+
+    recommendations = []
+    if recurring:
+        potential_savings = sum(r["total"] for r in recurring if r["total"] < 500) * 0.3
+        if potential_savings > 100:
+            recommendations.append(
+                f"Review small recurring expenses — potential savings of ${potential_savings:,.0f}/month"
+            )
+    if margin > 60:
+        recommendations.append(f"Your margin is {margin:.0f}% which is healthy. Focus on scaling revenue.")
+    elif margin < 30 and revenue > 0:
+        recommendations.append(f"Your margin is {margin:.0f}% which is low. Review your largest expenses.")
+    if unassigned_count > 100:
+        recommendations.append(
+            f"Assign {unassigned_count:,} unlinked transactions to projects for complete visibility."
+        )
+    if anomalies:
+        recommendations.append(
+            f"Investigate {len(anomalies)} unusually large transactions totaling ${sum(a['amount'] for a in anomalies):,.0f}."
+        )
+    if project_profitability and len(project_profitability) >= 2:
+        worst = project_profitability[-1]
+        if worst["margin_pct"] < 20 and worst["revenue"] > 0:
+            recommendations.append(
+                f"Project {worst['project_id']} has only {worst['margin_pct']}% margin — review costs."
+            )
+
+    return {
+        "ok": True,
+        "data": {
+            "summary": {
+                "total_revenue": round(revenue, 2),
+                "total_expenses": round(expenses, 2),
+                "net_profit": round(revenue - expenses, 2),
+                "margin_pct": round(margin, 1),
+                "period_days": days,
+            },
+            "insights": insights,
+            "recommendations": recommendations,
+            "project_profitability": project_profitability[:10],
+        },
+    }
+
+
+@router.get("/advisor/recurring")
+async def financial_advisor_recurring(request: Request, days: int = Query(90)):
+    """Detect recurring expenses (subscriptions, monthly charges) sorted by annual cost."""
+    _require_super_admin(request)
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    result = (
+        sb.table("financial_transactions")
+        .select("amount,currency,counterparty,description,txn_date,source")
+        .eq("type", "expense")
+        .gte("txn_date", cutoff)
+        .order("txn_date", desc=True)
+        .execute()
+    )
+    txns = result.data or []
+
+    # Group by counterparty
+    groups: dict = defaultdict(lambda: {"amounts": [], "dates": [], "currency": "USD", "source": ""})
+    for t in txns:
+        cp = t.get("counterparty") or t.get("description", "Unknown")
+        groups[cp]["amounts"].append(abs(float(t["amount"])))
+        groups[cp]["dates"].append(t.get("txn_date", ""))
+        groups[cp]["currency"] = t.get("currency", "USD")
+        groups[cp]["source"] = t.get("source", "")
+
+    recurring = []
+    for cp, data in groups.items():
+        if len(data["amounts"]) < 2:
+            continue
+
+        # Check if amounts are similar (within 20% of each other) => likely recurring
+        avg_amt = sum(data["amounts"]) / len(data["amounts"])
+        consistent = all(abs(a - avg_amt) / avg_amt < 0.2 for a in data["amounts"]) if avg_amt > 0 else False
+
+        # Check date intervals (25-35 day gaps = monthly)
+        sorted_dates = sorted(data["dates"])
+        intervals = []
+        for i in range(1, len(sorted_dates)):
+            try:
+                d1 = datetime.fromisoformat(sorted_dates[i - 1].replace("Z", "+00:00"))
+                d2 = datetime.fromisoformat(sorted_dates[i].replace("Z", "+00:00"))
+                intervals.append((d2 - d1).days)
+            except (ValueError, TypeError):
+                pass
+
+        avg_interval = sum(intervals) / len(intervals) if intervals else 0
+        is_monthly = 20 <= avg_interval <= 40
+        is_weekly = 5 <= avg_interval <= 10
+
+        frequency = "monthly" if is_monthly else ("weekly" if is_weekly else "recurring")
+
+        total_in_period = sum(data["amounts"])
+        annual_estimate = (total_in_period / days) * 365
+
+        recurring.append({
+            "counterparty": cp,
+            "occurrences": len(data["amounts"]),
+            "avg_amount": round(avg_amt, 2),
+            "total_in_period": round(total_in_period, 2),
+            "estimated_annual": round(annual_estimate, 2),
+            "currency": data["currency"],
+            "source": data["source"],
+            "frequency": frequency,
+            "consistent_amount": consistent,
+            "avg_interval_days": round(avg_interval, 1),
+        })
+
+    recurring.sort(key=lambda x: x["estimated_annual"], reverse=True)
+
+    total_annual = sum(r["estimated_annual"] for r in recurring)
+
+    return {
+        "ok": True,
+        "data": {
+            "recurring_expenses": recurring,
+            "total_detected": len(recurring),
+            "total_estimated_annual": round(total_annual, 2),
+            "period_days": days,
+        },
+    }
