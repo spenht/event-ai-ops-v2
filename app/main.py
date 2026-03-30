@@ -32,6 +32,7 @@ from .routes.sms_blast import router as sms_blast_router
 from .routes.agent_profiles import router as agent_profiles_router
 from .routes.finance import router as finance_router
 from .routes.agent_terminal import router as agent_terminal_router
+from .routes.payment_webhooks import router as payment_webhooks_router
 
 logging.basicConfig(level=logging.INFO)
 
@@ -72,6 +73,7 @@ app.include_router(sms_blast_router)
 app.include_router(agent_profiles_router)
 app.include_router(finance_router)
 app.include_router(agent_terminal_router)
+app.include_router(payment_webhooks_router)
 
 
 @app.get("/health")
