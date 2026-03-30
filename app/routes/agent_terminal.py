@@ -1442,6 +1442,18 @@ async def admin_delete_product(product_id: str, request: Request):
     return {"ok": True, "message": "Product deleted"}
 
 
+@router.get("/admin/product-access")
+async def admin_get_product_access(request: Request):
+    """Return agent assignments for a specific product."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+    product_id = request.query_params.get("product_id")
+    if not product_id:
+        return JSONResponse({"ok": False, "error": "product_id required"}, 400)
+    access = sb.table("agent_product_access").select("*").eq("product_id", product_id).execute()
+    return {"ok": True, "data": access.data or []}
+
+
 @router.post("/admin/product-access")
 async def admin_set_product_access(request: Request):
     """Assign/remove agent access to a product."""
