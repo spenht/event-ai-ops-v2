@@ -354,21 +354,133 @@ def execute_payout(batch: dict) -> dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-def execute_all_payouts(*, force: bool = False) -> dict[str, Any]:
-    """Calculate and execute all pending payouts. Called by daily cron."""
-    batches = calculate_pending_payouts(force=force)
+def _calculate_collaborator_payouts(*, force: bool = False) -> list[dict]:
+    """Calculate fixed-amount payouts for collaborators (non-sales team).
 
-    if not batches:
-        return {"ok": True, "message": "No payouts due", "count": 0}
+    Returns list of payout dicts ready to execute via execute_collaborator_payout().
+    """
+    profiles = (
+        sb.table("agent_payout_profiles")
+        .select("*")
+        .eq("profile_type", "collaborator")
+        .eq("stripe_connect_status", "active")
+        .gt("fixed_amount", 0)
+        .execute()
+    )
+
+    if not profiles.data:
+        return []
+
+    payouts = []
+    for p in profiles.data:
+        freq = p.get("payout_frequency", "biweekly")
+        if not force and not _should_pay_today(freq):
+            continue
+
+        payouts.append({
+            "user_id": p["user_id"],
+            "name": p.get("name", ""),
+            "email": p.get("email", ""),
+            "stripe_connect_account_id": p["stripe_connect_account_id"],
+            "source_stripe_account": p.get("source_stripe_account", "lba"),
+            "fixed_amount": float(p["fixed_amount"]),
+            "currency": p.get("currency", "USD"),
+            "payout_frequency": freq,
+        })
+
+    return payouts
+
+
+def _execute_collaborator_payout(collab: dict) -> dict[str, Any]:
+    """Execute a single fixed-amount payout to a collaborator's Connect account."""
+    user_id = collab["user_id"]
+    connect_id = collab["stripe_connect_account_id"]
+    source_account = collab["source_stripe_account"]
+    amount = collab["fixed_amount"]
+    total_cents = int(round(amount * 100))
+    currency = collab.get("currency", "USD")
+
+    if total_cents <= 0:
+        return {"ok": False, "error": "Amount must be positive"}
+
+    try:
+        client = _stripe_client(source_account)
+
+        transfer = client.transfers.create(
+            params={
+                "amount": total_cents,
+                "currency": currency.lower(),
+                "destination": connect_id,
+                "description": f"Fixed {collab['payout_frequency']} payout - {collab.get('name', user_id)}",
+                "metadata": {
+                    "user_id": user_id,
+                    "payout_type": "collaborator_fixed",
+                    "source": "collaborator_payout",
+                    "batch_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                },
+            }
+        )
+
+        transfer_id = transfer.id
+
+        # Record payout batch
+        sb.table("payout_batches").insert({
+            "agent_id": user_id,
+            "stripe_transfer_id": transfer_id,
+            "source_stripe_account": source_account,
+            "amount": amount,
+            "currency": currency,
+            "commission_count": 0,
+            "commission_ids": [],
+            "status": "completed",
+            "notes": f"Fixed {collab['payout_frequency']} payout",
+        }).execute()
+
+        logger.info(
+            "Collaborator payout completed: user=%s amount=$%.2f transfer=%s",
+            user_id, amount, transfer_id,
+        )
+
+        return {"ok": True, "transfer_id": transfer_id, "amount": amount}
+
+    except Exception as e:
+        logger.error("Collaborator payout FAILED: user=%s error=%s", user_id, e)
+
+        sb.table("payout_batches").insert({
+            "agent_id": user_id,
+            "stripe_transfer_id": f"FAILED_{uuid.uuid4().hex[:8]}",
+            "source_stripe_account": source_account,
+            "amount": amount,
+            "currency": currency,
+            "commission_count": 0,
+            "commission_ids": [],
+            "status": "failed",
+            "error_message": str(e)[:500],
+            "notes": "Fixed collaborator payout - FAILED",
+        }).execute()
+
+        return {"ok": False, "error": str(e)}
+
+
+def execute_all_payouts(*, force: bool = False) -> dict[str, Any]:
+    """Calculate and execute all pending payouts. Called by daily cron.
+
+    Handles both:
+    1. Commission-based payouts (agents) — based on pending commissions
+    2. Fixed-amount payouts (collaborators) — based on fixed_amount in profile
+    """
+    batches = calculate_pending_payouts(force=force)
 
     results = []
     total_paid = 0.0
     total_failed = 0
 
+    # 1. Commission-based agent payouts
     for batch in batches:
         result = execute_payout(batch)
         results.append({
             "agent_id": batch["agent_id"],
+            "type": "commission",
             "amount": batch["total_amount"],
             **result,
         })
@@ -377,10 +489,30 @@ def execute_all_payouts(*, force: bool = False) -> dict[str, Any]:
         else:
             total_failed += 1
 
+    # 2. Fixed-amount collaborator payouts
+    collab_payouts = _calculate_collaborator_payouts(force=force)
+    for collab in collab_payouts:
+        result = _execute_collaborator_payout(collab)
+        results.append({
+            "agent_id": collab["user_id"],
+            "type": "collaborator_fixed",
+            "amount": collab["fixed_amount"],
+            **result,
+        })
+        if result["ok"]:
+            total_paid += collab["fixed_amount"]
+        else:
+            total_failed += 1
+
+    total_count = len(batches) + len(collab_payouts)
+
+    if total_count == 0:
+        return {"ok": True, "message": "No payouts due", "count": 0}
+
     return {
         "ok": True,
-        "message": f"Processed {len(batches)} payouts",
-        "count": len(batches),
+        "message": f"Processed {total_count} payouts ({len(batches)} commissions, {len(collab_payouts)} collaborators)",
+        "count": total_count,
         "total_paid": round(total_paid, 2),
         "failed": total_failed,
         "results": results,

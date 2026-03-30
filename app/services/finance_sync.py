@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Union
 
 import httpx
 
@@ -112,12 +112,46 @@ def _find_project_for_txn(txn: dict, rules: list[dict]) -> Optional[str]:
     return None
 
 
+# ─── Validation helper ────────────────────────────────────────────────────
+
+def _validate_txn(txn: dict) -> dict:
+    """Ensure all required fields are valid before insert."""
+    # Amount must be positive number
+    amt = txn.get("amount", 0)
+    if not isinstance(amt, (int, float)) or amt < 0:
+        txn["amount"] = 0
+
+    # Date must be ISO string
+    date = txn.get("txn_date", "")
+    if not date or date == "None":
+        txn["txn_date"] = datetime.now(timezone.utc).isoformat()
+    elif isinstance(date, (int, float)):
+        # Unix timestamp
+        txn["txn_date"] = datetime.fromtimestamp(date, tz=timezone.utc).isoformat()
+    elif isinstance(date, str):
+        # If date-only string (e.g. "2024-03-15"), add time component
+        if len(date) == 10 and "-" in date:
+            txn["txn_date"] = f"{date}T00:00:00+00:00"
+        # Ensure "Z" is replaced with proper offset
+        elif date.endswith("Z"):
+            txn["txn_date"] = date.replace("Z", "+00:00")
+
+    # Currency must be uppercase string
+    txn["currency"] = (txn.get("currency") or "USD").upper()
+
+    return txn
+
+
 # ─── Upsert helper ─────────────────────────────────────────────────────────
 
 def _upsert_transactions(txns: list[dict]) -> int:
     """Upsert a batch of transactions. Returns count upserted."""
     if not txns:
         return 0
+
+    # Validate every transaction before insert
+    txns = [_validate_txn(t) for t in txns]
+
     # Deduplicate within the batch — Stripe can return multiple charges
     # for the same payment_intent. Keep the latest one.
     seen: dict[str, dict] = {}
@@ -322,12 +356,19 @@ async def sync_mercury(acct_id: str, days: int = 365, full: bool = False) -> dic
                 posted = t.get("postedDate", t.get("createdAt", ""))
                 if posted:
                     try:
-                        dt = datetime.fromisoformat(posted.replace("Z", "+00:00"))
+                        if isinstance(posted, (int, float)):
+                            dt = datetime.fromtimestamp(posted, tz=timezone.utc)
+                        else:
+                            posted_str = str(posted).replace("Z", "+00:00")
+                            # Handle date-only strings like "2024-03-15"
+                            if len(posted_str) == 10 and "-" in posted_str:
+                                posted_str = f"{posted_str}T00:00:00+00:00"
+                            dt = datetime.fromisoformat(posted_str)
                         if dt.tzinfo is None:
                             dt = dt.replace(tzinfo=timezone.utc)
                         if dt > latest_dt:
                             latest_dt = dt
-                    except (ValueError, AttributeError):
+                    except (ValueError, AttributeError, OSError):
                         dt = datetime.now(timezone.utc)
                 else:
                     dt = datetime.now(timezone.utc)
@@ -388,7 +429,7 @@ async def sync_whop(days: int = 365, full: bool = False) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         headers = {"Authorization": f"Bearer {whop_key}"}
         cursor = None
-        for _ in range(50):
+        for _ in range(100):
             params = {"per": 100, "status": "paid",
                       "created_after": cursor_dt.isoformat()}
             if cursor:
@@ -402,12 +443,15 @@ async def sync_whop(days: int = 365, full: bool = False) -> dict:
             body = pr.json()
             payments = body.get("data", [])
             for p in payments:
-                # Whop: final_amount is often 0, subtotal has the real amount
+                # Whop: final_amount is often 0, prefer subtotal > calculated_amount > final_amount
                 amt = p.get("subtotal", 0) or 0
                 if amt == 0:
-                    amt = p.get("final_amount", 0) or 0
-                if amt == 0:
                     amt = p.get("calculated_amount", 0) or 0
+                if amt == 0:
+                    amt = p.get("final_amount", 0) or 0
+                # Whop amounts may be in cents (values > 10000 are likely cents)
+                if isinstance(amt, (int, float)) and amt > 10000:
+                    amt = amt / 100
                 created = p.get("created_at") or p.get("paid_at") or p.get("updated_at")
                 if created:
                     try:

@@ -1467,3 +1467,135 @@ async def admin_set_product_access(request: Request):
         "custom_commission_pct": custom_pct,
     }, on_conflict="agent_id,product_id").execute()
     return {"ok": True, "message": "Access granted"}
+
+
+# ── 11. Collaborator (Fixed Payout) Management ──────────────────
+
+
+@router.get("/admin/collaborators")
+async def admin_list_collaborators(request: Request):
+    """List all collaborators with their fixed payout config."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    # Get all collaborator payout profiles
+    profiles = (
+        sb.table("agent_payout_profiles")
+        .select("*")
+        .eq("profile_type", "collaborator")
+        .execute()
+    )
+
+    collaborators = []
+    for p in profiles.data or []:
+        collaborators.append({
+            "user_id": p.get("user_id", ""),
+            "name": p.get("name", ""),
+            "email": p.get("email", ""),
+            "fixed_amount": float(p.get("fixed_amount", 0)),
+            "currency": p.get("currency", "USD"),
+            "payout_frequency": p.get("payout_frequency", "biweekly"),
+            "source_stripe_account": p.get("source_stripe_account", "lba"),
+            "stripe_connect_status": p.get("stripe_connect_status", "not_connected"),
+            "stripe_connect_account_id": p.get("stripe_connect_account_id", ""),
+            "created_at": p.get("created_at", ""),
+        })
+
+    return {"ok": True, "data": collaborators}
+
+
+@router.post("/admin/collaborators")
+async def admin_add_collaborator(request: Request):
+    """Add a collaborator with fixed payout amount."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    body = await request.json()
+    user_id = body.get("user_id", "")
+    email = body.get("email", "")
+    name = body.get("name", "")
+    fixed_amount = body.get("fixed_amount", 0)
+    currency = body.get("currency", "USD")
+    payout_frequency = body.get("payout_frequency", "biweekly")
+    source_stripe_account = body.get("source_stripe_account", "lba")
+
+    if not email or not fixed_amount:
+        return JSONResponse({"ok": False, "error": "email and fixed_amount are required"}, 400)
+
+    # Generate a user_id if not provided
+    if not user_id:
+        import uuid as _uuid
+        user_id = f"collab_{_uuid.uuid4().hex[:12]}"
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Check if profile already exists
+    existing = (
+        sb.table("agent_payout_profiles")
+        .select("*")
+        .eq("email", email)
+        .execute()
+    )
+
+    profile_data = {
+        "user_id": user_id,
+        "email": email,
+        "name": name,
+        "profile_type": "collaborator",
+        "fixed_amount": float(fixed_amount),
+        "currency": currency.upper(),
+        "payout_frequency": payout_frequency,
+        "source_stripe_account": source_stripe_account,
+    }
+
+    if existing.data:
+        # Update existing profile
+        sb.table("agent_payout_profiles").update(profile_data).eq(
+            "email", email
+        ).execute()
+        profile_data["updated"] = True
+    else:
+        profile_data["created_at"] = now_iso
+        sb.table("agent_payout_profiles").insert(profile_data).execute()
+        profile_data["created"] = True
+
+    return {"ok": True, "data": profile_data}
+
+
+@router.put("/admin/collaborators/{user_id}")
+async def admin_update_collaborator(user_id: str, request: Request):
+    """Update a collaborator's payout config."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    body = await request.json()
+    update: dict = {}
+    for field in ["name", "email", "fixed_amount", "currency", "payout_frequency", "source_stripe_account"]:
+        if field in body:
+            update[field] = body[field]
+
+    if "fixed_amount" in update:
+        update["fixed_amount"] = float(update["fixed_amount"])
+    if "currency" in update:
+        update["currency"] = update["currency"].upper()
+
+    if not update:
+        return JSONResponse({"ok": False, "error": "No fields to update"}, 400)
+
+    sb.table("agent_payout_profiles").update(update).eq("user_id", user_id).execute()
+    return {"ok": True, "message": "Collaborator updated"}
+
+
+@router.delete("/admin/collaborators/{user_id}")
+async def admin_delete_collaborator(user_id: str, request: Request):
+    """Remove a collaborator from the payout system."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    # Don't hard-delete — just set profile_type back to 'agent' and zero out fixed_amount
+    sb.table("agent_payout_profiles").update({
+        "profile_type": "agent",
+        "fixed_amount": 0,
+    }).eq("user_id", user_id).execute()
+
+    return {"ok": True, "message": "Collaborator removed from payouts"}
