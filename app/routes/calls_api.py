@@ -596,7 +596,7 @@ async def list_records(
             .order("created_at", desc=True)
         )
         if user_id:
-            q = q.eq("user_id", user_id)
+            q = q.eq("caller_id", user_id)
         r = q.range(offset, offset + limit - 1).execute()
         return {"data": r.data or [], "count": len(r.data or [])}
     except Exception as exc:

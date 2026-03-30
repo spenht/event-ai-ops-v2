@@ -185,19 +185,34 @@ def get_agent_connect_status(user_id: str) -> dict[str, Any]:
 
 
 def _should_pay_today(frequency: str) -> bool:
-    """Check if the given frequency means we should pay today."""
+    """Check if the given frequency means we should pay today.
+
+    Payout dates:
+    - biweekly: 13th and penultimate day of month (29th or 30th depending on month)
+    - monthly: penultimate day of month
+    - weekly: Monday
+    - daily: every day
+    """
+    import calendar
+
     today = datetime.now(timezone.utc)
     day_of_week = today.weekday()  # 0=Monday
     day_of_month = today.day
+    year = today.year
+    month = today.month
+
+    # Penultimate day of current month (last day - 1)
+    last_day = calendar.monthrange(year, month)[1]
+    penultimate_day = last_day - 1  # e.g., 29 for a 30-day month, 27 for Feb
 
     if frequency == "daily":
         return True
     elif frequency == "weekly":
         return day_of_week == 0  # Monday
     elif frequency == "biweekly":
-        return day_of_month in (1, 15)
+        return day_of_month in (13, penultimate_day)
     elif frequency == "monthly":
-        return day_of_month == 1
+        return day_of_month == penultimate_day
     elif frequency == "manual":
         return False
     return False

@@ -399,19 +399,19 @@ async def create_terminal_charge(request: Request):
     commission_amount = 0.0
     if commission_rate > 0:
         commission_amount = round(float(amount) * (commission_rate / 100), 2)
-        sb.table("commissions").insert({
-            "campaign_id": None,
-            "agent_id": user_id,
-            "lead_id": None,
-            "call_record_id": None,
-            "tier": "DIRECT_SALE",
-            "sale_amount": float(amount),
-            "commission_pct": commission_rate,
-            "commission_amount": commission_amount,
-            "status": "pending",
-            "notes": f"Agent terminal sale - {description}",
-            "created_at": now_iso,
-        }).execute()
+        try:
+            sb.table("commissions").insert({
+                "agent_id": user_id,
+                "tier": "DIRECT_SALE",
+                "sale_amount": float(amount),
+                "commission_pct": commission_rate,
+                "commission_amount": commission_amount,
+                "status": "pending",
+                "notes": f"Agent terminal sale - {description}",
+                "created_at": now_iso,
+            }).execute()
+        except Exception as e:
+            logger.warning("commission_insert_failed (will track in txn metadata): %s", str(e)[:100])
 
     return {
         "ok": True,
