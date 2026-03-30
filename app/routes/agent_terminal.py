@@ -98,16 +98,17 @@ async def get_terminal_config(request: Request):
                     "is_primary": True,
                 }]
 
-        # Campaigns linked to this project (table may not exist yet)
+        # Campaigns linked to this project (via campaigns.project_id column)
         campaign_ids = []
         try:
             campaigns = (
-                sb.table("campaign_projects")
-                .select("campaign_id")
+                sb.table("campaigns")
+                .select("id, name, event_name")
                 .eq("project_id", project_id)
+                .eq("status", "active")
                 .execute()
             )
-            campaign_ids = [c["campaign_id"] for c in (campaigns.data or [])]
+            campaign_ids = [c["id"] for c in (campaigns.data or [])]
         except Exception:
             pass
 
