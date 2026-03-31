@@ -814,6 +814,48 @@ def _check_admin(request: Request) -> bool:
     return bool(key and settings.spartans_key and key == settings.spartans_key)
 
 
+def _check_owner(request: Request) -> bool:
+    """Check if caller is the platform owner (spartans key)."""
+    return _check_admin(request)
+
+
+async def _check_payout_permission(request: Request) -> bool:
+    """Check if the user has payout management permission.
+
+    Owner (spartans key) always has access.
+    Admins/members need the ``can_manage_payouts`` flag in org_members.permissions.
+    """
+    key = (request.headers.get("x-spartans-key") or "").strip()
+    # Owner always has access
+    if key and settings.spartans_key and key == settings.spartans_key:
+        return True
+    # Check user's permissions via JWT
+    auth_header = request.headers.get("authorization", "")
+    if auth_header:
+        try:
+            import jwt as pyjwt
+
+            token = auth_header.replace("Bearer ", "")
+            decoded = pyjwt.decode(token, options={"verify_signature": False})
+            uid = decoded.get("sub", "")
+            if uid:
+                member = (
+                    sb.table("org_members")
+                    .select("role, permissions")
+                    .eq("user_id", uid)
+                    .execute()
+                )
+                if member.data:
+                    role = member.data[0].get("role", "")
+                    if role == "owner":
+                        return True
+                    perms = member.data[0].get("permissions") or {}
+                    return perms.get("can_manage_payouts", False)
+        except Exception:
+            pass
+    return False
+
+
 @router.get("/admin/settings")
 async def admin_terminal_settings(request: Request):
     """Return all terminal configuration for admin view."""
@@ -1219,8 +1261,8 @@ async def agent_payout_history(request: Request):
 @router.get("/admin/pending-payouts")
 async def admin_pending_payouts(request: Request):
     """Preview pending payouts without executing them."""
-    if not _check_admin(request):
-        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+    if not await _check_payout_permission(request):
+        return JSONResponse({"ok": False, "error": "Payout management permission required"}, 403)
 
     from ..services.agent_payouts import calculate_pending_payouts
 
@@ -1241,8 +1283,8 @@ async def admin_pending_payouts(request: Request):
 @router.post("/admin/run-payouts")
 async def admin_run_payouts(request: Request):
     """Execute all pending commission payouts."""
-    if not _check_admin(request):
-        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+    if not await _check_payout_permission(request):
+        return JSONResponse({"ok": False, "error": "Payout management permission required"}, 403)
 
     from ..services.agent_payouts import execute_all_payouts
 
@@ -1492,14 +1534,103 @@ async def admin_set_product_access(request: Request):
     return {"ok": True, "message": "Access granted"}
 
 
+# ── 10b. Admin Permission Management ─────────────────────────────
+
+
+@router.get("/admin/user-permissions")
+async def get_user_permissions(request: Request):
+    """Get permissions for a specific user."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+    user_id = request.query_params.get("user_id")
+    if not user_id:
+        return JSONResponse({"ok": False, "error": "user_id required"}, 400)
+    member = sb.table("org_members").select("permissions").eq("user_id", user_id).execute()
+    perms = (member.data[0].get("permissions") or {}) if member.data else {}
+    return {"ok": True, "data": perms}
+
+
+@router.put("/admin/user-permissions")
+async def set_user_permissions(request: Request):
+    """Set permissions for a user. OWNER ONLY."""
+    if not _check_owner(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized — owner only"}, 401)
+
+    body = await request.json()
+    user_id = body.get("user_id")
+    permissions = body.get("permissions", {})
+
+    if not user_id:
+        return JSONResponse({"ok": False, "error": "user_id required"}, 400)
+
+    # Merge with existing permissions
+    existing = sb.table("org_members").select("permissions").eq("user_id", user_id).execute()
+    current_perms = (existing.data[0].get("permissions") or {}) if existing.data else {}
+    current_perms.update(permissions)
+
+    sb.table("org_members").update({"permissions": current_perms}).eq("user_id", user_id).execute()
+    return {"ok": True, "data": current_perms}
+
+
+@router.get("/admin/admin-members")
+async def get_admin_members(request: Request):
+    """List non-agent org members (admins/owners) with their permissions."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    members = (
+        sb.table("org_members")
+        .select("user_id, role, permissions")
+        .neq("role", "agent")
+        .execute()
+    )
+
+    # Fetch emails/names from auth
+    email_map: dict[str, str] = {}
+    name_map: dict[str, str] = {}
+    try:
+        import httpx as _httpx
+
+        auth_url = f"{os.getenv('SUPABASE_URL', '')}/auth/v1/admin/users?per_page=500"
+        auth_headers = {
+            "apikey": os.getenv("SUPABASE_KEY", ""),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_KEY', '')}",
+        }
+        with _httpx.Client(timeout=10) as hc:
+            auth_r = hc.get(auth_url, headers=auth_headers)
+            if auth_r.status_code == 200:
+                auth_data = auth_r.json()
+                for u in auth_data.get("users", []):
+                    email_map[u["id"]] = u.get("email", "")
+                    meta = u.get("user_metadata") or {}
+                    name_map[u["id"]] = meta.get("full_name", meta.get("name", ""))
+    except Exception as e:
+        logger.warning("Failed to fetch auth users for admin-members: %s", e)
+
+    result = []
+    for m in members.data or []:
+        uid = m["user_id"]
+        email = email_map.get(uid, "")
+        name = name_map.get(uid, "") or (email.split("@")[0] if email else uid[:12])
+        result.append({
+            "user_id": uid,
+            "role": m.get("role", ""),
+            "name": name,
+            "email": email,
+            "permissions": m.get("permissions") or {},
+        })
+
+    return {"ok": True, "data": result}
+
+
 # ── 11. Collaborator (Fixed Payout) Management ──────────────────
 
 
 @router.get("/admin/collaborators")
 async def admin_list_collaborators(request: Request):
     """List all collaborators with their fixed payout config."""
-    if not _check_admin(request):
-        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+    if not await _check_payout_permission(request):
+        return JSONResponse({"ok": False, "error": "Payout management permission required"}, 403)
 
     # Get all collaborator payout profiles
     profiles = (
@@ -1530,8 +1661,8 @@ async def admin_list_collaborators(request: Request):
 @router.post("/admin/collaborators")
 async def admin_add_collaborator(request: Request):
     """Add a collaborator with fixed payout amount."""
-    if not _check_admin(request):
-        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+    if not await _check_payout_permission(request):
+        return JSONResponse({"ok": False, "error": "Payout management permission required"}, 403)
 
     body = await request.json()
     user_id = body.get("user_id", "")
@@ -1588,8 +1719,8 @@ async def admin_add_collaborator(request: Request):
 @router.put("/admin/collaborators/{user_id}")
 async def admin_update_collaborator(user_id: str, request: Request):
     """Update a collaborator's payout config."""
-    if not _check_admin(request):
-        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+    if not await _check_payout_permission(request):
+        return JSONResponse({"ok": False, "error": "Payout management permission required"}, 403)
 
     body = await request.json()
     update: dict = {}
@@ -1612,8 +1743,8 @@ async def admin_update_collaborator(user_id: str, request: Request):
 @router.delete("/admin/collaborators/{user_id}")
 async def admin_delete_collaborator(user_id: str, request: Request):
     """Remove a collaborator from the payout system."""
-    if not _check_admin(request):
-        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+    if not await _check_payout_permission(request):
+        return JSONResponse({"ok": False, "error": "Payout management permission required"}, 403)
 
     # Don't hard-delete — just set profile_type back to 'agent' and zero out fixed_amount
     sb.table("agent_payout_profiles").update({
