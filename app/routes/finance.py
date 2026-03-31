@@ -2392,3 +2392,152 @@ async def financial_advisor_recurring(request: Request, days: int = Query(90)):
             "period_days": days,
         },
     }
+
+
+# ─── Client Tracking ──────────────────────────────────────────────────────
+
+
+@router.get("/projects/{project_id}/clients")
+async def list_project_clients(project_id: str, request: Request):
+    """List all clients for a project with payment status summary."""
+    _require_super_admin(request)
+
+    r = (
+        sb.table("project_clients")
+        .select("*")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    clients = r.data or []
+
+    # Calculate balance for each client
+    for c in clients:
+        c["balance"] = round((c.get("total_amount") or 0) - (c.get("paid_amount") or 0), 2)
+
+    # Status counts
+    counts = {"paid_full": 0, "payment_plan": 0, "overdue": 0, "active": 0}
+    for c in clients:
+        s = c.get("status", "active")
+        if s in counts:
+            counts[s] += 1
+
+    return {
+        "ok": True,
+        "data": {
+            "clients": clients,
+            "total": len(clients),
+            "counts": counts,
+        },
+    }
+
+
+@router.post("/projects/{project_id}/clients")
+async def create_project_client(project_id: str, request: Request):
+    """Add a new client to a project."""
+    _require_super_admin(request)
+    body = await request.json()
+
+    row = {
+        "project_id": project_id,
+        "name": body.get("name", ""),
+        "email": body.get("email"),
+        "phone": body.get("phone"),
+        "total_amount": body.get("total_amount", 0),
+        "paid_amount": body.get("paid_amount", 0),
+        "currency": body.get("currency", "USD"),
+        "status": body.get("status", "active"),
+        "payment_plan": body.get("payment_plan"),
+        "notes": body.get("notes"),
+    }
+
+    r = sb.table("project_clients").insert(row).execute()
+    return {"ok": True, "data": (r.data or [None])[0]}
+
+
+@router.patch("/clients/{client_id}")
+async def update_project_client(client_id: str, request: Request):
+    """Update any fields on a client."""
+    _require_super_admin(request)
+    body = await request.json()
+
+    allowed = [
+        "name", "email", "phone", "total_amount", "paid_amount",
+        "currency", "status", "payment_plan", "notes",
+        "stripe_customer_id", "lead_id",
+    ]
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    r = sb.table("project_clients").update(updates).eq("id", client_id).execute()
+    if not r.data:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return {"ok": True, "data": r.data[0]}
+
+
+@router.post("/clients/{client_id}/payments")
+async def record_client_payment(client_id: str, request: Request):
+    """Record a payment for a client. Updates paid_amount and creates a transaction."""
+    _require_super_admin(request)
+    body = await request.json()
+
+    amount = body.get("amount", 0)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+
+    # Fetch current client
+    cr = sb.table("project_clients").select("*").eq("id", client_id).limit(1).execute()
+    if not cr.data:
+        raise HTTPException(status_code=404, detail="Client not found")
+    client = cr.data[0]
+
+    new_paid = round((client.get("paid_amount") or 0) + amount, 2)
+    total = client.get("total_amount") or 0
+
+    # Update paid_amount + auto-set status if fully paid
+    update_data: dict = {"paid_amount": new_paid}
+    if new_paid >= total and total > 0:
+        update_data["status"] = "paid_full"
+
+    sb.table("project_clients").update(update_data).eq("id", client_id).execute()
+
+    # Create financial_transaction record
+    payment_date = body.get("date") or datetime.now(timezone.utc).isoformat()
+    txn = {
+        "project_id": client.get("project_id"),
+        "source": body.get("payment_method", "other"),
+        "type": "income",
+        "amount": amount,
+        "currency": client.get("currency", "USD"),
+        "description": body.get("description", f"Payment from {client.get('name', 'client')}"),
+        "txn_date": payment_date,
+        "external_id": f"client_payment_{client_id}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+        "metadata": {"client_id": client_id, "payment_method": body.get("payment_method", "other")},
+    }
+    sb.table("financial_transactions").insert(txn).execute()
+
+    return {
+        "ok": True,
+        "data": {
+            "client_id": client_id,
+            "amount": amount,
+            "new_paid_amount": new_paid,
+            "new_status": update_data.get("status", client.get("status")),
+        },
+    }
+
+
+@router.get("/clients/{client_id}/payments")
+async def list_client_payments(client_id: str, request: Request):
+    """List all payments recorded for a client."""
+    _require_super_admin(request)
+
+    r = (
+        sb.table("financial_transactions")
+        .select("*")
+        .eq("metadata->>client_id", client_id)
+        .order("txn_date", desc=True)
+        .execute()
+    )
+    return {"ok": True, "data": {"payments": r.data or [], "total": len(r.data or [])}}
