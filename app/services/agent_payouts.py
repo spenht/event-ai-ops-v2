@@ -223,7 +223,14 @@ def calculate_pending_payouts(*, force: bool = False) -> list[dict]:
 
     Returns list of payout batches ready to execute.
     """
-    # Get all pending commissions
+    # Auto-promote held commissions whose holding period has expired
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        sb.table("commissions").update({"status": "pending"}).eq("status", "held").lte("held_until", now_iso).execute()
+    except Exception as e:
+        logger.warning("Failed to promote held commissions: %s", e)
+
+    # Get all pending commissions (now includes freshly promoted ones)
     pending = (
         sb.table("commissions")
         .select("*")

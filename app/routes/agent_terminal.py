@@ -396,18 +396,28 @@ async def create_terminal_charge(request: Request):
     }
     sb.table("financial_transactions").upsert(txn, on_conflict="external_id,source").execute()
 
-    # Commission
+    # Commission (with holding period for refund protection)
     commission_amount = 0.0
     if commission_rate > 0:
         commission_amount = round(float(amount) * (commission_rate / 100), 2)
         try:
+            # Get holding period from platform settings
+            try:
+                setting = sb.table("platform_settings").select("value").eq("key", "commission_holding_days").execute()
+                holding_days = int(setting.data[0]["value"]) if setting.data else 14
+            except Exception:
+                holding_days = 14
+
+            held_until = (datetime.now(timezone.utc) + timedelta(days=holding_days)).isoformat()
+
             sb.table("commissions").insert({
                 "agent_id": user_id,
                 "tier": "DIRECT_SALE",
                 "sale_amount": float(amount),
                 "commission_pct": commission_rate,
                 "commission_amount": commission_amount,
-                "status": "pending",
+                "status": "held",
+                "held_until": held_until,
                 "notes": f"Agent terminal sale - {description}",
                 "created_at": now_iso,
             }).execute()
@@ -1612,3 +1622,41 @@ async def admin_delete_collaborator(user_id: str, request: Request):
     }).eq("user_id", user_id).execute()
 
     return {"ok": True, "message": "Collaborator removed from payouts"}
+
+
+# ── Commission Protection Settings ────────────────────────────────
+
+
+@router.get("/admin/commission-settings")
+async def get_commission_settings(request: Request):
+    """Get platform commission settings (holding period, dispute reserve)."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    settings_resp = sb.table("platform_settings").select("*").in_("key", [
+        "commission_holding_days", "commission_dispute_reserve_pct"
+    ]).execute()
+
+    result = {}
+    for s in settings_resp.data or []:
+        result[s["key"]] = s["value"]
+
+    return {"ok": True, "data": result}
+
+
+@router.put("/admin/commission-settings")
+async def update_commission_settings(request: Request):
+    """Update platform commission settings."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+
+    body = await request.json()
+    for key in ["commission_holding_days", "commission_dispute_reserve_pct"]:
+        if key in body:
+            sb.table("platform_settings").upsert({
+                "key": key,
+                "value": str(body[key]),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+
+    return {"ok": True, "message": "Settings updated"}

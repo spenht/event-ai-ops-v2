@@ -90,6 +90,70 @@ async def stripe_webhook(account_key: str, request: Request):
         except Exception:
             pass
 
+        # ── Commission clawback on refund ─────────────────────────
+        pi_id = charge.get("payment_intent", "")
+        if pi_id:
+            try:
+                orig_txn = sb.table("financial_transactions").select("metadata").eq("external_id", pi_id).execute()
+                if orig_txn.data:
+                    meta = orig_txn.data[0].get("metadata") or {}
+                    agent_id = meta.get("agent_id", "")
+                    if agent_id:
+                        refund_amount = charge.get("amount_refunded", 0) / 100
+                        # Try to cancel held/pending commissions first
+                        comms = (
+                            sb.table("commissions")
+                            .select("*")
+                            .eq("agent_id", agent_id)
+                            .in_("status", ["held", "pending"])
+                            .execute()
+                        )
+                        cancelled = False
+                        for comm in comms.data or []:
+                            if abs(float(comm.get("sale_amount", 0)) - refund_amount) < 1:
+                                sb.table("commissions").update({
+                                    "status": "cancelled",
+                                    "refund_id": charge.get("id", ""),
+                                    "notes": f"Cancelled due to refund {charge.get('id', '')}",
+                                }).eq("id", comm["id"]).execute()
+                                logger.info(
+                                    "commission_cancelled agent=%s amount=%s refund=%s",
+                                    agent_id, comm["commission_amount"], charge.get("id"),
+                                )
+                                cancelled = True
+                                break
+
+                        if not cancelled:
+                            # Commission already paid — create clawback
+                            paid_comms = (
+                                sb.table("commissions")
+                                .select("*")
+                                .eq("agent_id", agent_id)
+                                .eq("status", "paid")
+                                .execute()
+                            )
+                            for comm in paid_comms.data or []:
+                                if abs(float(comm.get("sale_amount", 0)) - refund_amount) < 1:
+                                    sb.table("commissions").insert({
+                                        "agent_id": agent_id,
+                                        "tier": "CLAWBACK",
+                                        "sale_amount": -float(comm["sale_amount"]),
+                                        "commission_pct": float(comm["commission_pct"]),
+                                        "commission_amount": -float(comm["commission_amount"]),
+                                        "status": "pending",
+                                        "clawback_of": comm["id"],
+                                        "refund_id": charge.get("id", ""),
+                                        "notes": f"Clawback for refund {charge.get('id', '')} on original commission {comm['id']}",
+                                        "created_at": datetime.now(timezone.utc).isoformat(),
+                                    }).execute()
+                                    logger.info(
+                                        "commission_clawback agent=%s amount=-%s",
+                                        agent_id, comm["commission_amount"],
+                                    )
+                                    break
+            except Exception as e:
+                logger.warning("commission_clawback_error: %s", str(e)[:200])
+
     return {"received": True}
 
 
