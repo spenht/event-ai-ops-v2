@@ -934,6 +934,15 @@ async def admin_terminal_settings(request: Request):
     except Exception as e:
         logger.warning("Failed to fetch auth users: %s", e)
 
+    # Also check agent_payout_profiles for custom names (override auth-derived names)
+    try:
+        payout_profiles = sb.table("agent_payout_profiles").select("user_id, name").execute()
+        for pp in payout_profiles.data or []:
+            if pp.get("name"):
+                name_map[pp["user_id"]] = pp["name"]
+    except Exception as e:
+        logger.warning("Failed to fetch payout profiles for names: %s", e)
+
     agents_list = []
     for oa in org_agents.data or []:
         uid = oa["user_id"]
@@ -959,6 +968,27 @@ async def admin_terminal_settings(request: Request):
             "commission_tiers": tiers.data or [],
         },
     }
+
+
+@router.put("/admin/agent-name")
+async def admin_update_agent_name(request: Request):
+    """Update an agent's display name via agent_payout_profiles."""
+    if not _check_admin(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, 401)
+    body = await request.json()
+    user_id = body.get("user_id")
+    name = body.get("name", "")
+    if not user_id or not name:
+        return JSONResponse({"ok": False, "error": "user_id and name required"}, 400)
+
+    # Update or create agent_payout_profiles with the name
+    existing = sb.table("agent_payout_profiles").select("id").eq("user_id", user_id).execute()
+    if existing.data:
+        sb.table("agent_payout_profiles").update({"name": name}).eq("user_id", user_id).execute()
+    else:
+        sb.table("agent_payout_profiles").insert({"user_id": user_id, "name": name}).execute()
+
+    return {"ok": True, "message": f"Name updated to {name}"}
 
 
 @router.put("/admin/gateway-toggle")
