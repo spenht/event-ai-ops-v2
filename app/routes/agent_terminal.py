@@ -1184,6 +1184,8 @@ async def admin_set_commission_tiers(request: Request):
     if action == "create":
         row = {
             "project_id": project_id,
+            "product_id": body.get("product_id"),  # NULL = project-wide
+            "tier_metric": body.get("tier_metric", "amount"),  # "amount" or "units"
             "min_sales": body.get("min_sales", 0),
             "max_sales": body.get("max_sales"),
             "commission_pct": body.get("commission_pct", 0),
@@ -1198,7 +1200,7 @@ async def admin_set_commission_tiers(request: Request):
         if not tier_id:
             return JSONResponse({"ok": False, "error": "tier_id required for update"}, 400)
         update = {}
-        for f in ["min_sales", "max_sales", "commission_pct", "sort_order", "tier_mode"]:
+        for f in ["min_sales", "max_sales", "commission_pct", "sort_order", "tier_mode", "product_id", "tier_metric"]:
             if f in body:
                 update[f] = body[f]
         sb.table("project_commission_tiers").update(update).eq("id", tier_id).execute()
