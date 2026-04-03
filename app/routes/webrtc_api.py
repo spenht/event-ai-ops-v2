@@ -135,7 +135,7 @@ async def webrtc_token(request: Request, body: TokenRequest):
     try:
         r = (
             sb.table("campaigns")
-            .select("telnyx_api_key, telnyx_sip_connection_id")
+            .select("telnyx_api_key, telnyx_sip_connection_id, telnyx_webrtc_credential_id")
             .eq("id", body.campaign_id)
             .limit(1)
             .execute()
@@ -157,11 +157,16 @@ async def webrtc_token(request: Request, body: TokenRequest):
         or settings.telnyx_api_key
     )
     connection_id = (
-        (campaign.get("telnyx_sip_connection_id") or "").strip()
+        (campaign.get("telnyx_webrtc_credential_id") or "").strip()
+        or (campaign.get("telnyx_sip_connection_id") or "").strip()
         or settings.telnyx_sip_connection_id
     )
 
     if not telnyx_api_key or not connection_id:
+        logger.error(
+            "webrtc_token_missing_creds campaign=%s has_key=%s has_conn=%s",
+            body.campaign_id, bool(telnyx_api_key), bool(connection_id),
+        )
         raise HTTPException(
             status_code=400,
             detail="campaign missing telnyx_api_key or telnyx_sip_connection_id",
