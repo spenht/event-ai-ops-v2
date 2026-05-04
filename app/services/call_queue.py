@@ -411,15 +411,26 @@ def create_call_record(
     notes: str = "",
     purpose: str = "",
 ) -> Optional[dict[str, Any]]:
-    """Create a new call record entry."""
+    """Create a new call record entry.
+
+    NOTE: lead_id is intentionally conditional. When agents dial a manual
+    number (no queue, no lead picked from list) the caller passes lead_id="".
+    Inserting an empty string violates the FK constraint
+    `call_records_lead_id_fkey` because "" is not a valid leads.lead_id.
+    Omitting the field lets the column stay NULL (we made it nullable
+    in DB migration; see also trigger `fix_empty_lead_id` as belt-and-suspenders).
+    """
     row: dict[str, Any] = {
         "campaign_id": campaign_id,
-        "lead_id": lead_id,
         "caller_type": caller_type,
         "from_number": from_number,
         "to_number": to_number,
         "status": status,
     }
+    # Only include lead_id when non-empty (manual dials from agent terminal
+    # legitimately have no associated lead).
+    if lead_id:
+        row["lead_id"] = lead_id
     if queue_id:
         row["queue_id"] = queue_id
     if caller_id:
