@@ -174,7 +174,7 @@ async def update_project(project_id: str, request: Request):
     allowed = {"name", "description", "stripe_account", "mercury_account", "status", "config", "leader_id", "leader_name"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if updates:
-        updates["updated_at"] = "now()"
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
         r = sb.table("projects").update(updates).eq("id", project_id).execute()
         return {"ok": True, "data": (r.data or [{}])[0]}
     return {"ok": True}
@@ -1272,7 +1272,7 @@ async def upsert_commission_rule(request: Request):
         r = sb.table("commission_configs").update({
             "commission_type": commission_type,
             "commission_value": commission_value,
-            "updated_at": "now()",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", existing.data[0]["id"]).execute()
     else:
         r = sb.table("commission_configs").insert({
