@@ -420,17 +420,18 @@ def create_call_record(
     Omitting the field lets the column stay NULL (we made it nullable
     in DB migration; see also trigger `fix_empty_lead_id` as belt-and-suspenders).
     """
+    # IMPORTANT: send `lead_id: None` (NULL) explicitly when no lead — DO NOT
+    # omit the field. The DB column has DEFAULT '' (empty string) and the FK
+    # `call_records_lead_id_fkey` rejects ''. Sending NULL is the only way
+    # to keep the FK satisfied for manual-dial / non-queue calls.
     row: dict[str, Any] = {
         "campaign_id": campaign_id,
+        "lead_id": lead_id if lead_id else None,
         "caller_type": caller_type,
         "from_number": from_number,
         "to_number": to_number,
         "status": status,
     }
-    # Only include lead_id when non-empty (manual dials from agent terminal
-    # legitimately have no associated lead).
-    if lead_id:
-        row["lead_id"] = lead_id
     if queue_id:
         row["queue_id"] = queue_id
     if caller_id:
