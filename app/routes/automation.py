@@ -109,13 +109,14 @@ def _validate_cron_token(request: Request) -> None:
         raise HTTPException(status_code=403, detail="invalid cron token")
 
 
-def _utcnow() -> datetime:
+def _now_utc() -> datetime:
+    """Return current UTC time as a timezone-aware datetime."""
     return datetime.now(timezone.utc)
 
 
 def _today_key(followup_type: str) -> str:
     """Unique key for dedup: type + date."""
-    return f"{followup_type}_{_utcnow().strftime('%Y-%m-%d')}"
+    return f"{followup_type}_{_now_utc().strftime('%Y-%m-%d')}"
 
 
 def _get_last_touchpoint(lead_id: str, event_types: list[str]) -> dict[str, Any] | None:
@@ -138,7 +139,7 @@ def _get_last_touchpoint(lead_id: str, event_types: list[str]) -> dict[str, Any]
 
 def _count_today_followups(lead_id: str) -> int:
     """Count how many follow-ups we already sent today."""
-    today_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    today_start = _now_utc().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     try:
         r = (
             sb.table("touchpoints")
@@ -260,7 +261,7 @@ async def run_followups(request: Request):
     """
     _validate_cron_token(request)
 
-    now = _utcnow()
+    now = _now_utc()
 
     # Query eligible leads
     try:
