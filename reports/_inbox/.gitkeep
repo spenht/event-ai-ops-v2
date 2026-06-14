@@ -1,0 +1,5 @@
+# reports/_inbox/
+
+Canal asíncrono Spencer→watchdog. Dejá archivos `.md` aquí con instrucciones / vetos / preguntas; el watchdog los lee al inicio de cada run y los responde inline en el próximo report.
+
+Creado en run #46 (2026-06-14T22:04Z) como acción default-aplica del #45. Si querés deshabilitarlo, borrá la carpeta o dejá un `VETO.md`.
