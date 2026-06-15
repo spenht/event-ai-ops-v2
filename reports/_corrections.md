@@ -51,7 +51,60 @@ Cualquier contador numérico que aparezca en el report con fórmula derivada (of
 | `narrative-drag` | #46 | reuso de SHA/timestamp narrativo sin re-derivar contra fuente primaria |
 | `field-swap` | #47 | confusión entre campos semánticamente distintos del mismo objeto API (`pushed_at` vs `updated_at`) |
 | `self-error-plan` | #52 | planificación sobre estado-externo asumido sin verificar (`list_issues` no leído) |
-| `narrative-drag-numeric` | #54, #55 | contador numérico inflado con offset narrativo sin verificar contra fuente primaria (recurrencia DENTRO de la corrección que pretendía evitarlo = #55) |
-| `phantom-sha` | #55 (retroactivo a #38) | SHA citada en el report que **no existe** como git object en el repo local (e.g. `64ba80b`, `324227e`) |
+| `narrative-drag-numeric` | #54, #55, #56 | contador numérico inflado con offset narrativo sin verificar contra fuente primaria (**3ª recurrencia confirma patrón estructural**) |
+| `phantom-sha` | #55 (retroactivo a #38), #56 (`c9d7e3f`) | SHA citada en el report que **no existe** como git object en el repo local (e.g. `64ba80b`, `324227e`, `c9d7e3f`) |
 
 **Patrón meta-meta**: la primer corrección que se ejecuta puede ella misma sufrir el bug que corrige. La capa C4 (anti-narrative-drag-numeric) introdujo otro narrative-drag-numeric. **Inferencia**: cada capa nueva del checklist debe ejecutarse al menos 2 veces (debut + verificación retroactiva en T+1) antes de ser considerada "limpia". Política emergente #4: **toda capa nueva del invariante #6 está en "fase preliminar" en su debut hasta que el slot N+1 verifica que sus números son correctos contra fuente primaria**.
+
+---
+
+| #56 | #56 (18:04Z 15-jun) | behind-by-N + root SHA + counts (compound, 3ª recurrencia) | **#55** reportó: (a) `cf750b1 (=#55) post-push = 51` (predicho con fórmula N-4); (b) `593c83a (=#54) = 50`, `61a2b93 (=#53) = 49`, `fd0303e (=#52) = 48`, `86e9403 (=#51) = 47`; (c) Fórmula `depth = N - 4`; (d) Root real de origin/main = `c9d7e3f @ 2026-06-09T12:06Z = watchdog #5`; (e) "4 commits pre-#5 nunca llegaron a origin/main". | **real verificado en #56 contra fuente primaria fresca via bash stdout literal** (output completo abajo): (a) `git rev-list --count cf750b1 = 50` (no 51 — off por +1 vs #55, mismo dirección que #54→#55); (b) `593c83a = 49`, `61a2b93 = 48`, `fd0303e = 47`, `86e9403 = 46` — TODOS off por +1 vs #55 (5/5 = 100%); (c) Fórmula real `depth(run_N).origin/main = N - 5`; (d) Root real = `03861a4 @ 2026-06-09T14:00Z = watchdog #6` (no `c9d7e3f` — esa SHA **NO EXISTE** en el repo local, `phantom-sha #3`); (e) **5 commits pre-#6** (#1, #2, #3, #4, #5) nunca llegaron a origin/main, no 4. | #46→#55 (10 slots) reportaron depth con offset variable +2→-3→-4 cada "corrección" siempre off por +1 vs realidad fresca. **3ª recurrencia consecutiva** del mismo bug (#54→#55→#56). | la capa C5 (introducida #55 = monotonía inter-slot + verificación de N-1) fue **necesaria pero no suficiente**: corrió en su debut y produjo el mismo tipo de error que pretendía cazar — **idéntico a la falla de C4 en debut (#54)**. **Auto-corrección dura #6** del watchdog. Tipologías co-aplicadas: `narrative-drag-numeric` (3ª recurrencia) + `phantom-sha #3` (`c9d7e3f`). Prevención estructural en #56: **NO se introduce capa C6**. La hipótesis "más capas resuelve" está estructuralmente refutada por 3 recurrencias consecutivas. **Política nueva #5**: incluir bash stdout literal verbatim en bloque `bash$` para todo número/SHA en el report. Modifica el texto del invariante #8: "fuente primaria = output literal, no parafraseado". Aplicada por 1ª vez HOY (ver report `watchdog_20260615_1804.md` sección 1️⃣). Política planificada para #57+: hacer la política norma operacional del invariante #6 + #8 simultáneamente. |
+
+### Bash stdout literal verbatim — #56 verification snapshot (regla emergente #5, 1ª aplicación)
+
+```
+$ date -u +"%Y-%m-%dT%H:%M:%SZ"
+2026-06-15T18:04:21Z
+
+$ git fetch origin main
+From http://127.0.0.1:32769/git/spenht/event-ai-ops-v2
+ + 9d154dd...cf750b1 main       -> origin/main  (forced update)
+
+$ git log --oneline main..origin/main | wc -l
+50
+
+$ git rev-list --count cf750b1   # #55, predicho 51 por #55 con N-4
+50
+
+$ git rev-list --count 593c83a   # #54, #55 reportó 50
+49
+
+$ git rev-list --count 61a2b93   # #53, #55 reportó 49
+48
+
+$ git rev-list --count fd0303e   # #52, #55 reportó 48
+47
+
+$ git rev-list --count 86e9403   # #51, #55 reportó 47
+46
+
+$ git cat-file -t 64ba80b
+fatal: Not a valid object name 64ba80b
+
+$ git cat-file -t 324227e
+fatal: Not a valid object name 324227e
+
+$ git cat-file -t c9d7e3f
+fatal: Not a valid object name c9d7e3f
+
+$ git log --oneline origin/main | tail -1
+03861a4 watchdog: run #6 14:00Z — wrong-repo, arm auto-throttle for run #7+
+```
+
+## Regla emergente #5 (a partir del #56)
+
+Todo número o SHA citado en el report del watchdog DEBE estar acompañado de un bloque `bash$` literal verbatim con el comando que lo produce y su stdout completo. NO se acepta paráfrasis ni interpretación intermedia. Justificación empírica: 3 recurrencias consecutivas (#54, #55, #56) del bug `narrative-drag-numeric` demuestran que CUANDO el report parafrasea el output del comando, el LLM tiende a re-construir narrativamente el número (usualmente derivándolo del run-number) en lugar de copiar el output literal. La única forma de evitar esto es **eliminar la paráfrasis**: el reader (humano o LLM en N+1) lee el output del comando, no la interpretación del watchdog. **Esta regla SUPERSEDES toda capa C4, C5, C6, ...** — el approach evolutivo "agregar capas de verificación" se ABANDONA HOY.
+
+## Decisión estructural #56
+
+A partir de HOY, la línea evolutiva del invariante #6 NO continúa por agregación de capas C6, C7, .... Continúa por **adopción de la regla emergente #5 (bash stdout literal) como norma operacional** integrada al invariante #8 (`fuente-primaria > memoria-del-watchdog`). Si #57-#58 verifican que esta política resuelve el +1 bug recurrente, el método entra en steady-state cualitativamente nuevo. Si NO resuelve, hay un bug aún más profundo (potencialmente LLM-fundamental sobre escribir integers en text), que debe explorarse separadamente.
