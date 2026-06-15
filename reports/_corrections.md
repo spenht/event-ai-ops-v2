@@ -20,3 +20,22 @@ Cualquier referencia a SHA o timestamp en un report del watchdog DEBE re-derivar
 ## Regla emergente #2 (a partir del #48)
 
 Cualquier métrica derivada del search API que tenga `pushed_at` Y `updated_at` debe reportarse con el nombre del campo explícitamente en la tabla. El "silencio del repo" por sí solo es ambiguo: el lector debe poder distinguir si la cifra cuenta desde el último push de código (`pushed_at`) o desde el último cambio de metadata (`updated_at`). Prevención estructural anti field-swap.
+
+---
+
+| #54 | #54 (14:04Z 15-jun) | behind-by-N | reportado #46→#53 como "+1/slot a 13 muestras, +2 offset estructural permanente, post-push N en #N (e.g. 53 post-push en #53)" | **real**: `git rev-list --count 61a2b93 (=#53) = 50`, `fd0303e (=#52) = 49`, `86e9403 (=#51) = 48`. Fórmula correcta `depth(run_N).origin/main = N - 3`. Root de origin/main = `324227e @ 2026-06-09T10:05:05Z = watchdog #4`. **3 commits pre-#4 (#1=ALERT, #2, #3) nunca llegaron a origin/main** — no 2 como #53 infirió. El "+2 offset" era narrative-drag construido sobre asumir que el contador raw debía igualar el run-number; en realidad el raw siempre fue depth correcto y el reported lo infló +3 retroactivamente. | #46→#53 (8 slots) reportaron números inflados (50→53 en #53, 49→52 en #52, etc.). Sin impacto operacional para Spencer. Cuestión de calidad de método. | el invariante #6 (auto-auditoría) cubría hasta #53 estado externo (`list_issues` capa C3) pero NO incluía verificación aritmética del propio contador contra fuente primaria. Hueco: lectura literal de `wc -l` ajustada con offset narrativo sin nunca correr `git rev-list --count` para validar la fórmula. **Auto-corrección dura #4** del watchdog. Tipología nueva: `narrative-drag-numeric`. Prevención estructural en #54: **capa C4 introducida** = verificación aritmética de contadores numéricos del report contra fuente primaria en T mismo (no T+1). **Decisión disciplinada**: documentar la fórmula `depth = N - 3` y aplicar a contadores futuros. |
+
+## Regla emergente #3 (a partir del #54)
+
+Cualquier contador numérico que aparezca en el report con fórmula derivada (offset, multiplicador, suma sobre fuente primaria) DEBE re-verificarse contra fuente primaria en el slot que lo cita. Comandos canonical para behind-by-N: `git rev-list --count HEAD`, `git rev-list --count <SHA>` por commit. **Política operacional meta emergente**: `fuente-primaria > memoria-del-watchdog`. Promovible a invariante #8 en #55.
+
+## Tipología de auto-correcciones (a partir del #54)
+
+| tipo | slot ejemplo | descripción |
+|---|---|---|
+| `narrative-drag` | #46 | reuso de SHA/timestamp narrativo sin re-derivar contra fuente primaria |
+| `field-swap` | #47 | confusión entre campos semánticamente distintos del mismo objeto API (`pushed_at` vs `updated_at`) |
+| `self-error-plan` | #52 | planificación sobre estado-externo asumido sin verificar (`list_issues` no leído) |
+| `narrative-drag-numeric` | #54 | contador numérico inflado con offset narrativo sin verificar contra fuente primaria |
+
+**Patrón meta**: 3 de 4 tipos involucran no-re-derivar contra fuente primaria. Esta es la razón estructural de la regla emergente #3.
