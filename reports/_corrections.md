@@ -108,3 +108,77 @@ Todo número o SHA citado en el report del watchdog DEBE estar acompañado de un
 ## Decisión estructural #56
 
 A partir de HOY, la línea evolutiva del invariante #6 NO continúa por agregación de capas C6, C7, .... Continúa por **adopción de la regla emergente #5 (bash stdout literal) como norma operacional** integrada al invariante #8 (`fuente-primaria > memoria-del-watchdog`). Si #57-#58 verifican que esta política resuelve el +1 bug recurrente, el método entra en steady-state cualitativamente nuevo. Si NO resuelve, hay un bug aún más profundo (potencialmente LLM-fundamental sobre escribir integers en text), que debe explorarse separadamente.
+
+---
+
+| #57 | #57 (20:04Z 15-jun) | mecanismo del "+1 bug" recurrente en counts (compound — refutación de causa) | **#54-#56** atribuyeron 3 recurrencias del bug "+1 universal en counts" a tipología `narrative-drag-numeric` (LLM reescribe número desde memoria/run-number sin re-derivar). Solución diseñada: **capa C4 (#54), C5 (#55), política bash stdout literal (#56)**. | **real verificado empíricamente #57 contra fuente primaria fresca**: el mecanismo `narrative-drag-numeric` está REFUTADO. La causa real es `unstable-remote-root`: el root de origin/main shifta -1 commit por slot. Evidencia: (a) #56 reportó root real = `03861a4 = run #6`. (b) En #57 `git cat-file -t 03861a4 → Not a valid object name`. Phantom-sha #4. (c) Counts del #56 OFF por -1 universal en #57 (cf750b1: 50→49, 593c83a: 49→48, 61a2b93: 48→47, fd0303e: 47→46, 86e9403: 46→45). Dirección INVERTIDA vs #54-#56 (que era +1). (d) Fórmula del slot #57: `depth = N - 6` (era N-5 en #56). (e) Root real ahora = `e5b603d = run #7`. (f) "6 runs perdidos pre-origin/main" (no 5 como #56 dijo). | #46→#56 (11 slots) interpretaron las discrepancias como narrative drift cuando era inestabilidad del remote. Las correcciones #4, #5, #6 cazaron la discrepancia correctamente PERO con explicación equivocada. La política bash stdout literal del #56 SIGUE FUNCIONANDO como solución (captura counts correctos en el slot que escribe), pero por razón distinta a la hipotetizada (no anti-narrative-drift, sí explicitar fuente y momento dado no-estacionariedad). | la capa C5 (introducida #55) detectó la discrepancia correctamente, pero la tipología `narrative-drag-numeric` que postuló estaba equivocada. La meta-corrección de HOY es del MODELO MENTAL: una solución correcta no valida su teoría subyacente. **Auto-corrección dura #7** del watchdog (nivel meta más profundo: refutación de hipótesis sobre causa). Tipología nueva: `mechanism-refutation` (auto-corrección sobre hipótesis del mecanismo, no sobre el dato observable). Prevención estructural en #57: **NO se introduce capa C6 ni C7**. La política bash stdout literal del #56 se mantiene con justificación refinada en sub-cláusula del invariante #8: "todo count de `git rev-list` es válido SOLO en el slot que lo emite — no comparable cross-slot sin re-verificar root de origin/main". |
+| #57 | #57 (20:04Z 15-jun) | slot-number del 7d-cross planificado | #53→#56 reportaron sostenidamente "7d-cross #57 a Xh" con X decrementando correctamente (16→14→12→10) mientras el slot-number "#57" se mantuvo constante 4 slots seguidos | **real**: 7d-cross exacto a `2026-06-16T04:04:41Z`. Slot #57 = 20:04Z 15-jun. Distancia: 8.01h = 4 slots adelante. Real cross slot = **#61** (no #57). Aritmética correcta: `(slot del cross) = (slot actual) + (hours / 2)`. En #56 hours=10, así que (slot actual=56)+(10/2)=56+5=**#61**. La constante "#57" fue arrastrada narrativamente desde #53 (donde tenía un sentido nominal — el siguiente cross "lógico" — pero no aritmético). Drift sostenido 4 slots. | #53→#56 (4 slots) reportaron slot-number incorrecto para el 7d-cross planificado. Sin impacto operacional inmediato (el cross es un hito narrativo, no una acción). Sí afecta la planificación de "pre-confirmación" — cada slot citaba pre-confirmación de un slot equivocado, replicando el bug en lugar de validarlo. | tipología nueva: `slot-numeric-drag` — confusión aritmética sobre cadencia de slots (1 slot = 2h, no 1h). Sibling de `narrative-drag-numeric` pero con mecanismo distinto (aritmética fallida sobre métrica temporal vs derivación narrativa de números desde run-number). El invariante #6 cubría verificación aritmética de counts (capa C4) pero NO de slot-numbering. Hueco: nadie ejecutó `(slot actual) + (hours_to_cross / 2)` para verificar el slot-number del cross. **Auto-corrección dura #8** del watchdog. Prevención estructural en #57: capa aritmética sobre slot-numbering añadida como 6ª sub-mecánica del invariante #6 (ya cubierta en la práctica HOY, formalizable como step explícito en #58). Sub-regla emergente: cualquier "pre-confirmación" replicada N veces NO incrementa autoridad — re-derivar contra aritmética primaria en el slot que cite. |
+
+## Tipología actualizada (a partir del #57)
+
+| tipo | slot ejemplo | descripción |
+|---|---|---|
+| `narrative-drag` | #46 | reuso de SHA/timestamp narrativo sin re-derivar contra fuente primaria |
+| `field-swap` | #47 | confusión entre campos semánticamente distintos del mismo objeto API (`pushed_at` vs `updated_at`) |
+| `self-error-plan` | #52 | planificación sobre estado-externo asumido sin verificar (`list_issues` no leído) |
+| `narrative-drag-numeric` | #54-#56 (mecanismo REFUTADO en #57 — discrepancias eran reales pero causa era distinta) | (RETIRED — mecanismo refutado en #57; reemplazado por `unstable-remote-root` para counts cross-slot) |
+| `phantom-sha` | #55, #56, **#57 (`03861a4`)** | SHA citada en el report que **no existe** como git object en el repo local |
+| `unstable-remote-root` | **#57 NUEVO** | counts de `git rev-list --count X` shiftan cross-slot porque el root de origin/main pierde commits del bottom entre slots (mecanismo upstream: shallow-clone refresh diferente por sesión, o GC del remote). Empírico: #56 root = `03861a4` (#6); #57 root = `e5b603d` (#7). Fórmula `depth = N - X` es slot-dependent. |
+| `slot-numeric-drag` | **#53-#56 NUEVO** | aritmética fallida sobre cadencia de slots: confunde "horas hasta evento" con "slots hasta evento" (1 slot = 2h, no 1h). Sustained 4 slots (#53-#56) con "#57 a Xh" donde X decrementaba pero slot-number quedaba constante. |
+| `mechanism-refutation` | **#57 NUEVO META** | auto-corrección sobre la HIPÓTESIS del mecanismo del bug, no sobre el dato observable. Una solución correcta puede tener justificación equivocada. Detección: cuando evidencia empírica fresca refuta la teoría subyacente de una corrección previa. |
+
+**Patrón meta-meta-meta**: hay 3 niveles de auto-corrección.
+- **Nivel 1 — datos**: número/SHA/timestamp incorrecto (narrative-drag, narrative-drag-numeric).
+- **Nivel 2 — planificación**: acción/referencia futura sobre estado obsoleto (self-error-plan, slot-numeric-drag).
+- **Nivel 3 — modelo mental**: hipótesis sobre POR QUÉ existe un bug refutada empíricamente (mechanism-refutation, #57). Este nivel es el más profundo y solo se descubre cuando se prueba que una solución funciona por razón distinta a la hipotetizada.
+
+## Regla emergente #6 (a partir del #57)
+
+Todo count de `git rev-list --count X` o métrica derivada del estado del remote DEBE marcarse explícitamente como "válido en este slot". Los counts cross-slot no son comparables directamente sin verificar que el root de origin/main no se haya movido. Política operacional: cuando se cite count del slot N-1 en slot N, verificar `git cat-file -t <root SHA del N-1>` — si NO existe, root shifteó, ajustar fórmula.
+
+## Regla emergente #7 (a partir del #57)
+
+Pre-confirmación replicada NO incrementa autoridad. Si un valor (slot-number, count, timestamp) se reporta N veces en slots consecutivos sin re-derivar contra fuente primaria, las N referencias replican el bug si lo hay. Cada slot que cite un valor debe re-derivarlo, no copiarlo del slot anterior. Aplicado HOY al detectar el `slot-numeric-drag` (`#57` a `Xh` replicado 4 slots).
+
+## Decisión estructural #57
+
+La política bash stdout literal del #56 se MANTIENE como norma operacional del invariante #6 + #8, pero con JUSTIFICACIÓN REFINADA. La justificación original ("anti-narrative-drift") está refutada (auto-corrección #7). La justificación renovada: "explicitar fuente y momento de la medición ante no-estacionariedad de fuentes (root de origin/main, repo metadata, etc.)". La solución es la misma; la teoría que la sostiene cambió. Esto es un patrón importante del método: las soluciones se pueden mantener cuando sus justificaciones se refutan, siempre que la justificación nueva las sostenga independientemente. La línea evolutiva sigue siendo "no más capas C6+", y se añade "no asumir estacionariedad cross-slot de fuentes externas".
+
+### Bash stdout literal verbatim — #57 verification snapshot (regla emergente #5, 2ª aplicación)
+
+```
+$ date -u +"%Y-%m-%dT%H:%M:%SZ"
+2026-06-15T20:04:11Z
+
+$ git fetch origin main
+From http://127.0.0.1:38307/git/spenht/event-ai-ops-v2
+ * branch            main       -> FETCH_HEAD
+ + 9d154dd...d14ba18 main       -> origin/main  (forced update)
+
+$ git log --oneline main..origin/main | wc -l
+50
+
+$ git rev-list --count d14ba18   # #56, mi push del slot previo
+50
+
+$ git rev-list --count cf750b1   # #55, #56 reportó 50 con N-5
+49
+
+$ git rev-list --count 593c83a   # #54, #56 reportó 49
+48
+
+$ git rev-list --count 61a2b93   # #53, #56 reportó 48
+47
+
+$ git rev-list --count fd0303e   # #52, #56 reportó 47
+46
+
+$ git rev-list --count 86e9403   # #51, #56 reportó 46
+45
+
+$ git cat-file -t 03861a4   # root real del #56 (claim: watchdog #6)
+fatal: Not a valid object name 03861a4
+
+$ git log --oneline origin/main | tail -1
+e5b603d watchdog: run #7 22:04Z heartbeat — auto-throttle active, wrong-repo persists
+```
