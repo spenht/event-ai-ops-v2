@@ -29,6 +29,14 @@ Cualquier métrica derivada del search API que tenga `pushed_at` Y `updated_at` 
 
 Cualquier contador numérico que aparezca en el report con fórmula derivada (offset, multiplicador, suma sobre fuente primaria) DEBE re-verificarse contra fuente primaria en el slot que lo cita. Comandos canonical para behind-by-N: `git rev-list --count HEAD`, `git rev-list --count <SHA>` por commit. **Política operacional meta emergente**: `fuente-primaria > memoria-del-watchdog`. Promovible a invariante #8 en #55.
 
+---
+
+| #269 | #269 (22:08Z 03-jul) | `tags object` label | reportado desde ~#193+ hasta #268 (~76 slots) como "tags object f3b86c3 / 67bc745 / 0770f71 / aac3dc0 (4/4 stable Nh)" — sugería objetos locales verificados | **los 4 SHAs NUNCA fueron objetos locales**: `git cat-file -t f3b86c3` = FAIL (mismo para los 4). La fuente real siempre fue `git ls-remote --tags origin` (remote-refs, no objetos). El dato de estabilidad **REMOTA** era correcto (los 4 SHAs no cambian en el server 152h); el rótulo "object" era misnaming: no había verificación local. El shallow clone (`is_shallow=true`, depth=50) no incluye tags — sólo main. | #193→#268 (~76 slots) rótulo arrastrado; sin impacto numérico (los SHAs remotos son idénticos a los reportados), sólo semántico | copia-pega narrativa desde slot antiguo sin re-derivar con `git cat-file`. Punto ciego: el watchdog nunca corrió `cat-file -t` sobre las 4 SHAs. **Auto-corrección dura #5**. Prevención estructural en #269: (a) rename futuro `tags ls-remote-ref` en el formato; (b) precommit `is_shallow` + `shallow_grafts_SHA` seriados desde #270; (c) hallazgo colateral: `.git/shallow` contiene 2 grafts que son mis propios commits #196 (`438bed86`) y #220 (`dd5a2264`) — el container fue clonado depth=50 anclado a mi historia post-ALERT. |
+
+## Regla emergente #4 (a partir del #269)
+
+Cualquier rótulo del report que implique verificación local (`object`, `blob`, `commit`, `tree`) DEBE derivarse de un comando `git cat-file` (o equivalente local), no de `git ls-remote` (que sólo devuelve refs remotas). Cuando la fuente sea `ls-remote`, el rótulo debe ser `ls-remote-ref` o `remote-SHA`. Prevención estructural anti local-vs-remote confusion.
+
 ## Tipología de auto-correcciones (a partir del #54)
 
 | tipo | slot ejemplo | descripción |
