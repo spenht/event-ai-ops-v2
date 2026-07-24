@@ -227,6 +227,32 @@ async def create_terminal_charge(request: Request):
     now_iso = datetime.now(timezone.utc).isoformat()
     commission_rate = pa_data[0].get("commission_rate", 0) or 0
 
+    # Debounce: reject if there's already a pending charge for same agent+project+amount in last 2 min
+    if gateway_type != "whop":
+        two_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        try:
+            recent = (
+                sb.table("financial_transactions")
+                .select("id, external_id")
+                .eq("source", f"stripe_{gateway.get('gateway_key', '')}")
+                .filter("metadata->>agent_id", "eq", user_id)
+                .filter("metadata->>status", "eq", "pending")
+                .eq("project_id", project_id)
+                .eq("amount", float(amount))
+                .gte("created_at", two_min_ago)
+                .limit(1)
+                .execute()
+            )
+            if recent.data:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Charge already in progress for this amount. Wait 2 minutes or use a different amount.",
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning("debounce_check_failed: %s", str(e)[:100])
+
     # Override commission from product if specified
     product_name = ""
     product_stripe_price_id = ""
@@ -371,10 +397,11 @@ async def create_terminal_charge(request: Request):
             raise HTTPException(status_code=400, detail=f"Stripe error: {r.text[:200]}")
         pi = r.json()
 
-    # Record in financial_transactions
+    # Record in financial_transactions (source aligned with webhook/sync: stripe_xxx)
+    gw_key = gateway.get("gateway_key", "agent_terminal")
     txn = {
         "external_id": pi["id"],
-        "source": gateway.get("gateway_key", "agent_terminal"),
+        "source": f"stripe_{gw_key}",
         "type": "sale",
         "amount": float(amount),
         "currency": currency.upper(),
@@ -386,9 +413,10 @@ async def create_terminal_charge(request: Request):
         "metadata": {
             "agent_id": user_id,
             "gateway_id": gateway_id,
-            "gateway_key": gateway.get("gateway_key", ""),
+            "gateway_key": gw_key,
             "customer_email": customer_email,
             "source": "agent_terminal",
+            "status": "pending",
             "payment_intent_id": pi["id"],
             "product_id": product_id or "",
             "product_name": product_name or "",
@@ -396,33 +424,12 @@ async def create_terminal_charge(request: Request):
     }
     sb.table("financial_transactions").upsert(txn, on_conflict="external_id,source").execute()
 
-    # Commission (with holding period for refund protection)
+    # Commission is calculated here for display but NOT inserted yet.
+    # Commission row is created by the webhook when payment_intent.succeeded fires,
+    # preventing phantom commissions from charges that never complete.
     commission_amount = 0.0
     if commission_rate > 0:
         commission_amount = round(float(amount) * (commission_rate / 100), 2)
-        try:
-            # Get holding period from platform settings
-            try:
-                setting = sb.table("platform_settings").select("value").eq("key", "commission_holding_days").execute()
-                holding_days = int(setting.data[0]["value"]) if setting.data else 14
-            except Exception:
-                holding_days = 14
-
-            held_until = (datetime.now(timezone.utc) + timedelta(days=holding_days)).isoformat()
-
-            sb.table("commissions").insert({
-                "agent_id": user_id,
-                "tier": "DIRECT_SALE",
-                "sale_amount": float(amount),
-                "commission_pct": commission_rate,
-                "commission_amount": commission_amount,
-                "status": "held",
-                "held_until": held_until,
-                "notes": f"Agent terminal sale - {description}",
-                "created_at": now_iso,
-            }).execute()
-        except Exception as e:
-            logger.warning("commission_insert_failed (will track in txn metadata): %s", str(e)[:100])
 
     return {
         "ok": True,
@@ -466,6 +473,14 @@ async def get_agent_sales(request: Request):
     except Exception as e:
         logger.warning("sales query failed: %s", e)
         sales = []
+
+    # Filter out stale pending charges (older than 30 min without payment confirmation)
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    sales = [
+        s for s in sales
+        if (s.get("metadata") or {}).get("status") != "pending"
+        or s.get("created_at", "") >= stale_cutoff
+    ]
 
     total_usd = sum(float(s["amount"]) for s in sales if s.get("currency") == "USD")
     total_mxn = sum(float(s["amount"]) for s in sales if s.get("currency") == "MXN")
@@ -727,7 +742,7 @@ async def create_payment_link(request: Request):
 
         sb.table("financial_transactions").insert({
             "external_id": f"pl_{link['id']}",
-            "source": gateway.get("gateway_key", "agent_terminal"),
+            "source": f"stripe_{gateway.get('gateway_key', 'agent_terminal')}",
             "type": "sale",
             "amount": float(amount),
             "currency": currency.upper(),
@@ -1094,6 +1109,14 @@ async def admin_all_sales(request: Request):
         q = q.gte("amount", float(min_amount))
 
     txns = (q.execute()).data or []
+
+    # Exclude stale pending charges (never completed)
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    txns = [
+        t for t in txns
+        if (t.get("metadata") or {}).get("status") != "pending"
+        or t.get("created_at", "") >= stale_cutoff
+    ]
 
     total_usd = sum(float(t["amount"]) for t in txns if t.get("currency") == "USD")
     total_mxn = sum(float(t["amount"]) for t in txns if t.get("currency") == "MXN")
