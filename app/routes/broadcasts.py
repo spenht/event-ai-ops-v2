@@ -72,7 +72,8 @@ def _validate_cron_token(request: Request) -> None:
         raise HTTPException(status_code=403, detail="invalid cron token")
 
 
-def _utcnow() -> datetime:
+def _now_utc() -> datetime:
+    """Return current UTC time as a timezone-aware datetime."""
     return datetime.now(timezone.utc)
 
 
@@ -190,7 +191,7 @@ async def execute_campaign(campaign_id: str) -> dict[str, Any]:
     total = len(leads)
     sent = 0
     failed = 0
-    now = _utcnow()
+    now = _now_utc()
 
     for lead in leads:
         lead_id = lead.get("lead_id", "")
