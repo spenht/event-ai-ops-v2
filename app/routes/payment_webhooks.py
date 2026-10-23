@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Request
 from starlette.responses import JSONResponse
@@ -50,10 +50,13 @@ async def stripe_webhook(account_key: str, request: Request):
             "auto_assigned": bool(meta.get("project_id")),
             "metadata": {
                 "source": "webhook",
+                "status": "completed",
                 "agent_id": meta.get("agent_id", ""),
                 "product_id": meta.get("product_id", ""),
                 "product_name": meta.get("product_name", ""),
+                "gateway_id": meta.get("gateway_id", ""),
                 "gateway_key": account_key,
+                "customer_email": meta.get("customer_email", ""),
             },
         }
         try:
@@ -68,6 +71,70 @@ async def stripe_webhook(account_key: str, request: Request):
             )
         except Exception as e:
             logger.warning("webhook_stripe_upsert_error: %s", str(e)[:100])
+
+        # Create commission for agent terminal sales on payment confirmation
+        agent_id = meta.get("agent_id", "")
+        if agent_id and meta.get("source") == "agent_terminal":
+            try:
+                # Look up commission rate from project_agents
+                project_id = meta.get("project_id", "")
+                commission_rate = 0.0
+                if project_id:
+                    pa = (
+                        sb.table("project_agents")
+                        .select("commission_rate")
+                        .eq("user_id", agent_id)
+                        .eq("project_id", project_id)
+                        .limit(1)
+                        .execute()
+                    )
+                    if pa.data:
+                        commission_rate = float(pa.data[0].get("commission_rate", 0) or 0)
+
+                # Check for product-level commission override
+                product_id = meta.get("product_id", "")
+                if product_id:
+                    prod = sb.table("project_products").select("commission_pct").eq("id", product_id).limit(1).execute()
+                    if prod.data and prod.data[0].get("commission_pct"):
+                        commission_rate = float(prod.data[0]["commission_pct"])
+                    # Agent-specific override
+                    access = (
+                        sb.table("agent_product_access")
+                        .select("custom_commission_pct")
+                        .eq("agent_id", agent_id)
+                        .eq("product_id", product_id)
+                        .limit(1)
+                        .execute()
+                    )
+                    if access.data and access.data[0].get("custom_commission_pct") is not None:
+                        commission_rate = float(access.data[0]["custom_commission_pct"])
+
+                if commission_rate > 0:
+                    commission_amount = round(amount * (commission_rate / 100), 2)
+                    try:
+                        setting = sb.table("platform_settings").select("value").eq("key", "commission_holding_days").limit(1).execute()
+                        holding_days = int(setting.data[0]["value"]) if setting.data else 14
+                    except Exception:
+                        holding_days = 14
+
+                    held_until = (datetime.now(timezone.utc) + timedelta(days=holding_days)).isoformat()
+                    sb.table("commissions").insert({
+                        "agent_id": agent_id,
+                        "tier": "DIRECT_SALE",
+                        "sale_amount": amount,
+                        "commission_pct": commission_rate,
+                        "commission_amount": commission_amount,
+                        "status": "held",
+                        "held_until": held_until,
+                        "notes": f"Agent terminal sale - {pi.get('description', '')}",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }).execute()
+                    logger.info(
+                        "commission_created agent=%s amount=%s pi=%s",
+                        agent_id, commission_amount, pi["id"],
+                    )
+            except Exception as e:
+                logger.warning("webhook_commission_error: %s", str(e)[:200])
 
     elif event_type == "charge.refunded":
         charge = data
